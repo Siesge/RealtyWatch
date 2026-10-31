@@ -1,0 +1,16 @@
+# Портативная среда выполнения (скачивается скриптом установки)
+Parser App/runtime/
+Parser App/browsers/
+
+# Данные пользователя: база, профили браузера, логи
+Parser App/data/
+Parser App/profiles/
+Parser App/logs/
+
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
