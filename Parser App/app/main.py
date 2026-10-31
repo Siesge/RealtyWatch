@@ -75,6 +75,55 @@ def _start_server(port):
     return server
 
 
+TITLE = "RealtyWatch — квартиры в Ялте"
+
+
+def _light_theme():
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return bool(winreg.QueryValueEx(k, "AppsUseLightTheme")[0])
+    except OSError:
+        return True
+
+
+def _set_app_id():
+    """Своя группа в панели задач (иначе Windows покажет иконку python.exe)."""
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RealtyWatch.Yalta")
+    except Exception:
+        pass
+
+
+def _apply_icon():
+    """pywebview берёт иконку из python.exe — заменяем на свою через WM_SETICON."""
+    try:
+        import ctypes
+
+        u = ctypes.windll.user32
+        u.LoadImageW.restype = ctypes.c_void_p
+        u.FindWindowW.restype = ctypes.c_void_p
+        u.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+        ico = str(paths.ROOT / "assets" / "icon.ico")
+        hwnd = None
+        for _ in range(50):
+            hwnd = u.FindWindowW(None, TITLE)
+            if hwnd:
+                break
+            time.sleep(0.1)
+        if not hwnd:
+            return
+        big = u.LoadImageW(None, ico, 1, u.GetSystemMetrics(11) * 2, u.GetSystemMetrics(12) * 2, 0x10)
+        small = u.LoadImageW(None, ico, 1, u.GetSystemMetrics(49), u.GetSystemMetrics(50), 0x10)
+        u.SendMessageW(hwnd, 0x80, 1, big)    # WM_SETICON, ICON_BIG
+        u.SendMessageW(hwnd, 0x80, 0, small)  # ICON_SMALL
+    except Exception:
+        pass
+
+
 def _shutdown_runs():
     from .runner import manager
 
@@ -107,8 +156,11 @@ def main():
         else:
             import webview
 
-            webview.create_window("RealtyWatch — квартиры в Ялте", url, width=1440, height=900,
-                                  min_size=(1000, 650), maximized=True, background_color="#f4f5f7")
+            _set_app_id()
+            window = webview.create_window(TITLE, url, width=1440, height=900,
+                                           min_size=(1100, 680), maximized=True,
+                                           background_color="#F3F1EC" if _light_theme() else "#0D0F12")
+            window.events.shown += _apply_icon
             webview.start(private_mode=False, storage_path=str(paths.DATA / "webview"))
     except KeyboardInterrupt:
         pass

@@ -2,9 +2,14 @@
 # Запуск: setup.bat (повторный запуск безопасен, уже установленное пропускается).
 # -Quick: вызывается из start.bat при каждом запуске — мгновенно выходит, если всё на месте
 # и requirements.txt не менялся с последней установки; иначе доустанавливает недостающее.
-param([switch]$Quick)
+# -CheckOnly: только проверка (код 0 — всё готово, 2 — нужна установка); используется RealtyWatch.exe.
+param([switch]$Quick, [switch]$CheckOnly, [switch]$PauseOnError)
 $ErrorActionPreference = "Stop"
-trap { Write-Host "`nНе удалось установить компоненты: $_" -ForegroundColor Red; exit 1 }
+trap {
+    Write-Host "`nНе удалось установить компоненты: $_" -ForegroundColor Red
+    if ($PauseOnError) { Read-Host "Нажмите Enter, чтобы закрыть" | Out-Null }
+    exit 1
+}
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -17,8 +22,10 @@ $Stamp   = Join-Path $Runtime "installed.txt"
 $ReqHash = (Get-FileHash (Join-Path $Root "requirements.txt") -Algorithm SHA256).Hash
 $HasChromium = [bool](Get-ChildItem (Join-Path $Root "browsers") -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue)
 
+$Ready = (Test-Path $PyExe) -and $HasChromium -and (Test-Path $Stamp) -and ((Get-Content $Stamp -Raw).Trim() -eq $ReqHash)
+if ($CheckOnly) { if ($Ready) { exit 0 } else { exit 2 } }
 if ($Quick) {
-    if ((Test-Path $PyExe) -and $HasChromium -and (Test-Path $Stamp) -and ((Get-Content $Stamp -Raw).Trim() -eq $ReqHash)) { exit 0 }
+    if ($Ready) { exit 0 }
     Write-Host "Обновляю компоненты программы (один раз после установки или обновления)..."
 }
 
