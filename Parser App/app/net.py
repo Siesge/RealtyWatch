@@ -58,7 +58,7 @@ class Http:
             r = self.s.request(method, url, **kw)
         except Exception as e:  # сетевые ошибки curl
             raise IOError(f"{type(e).__name__}: {e}") from e
-        if r.status_code in (401, 403, 429) or self.is_blocked(r.text, str(r.url)):
+        if r.status_code in (401, 403, 429, 439) or self.is_blocked(r.text, str(r.url)):
             raise Blocked(f"HTTP {r.status_code} {r.url}")
         if r.status_code >= 400:
             raise IOError(f"HTTP {r.status_code} {url}")
