@@ -43,6 +43,9 @@ class Yandex(Scraper):
         f = self.cfg["filters"]
         p = [("priceMin", f["price_min"]), ("priceMax", f["price_max"]), ("areaMin", f["area_min"])]
         p += [("roomsTotal", r) for r in f["rooms"]]
+        # Сортировка по дате обязательна: в выдаче «по релевантности» платные объявления повторяются
+        # на каждой странице (одно и то же до 14 раз) и вытесняют ~15% обычных — они терялись и считались снятыми
+        p.append(("sort", "DATE_DESC"))
         if index > 0:
             p.append(("page", index + 1))  # в URL нумерация с 1, page=2 — вторая страница
         return f"https://realty.yandex.ru/{self.site['region_path']}/kupit/kvartira/?" + urlencode(p)
