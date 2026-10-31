@@ -55,7 +55,7 @@ class Scraper:
         if self.browser is None:
             b = self.cfg.get("browser", {})
             self.browser = Browser(self.name, self.is_blocked, self.log, self.stop,
-                                   headless=b.get("headless", False), captcha_wait_min=b.get("captcha_wait_min", 10))
+                                   window=b.get("window", "hidden"), captcha_wait_min=b.get("captcha_wait_min", 10))
         return self.browser
 
     def fetch(self, via_http, via_browser):

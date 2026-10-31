@@ -42,6 +42,7 @@ input[type=number], input[type=search], input[type=text], select {
 .state-error, .state-blocked { color: var(--danger); } .state-stopped { color: var(--warn); }
 
 .layout { display: grid; grid-template-columns: 240px 1fr; gap: 16px; padding: 0 16px 80px; }
+.layout.wide { grid-template-columns: 1fr; }
 @media (max-width: 800px) { .layout { grid-template-columns: 1fr; } }
 .filters { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; align-self: start;
   position: sticky; top: 70px; max-height: calc(100vh - 90px); overflow: auto; }
@@ -83,6 +84,21 @@ input[type=number], input[type=search], input[type=text], select {
 .cf { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); padding: 8px 12px; border-top: 1px solid var(--line); }
 .cf a { color: var(--accent); text-decoration: none; font-weight: 600; }
 
+.viewbar { display: flex; justify-content: flex-end; margin: -4px 0 4px; }
+button.toggle.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.split .side { display: none; }
+.split.with-map { grid-template-columns: minmax(0, 1fr) 42%; }
+.split.with-map .side { display: block; position: sticky; top: 70px; height: calc(100vh - 130px); align-self: start; }
+#sideMap { height: 100%; border-radius: 8px; border: 1px solid var(--line); }
+@media (max-width: 1000px) {
+  .split.with-map { grid-template-columns: minmax(0, 1fr); }
+  .split.with-map .side { position: static; height: 320px; order: -1; }
+}
+.split.with-map .cards { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.card.focus { outline: 3px solid var(--accent); outline-offset: -1px; }
+.pin { border: none; background: none; padding: 0 6px; font-size: 14px; cursor: pointer; }
+
 table.grid { width: 100%; border-collapse: collapse; background: var(--panel); font-size: 13px; }
 table.grid th, table.grid td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: left; vertical-align: top; }
 table.grid th { position: sticky; top: 60px; background: var(--panel); cursor: pointer; white-space: nowrap; }
@@ -95,6 +111,7 @@ table.grid tr.excl td { color: var(--muted); }
 .settings { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; max-width: 760px; }
 .settings h4 { margin: 16px 0 6px; }
 .settings .grid2 { display: grid; grid-template-columns: 220px 1fr; gap: 6px 12px; align-items: center; }
+.settings .grid2 input[type=checkbox] { justify-self: start; }
 .settings .hint { color: var(--muted); font-size: 12px; }
 .settings .actions { margin-top: 16px; display: flex; gap: 8px; }
 

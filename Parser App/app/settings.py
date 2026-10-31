@@ -36,7 +36,8 @@ DEFAULTS = {
         },
         "yandex": {"enabled": True, "mode": "auto", "region_path": "yalta", "delay": [2.5, 6.0], "max_pages": 40},
     },
-    "browser": {"headless": False, "captcha_wait_min": 10},
+    # window: hidden — окно за пределами экрана (появляется только при капче); visible; headless
+    "browser": {"window": "hidden", "captcha_wait_min": 10},
     "server": {"port": 8765},
 }
 

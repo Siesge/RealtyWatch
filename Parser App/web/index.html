@@ -77,7 +77,13 @@
 
   <main>
     <div id="summary" class="summary"></div>
-    <div id="view-cards" class="view"></div>
+    <div id="view-cards" class="view">
+      <div class="viewbar"><button id="btnSide" class="toggle">🗺 Карта рядом</button></div>
+      <div id="split" class="split">
+        <div id="cardsList"></div>
+        <div class="side"><div id="sideMap"></div></div>
+      </div>
+    </div>
     <div id="view-table" class="view hidden"></div>
     <div id="view-map" class="view hidden"><div id="map"></div></div>
     <div id="view-runs" class="view hidden"></div>

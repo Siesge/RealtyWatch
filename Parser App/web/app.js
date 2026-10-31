@@ -6,7 +6,7 @@ const RENO = { design: "дизайнерский", euro: "евроремонт",
 const SELLER = { owner: "собственник", agent: "агент", developer: "застройщик" };
 const STATE = { running: "идёт", done: "готово", error: "ошибка", blocked: "блокировка", stopped: "остановлен" };
 
-let ALL = [], SETTINGS = null, view = "cards", jAfter = 0, map = null, mapLayer = null, zoneLayer = null, tableSort = null;
+let ALL = [], SETTINGS = null, view = "cards", jAfter = 0, tableSort = null;
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -99,7 +99,7 @@ function tags(r) {
 function card(r) {
   const meta = [r.living_area && `жилая ${r.living_area}`, r.kitchen_area && `кухня ${r.kitchen_area}`, r.build_year && `${r.build_year} г.`]
     .filter(Boolean).join(" · ");
-  return `<div class="card ${r.excluded ? "excl" : ""} ${r.active ? "" : "inactive"}">
+  return `<div class="card ${r.excluded ? "excl" : ""} ${r.active ? "" : "inactive"}" data-id="${esc(rid(r))}">
     <div class="ph" style="background-image:url('${esc(r.photo || "")}')">
       <span class="src ${r.source}">${SRC[r.source]}</span><span class="zn ${r.zone}">${r.zone}</span>
     </div>
@@ -111,12 +111,18 @@ function card(r) {
       <div class="tags">${tags(r)}</div>
       <div class="desc">${esc((r.description || "").slice(0, 300))}</div>
     </div>
-    <div class="cf"><span>впервые ${dt(r.first_seen)} · ${r.fetch_mode || ""}</span><a href="${esc(r.url)}" target="_blank" rel="noopener">Открыть ↗</a></div>
+    <div class="cf"><span>впервые ${dt(r.first_seen)} · ${r.fetch_mode || ""}</span>
+      <span>${r.lat != null ? `<button class="pin" title="Показать на карте">📍</button>` : ""}<a href="${esc(r.url)}" target="_blank" rel="noopener">Открыть ↗</a></span></div>
   </div>`;
 }
 
 function renderCards(rows) {
-  const el = $("#view-cards");
+  if (sideOn()) {
+    if (!SIDE) SIDE = makeMap("sideMap");
+    drawMap(SIDE, rows);
+    hl = null;
+  }
+  const el = $("#cardsList");
   if (!rows.length) { el.innerHTML = `<div class="empty">Нет объявлений по текущему фильтру. Запустите парсеры или ослабьте фильтр.</div>`; return; }
   const LIMIT = 240;
   el.innerHTML = Object.keys(ZONE).map(z => {
@@ -152,26 +158,70 @@ function renderTable(rows) {
   });
 }
 
-// ---------- карта ----------
-function renderMap(rows) {
-  if (!map) {
-    map = L.map("map").setView([44.49, 34.155], 13);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(map);
-    mapLayer = L.layerGroup().addTo(map);
-  }
-  setTimeout(() => map.invalidateSize(), 50);
-  if (zoneLayer) zoneLayer.remove();
+// ---------- карты (вкладка «Карта» и карта рядом с карточками) ----------
+const COLOR = { cian: "#1a73e8", avito: "#00a046", yandex: "#e5462e" };
+const rid = r => `${r.source}:${r.source_id}`;
+let MAIN = null, SIDE = null, hl = null;
+
+function makeMap(el) {
+  const m = L.map(el).setView([44.49, 34.155], 13);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(m);
+  return { map: m, layer: L.layerGroup().addTo(m), zone: null, markers: {} };
+}
+
+function markerStyle(r, on) {
+  return { radius: on ? 10 : 6, color: on ? "#111" : "#fff", weight: on ? 3 : 1, fillColor: COLOR[r.source], fillOpacity: r.excluded ? .35 : .9 };
+}
+
+function drawMap(M, rows) {
+  setTimeout(() => M.map.invalidateSize(), 50);
+  if (M.zone) M.zone.remove();
   const z = SETTINGS.zone;
-  zoneLayer = z.polygon ? L.polygon(z.polygon, { color: "#d32f2f", weight: 2, fillOpacity: .05 })
-    : L.circle(z.center, { radius: z.radius_m, color: "#d32f2f", weight: 2, fillOpacity: .05 });
-  zoneLayer.addTo(map);
-  mapLayer.clearLayers();
-  const color = { cian: "#1a73e8", avito: "#00a046", yandex: "#e5462e" };
+  M.zone = (z.polygon ? L.polygon(z.polygon, { color: "#d32f2f", weight: 2, fillOpacity: .05 })
+    : L.circle(z.center, { radius: z.radius_m, color: "#d32f2f", weight: 2, fillOpacity: .05 })).addTo(M.map);
+  M.layer.clearLayers();
+  M.markers = {};
   rows.filter(r => r.lat != null).forEach(r => {
-    L.circleMarker([r.lat, r.lon], { radius: 6, color: "#fff", weight: 1, fillColor: color[r.source], fillOpacity: r.excluded ? .35 : .9 })
+    const mk = L.circleMarker([r.lat, r.lon], markerStyle(r, false))
       .bindPopup(`<b>${fmt(r.price)} ₽</b> · ${SRC[r.source]} · зона ${r.zone}<br>${esc(r.title)}<br>${esc(r.address || "")}<br><a href="${esc(r.url)}" target="_blank">Открыть ↗</a>`)
-      .addTo(mapLayer);
+      .addTo(M.layer);
+    mk.row = r;
+    mk.on("click", () => focusCard(rid(r)));
+    M.markers[rid(r)] = mk;
   });
+}
+
+function renderMap(rows) {
+  if (!MAIN) MAIN = makeMap("map");
+  drawMap(MAIN, rows);
+}
+
+function highlight(id, fly) {
+  if (!SIDE || !sideOn()) return;
+  if (hl && SIDE.markers[hl]) SIDE.markers[hl].setStyle(markerStyle(SIDE.markers[hl].row, false));
+  hl = id;
+  const mk = SIDE.markers[id];
+  if (!mk) return;
+  mk.setStyle(markerStyle(mk.row, true)).bringToFront();
+  if (fly) { SIDE.map.flyTo(mk.getLatLng(), Math.max(SIDE.map.getZoom(), 16), { duration: .6 }); mk.openPopup(); }
+}
+
+function focusCard(id) {
+  if (view !== "cards") return;
+  const el = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+  if (!el) return;
+  el.scrollIntoView({ block: "center", behavior: "smooth" });
+  el.classList.add("focus");
+  setTimeout(() => el.classList.remove("focus"), 1800);
+}
+
+function sideOn() { return $("#split").classList.contains("with-map"); }
+
+function setSide(on) {
+  $("#split").classList.toggle("with-map", on);
+  $("#btnSide").classList.toggle("active", on);
+  try { localStorage.setItem("rw.sideMap", on ? "1" : "0"); } catch (e) { /* хранилище недоступно */ }
+  if (on) render();
 }
 
 // ---------- прогоны ----------
@@ -216,8 +266,12 @@ function renderSettings() {
       <label>Авито</label>${modeSel("avito")}
       <label>Яндекс</label>${modeSel("yandex")}
       <label>Авито: макс. страниц объявлений за прогон</label><input type="number" id="sAvDet" value="${s.avito.max_details}">
+      <label>Окно браузера</label><select id="sWin">
+        ${[["hidden", "скрытое — появляется только при капче"], ["visible", "видимое"], ["headless", "без окна (headless, легче распознать бота)"]]
+          .map(([v, t]) => `<option value="${v}" ${(SETTINGS.browser.window || "hidden") === v ? "selected" : ""}>${t}</option>`).join("")}</select>
     </div>
-    <div class="hint">auto — сначала быстрый HTTP, при блокировке автоматически браузер; http — только HTTP; browser — только браузер (видимое окно, капчу проходите вручную).</div>
+    <div class="hint">auto — сначала быстрый HTTP, при блокировке автоматически браузер; http — только HTTP; browser — только браузер.
+      В скрытом режиме окно Chromium работает за пределами экрана; если сайт покажет капчу, окно само появится — пройдите проверку, и оно снова скроется.</div>
     <div class="actions"><button class="primary" id="btnSave">Сохранить и пересчитать</button></div>
   </div>`;
   $("#btnSave").onclick = saveSettings;
@@ -232,6 +286,7 @@ async function saveSettings() {
   z.center = [+$("#zLat").value, +$("#zLon").value]; z.radius_m = +$("#zR").value;
   $$("#view-settings select[data-site]").forEach(el => s[el.dataset.site].mode = el.value);
   s.avito.max_details = +$("#sAvDet").value;
+  SETTINGS.browser.window = $("#sWin").value;
   SETTINGS = await post("/api/settings", SETTINGS);
   await post("/api/reclassify");
   await loadData();
@@ -281,6 +336,7 @@ function setView(v) {
   $(`#view-${v}`).classList.remove("hidden");
   const side = v === "cards" || v === "table" || v === "map";
   $("#filters").classList.toggle("hidden", !side);
+  $(".layout").classList.toggle("wide", !side);
   $("#summary").classList.toggle("hidden", !side);
   if (v === "runs") renderRuns();
   else if (v === "settings") renderSettings();
@@ -303,5 +359,22 @@ $("#btnRun").onclick = async () => {
 };
 $("#btnStop").onclick = () => post("/api/stop", {});
 $("#jToggle").onclick = () => $("#journal").classList.toggle("collapsed");
+$("#btnSide").onclick = () => setSide(!sideOn());
+$("#cardsList").addEventListener("mouseover", e => {
+  const c = e.target.closest(".card");
+  if (c && c.dataset.id !== hl) highlight(c.dataset.id, false);
+});
+$("#cardsList").addEventListener("click", e => {
+  if (!e.target.closest(".pin")) return;
+  const id = e.target.closest(".card").dataset.id;
+  if (!sideOn()) setSide(true);
+  highlight(id, true);
+});
+{
+  let on = true;
+  try { on = localStorage.getItem("rw.sideMap") !== "0"; } catch (e) { /* хранилище недоступно */ }
+  $("#split").classList.toggle("with-map", on);
+  $("#btnSide").classList.toggle("active", on);
+}
 
 (async () => { await loadSettings(); await loadData(); poll(); })();

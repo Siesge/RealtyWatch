@@ -71,15 +71,21 @@ class Http:
         return self.request("POST", url, **kw)
 
 
-class Browser:
-    """Видимое окно Chromium с постоянным профилем. При капче ждёт, пока её пройдёт человек."""
+OFFSCREEN = -32000
 
-    def __init__(self, site, is_blocked, log, stop, headless=False, captcha_wait_min=10):
+
+class Browser:
+    """Chromium с постоянным профилем.
+    window: hidden — полноценное окно за пределами экрана (по умолчанию: незаметно и без признаков headless),
+            visible — обычное окно, headless — без окна (быстрее, но сайты чаще распознают бота).
+    При капче скрытое окно выводится на экран, пока её не пройдёт человек."""
+
+    def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10):
         self.site = site
         self.is_blocked = is_blocked
         self.log = log
         self.stop = stop
-        self.headless = headless
+        self.window = window
         self.captcha_wait = captcha_wait_min * 60
         self._pw = None
         self.ctx = None
@@ -90,17 +96,32 @@ class Browser:
             return
         from patchright.sync_api import sync_playwright
 
-        self.log("запускаю браузер")
+        self.log(f"запускаю браузер ({self.window})")
         self._pw = sync_playwright().start()
-        self.ctx = self._pw.chromium.launch_persistent_context(
-            str(PROFILES / self.site / "browser"),
-            headless=self.headless,
-            no_viewport=True,
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            args=["--start-maximized"],
-        )
+        opts = dict(locale="ru-RU", timezone_id="Europe/Moscow", headless=self.window == "headless")
+        if self.window == "headless":
+            opts["viewport"] = {"width": 1440, "height": 900}
+        else:
+            opts["no_viewport"] = True
+            opts["args"] = (["--start-maximized"] if self.window == "visible"
+                            else [f"--window-position={OFFSCREEN},{OFFSCREEN}", "--window-size=1440,900",
+                                  # иначе Windows считает окно перекрытым и страница становится visibilityState=hidden
+                                  "--disable-features=CalculateNativeWinOcclusion",
+                                  "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding"])
+        self.ctx = self._pw.chromium.launch_persistent_context(str(PROFILES / self.site / "browser"), **opts)
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+
+    def _place_window(self, left, top):
+        try:
+            cdp = self.ctx.new_cdp_session(self.page)
+            wid = cdp.send("Browser.getWindowForTarget")["windowId"]
+            cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "normal"}})
+            cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {"left": left, "top": top, "width": 1366, "height": 900}})
+            cdp.detach()
+            if left >= 0:
+                self.page.bring_to_front()
+        except Exception as e:
+            self.log(f"не удалось переместить окно: {e}")
 
     def _humanize(self):
         try:
@@ -125,6 +146,10 @@ class Browser:
             pause(settle, self.stop)
             html = self.page.content()
         if self.is_blocked(html, self.page.url):
+            if self.window == "headless":
+                raise Blocked("капча в режиме без окна — переключите «Окно браузера» на «скрытое» или «видимое»")
+            if self.window == "hidden":
+                self._place_window(80, 60)
             self.log(f"⚠ НУЖНА РУЧНАЯ ПРОВЕРКА: пройдите капчу в окне браузера ({self.captcha_wait // 60} мин)")
             end = time.time() + self.captcha_wait
             while time.time() < end:
@@ -135,6 +160,8 @@ class Browser:
                     continue
                 if not self.is_blocked(html, self.page.url):
                     self.log("проверка пройдена")
+                    if self.window == "hidden":
+                        self._place_window(OFFSCREEN, OFFSCREEN)
                     if self.page.url.rstrip("/") != url.rstrip("/"):
                         self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
                         pause(settle, self.stop)
