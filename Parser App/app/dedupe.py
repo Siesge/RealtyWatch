@@ -2,6 +2,7 @@
 получают общий object_id. Вызывается при каждой записи объявления во время сбора."""
 import re
 
+from . import rules
 from .geo import haversine_m
 
 MAX_AREA_DIFF = 1.0     # м²
@@ -12,7 +13,7 @@ _DEG = 0.0025           # ~250 м: грубый отбор кандидатов 
 _FLAT_NO = re.compile(r"\bкв(?:артир[аы])?\.?\s*№?\s*(\d{1,4})\b", re.I)
 _BLOCK_NO = re.compile(r"\b(?:корпус[ае]?|корп\.)\s*№?\s*(\d{1,3})\b", re.I)
 
-COLS = "source, source_id, object_id, rooms, area, floor, floors, lat, lon, price, is_new_building, description, cluster_key"
+COLS = "source, source_id, object_id, rooms, area, floor, floors, lat, lon, price, is_new_building, description, cluster_key, address"
 
 
 def _num(rx, text):
@@ -20,10 +21,27 @@ def _num(rx, text):
     return m.group(1) if m else None
 
 
-def same_object(a, b):
-    """Похожи ли два объявления на одну квартиру."""
-    if a["source"] == "yandex" == b["source"] and a["cluster_key"] and a["cluster_key"] == b["cluster_key"]:
-        return True  # Яндекс сам склеил дубли
+_ADDR_JUNK = re.compile(
+    r"россия|республика крым|крым республика|респ\.? крым|муниципальный округ ялта|городской округ ялта|г\.\s*о\.\s*ялта"
+    r"|ялта г\.?|г\.\s*ялта|\bялта\b|\bг\.")
+_ADDR_TYPES = re.compile(
+    r"\b(улица|ул|переулок|пер|проспект|пр-кт|просп|шоссе|ш|набережная|наб|проезд|бульвар|б-р|тупик|спуск|дом|д)\b\.?")
+_ADDR = re.compile(r"([а-я][а-я\-\. ]{2,}?)[\s,]+(\d+[а-я]?)\b")
+
+
+def address_key(address):
+    """«Крым Республика, Ялта г., Киевская ул., д.9» и «ул. Киевская, 9» → «киевская|9»."""
+    a = _ADDR_TYPES.sub(" ", _ADDR_JUNK.sub(" ", rules.norm(address)))
+    m = _ADDR.search(a)
+    if not m:
+        return None
+    return f"{re.sub(r'[^а-я]', '', m.group(1))[:8]}|{m.group(2)}"
+
+
+def same_object(a, b, location=True):
+    """Похожи ли два объявления на одну квартиру.
+    Метка дублей Яндекса (cluster_key) лишь помогает найти кандидатов: в новостройках она объединяет
+    одинаковые планировки разных квартир, поэтому все проверки ниже обязательны и для неё."""
     if a["rooms"] is None or a["rooms"] != b["rooms"] or not a["area"] or not b["area"]:
         return False
     if abs(a["area"] - b["area"]) > MAX_AREA_DIFF:
@@ -32,8 +50,16 @@ def same_object(a, b):
         return False
     if a["floors"] and b["floors"] and a["floors"] != b["floors"]:
         return False
-    if a["lat"] is None or b["lat"] is None or haversine_m(a["lat"], a["lon"], b["lat"], b["lon"]) > MAX_DISTANCE:
-        return False
+    if not location:
+        pass  # расположение уже подтверждено с другим объявлением объекта
+    elif a["lat"] is not None and b["lat"] is not None:
+        if haversine_m(a["lat"], a["lon"], b["lat"], b["lon"]) > MAX_DISTANCE:
+            return False
+    else:
+        # нет координат (у Авито — пока не открыта страница объявления): нужен совпадающий адрес «улица + дом»
+        ka = address_key(a["address"])
+        if not ka or ka != address_key(b["address"]):
+            return False
     if a["price"] and b["price"] and abs(a["price"] - b["price"]) / max(a["price"], b["price"]) > MAX_PRICE_DIFF:
         return False
     if a["is_new_building"] or b["is_new_building"]:
@@ -58,16 +84,34 @@ def assign(con, source, source_id):
     q = f"SELECT {COLS} FROM listings WHERE NOT (source=? AND source_id=?) AND ("
     args = [source, source_id]
     conds = []
-    if me["lat"] is not None and me["rooms"] is not None and me["floor"]:
-        conds.append("(rooms=? AND floor=? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?)")
-        args += [me["rooms"], me["floor"], me["lat"] - _DEG, me["lat"] + _DEG, me["lon"] - _DEG * 1.4, me["lon"] + _DEG * 1.4]
+    if me["rooms"] is not None and me["floor"]:
+        if me["lat"] is not None:
+            conds.append("(rooms=? AND floor=? AND ((lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?) OR lat IS NULL))")
+            args += [me["rooms"], me["floor"], me["lat"] - _DEG, me["lat"] + _DEG, me["lon"] - _DEG * 1.4, me["lon"] + _DEG * 1.4]
+        else:
+            conds.append("(rooms=? AND floor=?)")  # сравнение по адресу — в same_object
+            args += [me["rooms"], me["floor"]]
     if source == "yandex" and me["cluster_key"]:
         conds.append("(source='yandex' AND cluster_key=?)")
         args.append(me["cluster_key"])
+    cands = set()
     if conds:
         for other in con.execute(q + " OR ".join(conds) + ")", args):
-            if other["object_id"] and same_object(me, other):
-                linked.add(other["object_id"])
+            if other["object_id"] and other["object_id"] not in linked and same_object(me, other):
+                cands.add(other["object_id"])
+    # Полная связь по характеристикам: объект присоединяется, только если КАЖДОЕ его объявление совпадает
+    # с каждым в группе по комнатам, площади, этажу, цене и номерам квартир — иначе цепочка «A≈B, B≈C» склеила бы
+    # разные квартиры одной планировки в ЖК. Расположение достаточно подтвердить с одним объявлением (тот же дом).
+    def members(oid):
+        return con.execute(f"SELECT {COLS} FROM listings WHERE object_id=? AND NOT (source=? AND source_id=?)",
+                           (oid, source, source_id)).fetchall()
+
+    group = [me] + (members(me["object_id"]) if me["object_id"] else [])
+    for oid_c in sorted(cands, key=lambda o: -len(members(o))):
+        extra = members(oid_c)
+        if all(same_object(a, b, location=False) for a in extra for b in group):
+            linked.add(oid_c)
+            group += extra
     oid = min(linked) if linked else f"{source}:{source_id}"
     con.execute("UPDATE listings SET object_id=? WHERE source=? AND source_id=?", (oid, source, source_id))
     for other in linked - {oid}:

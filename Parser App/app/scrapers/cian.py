@@ -1,5 +1,6 @@
 """ЦИАН: JSON API поиска (HTTP) или состояние страницы выдачи (браузер)."""
 import math
+import re
 from urllib.parse import urlencode
 
 from .. import rules
@@ -9,6 +10,8 @@ API = "https://api.cian.ru/search-offers/v2/search-offers-desktop/"
 PAGE_SIZE = 28
 
 DECORATION = {"without": "none", "rough": "none", "preFine": "none", "fine": "finish"}
+STATUS = {"deactivated": "снято с публикации", "removed": "удалено", "draft": "черновик", "blocked": "заблокировано",
+          "moderate": "на модерации", "refused": "отклонено модерацией", "sold": "продано"}
 
 _JS_STATE = """() => {
   const cfg = window._cianConfig && window._cianConfig['frontend-serp'];
@@ -71,19 +74,45 @@ class Cian(Scraper):
         return self.fetch(via_http, via_browser)
 
     def listings(self):
-        page, pages = 1, 1
-        while page <= pages and page <= self.site.get("max_pages", 40):
+        page, pages, limit = 1, 1, self.site.get("max_pages", 40)
+        while page <= pages and page <= limit:
             offers, total = self._load(page)
             pages = max(1, math.ceil((total or 0) / PAGE_SIZE))
-            self.progress(page=page, pages=min(pages, self.site.get("max_pages", 40)), total=total)
+            if not offers and page < pages:
+                self.log(f"страница {page}/{pages} пустая — повторяю")
+                self.wait()
+                offers, total = self._load(page)
+                if not offers:
+                    self.empty_page(page, pages)
+            self.progress(page=page, pages=min(pages, limit), total=total)
             self.log(f"страница {page}/{pages}: {len(offers)} объявлений")
             for o in offers:
                 yield self._normalize(o)
-            if not offers:
-                break
             page += 1
-            if page <= pages:
+            if page <= pages and page <= limit:
                 self.wait()
+        self.complete = page > pages
+
+    def verify(self, row):
+        """Страница объявления: offer.status — published (активно) или другой статус / 404."""
+        try:
+            h = self.http.get(row["url"]).text
+        except IOError as e:
+            if "HTTP 404" in str(e) or "HTTP 410" in str(e):
+                return "removed", "на ЦИАН страница объявления не найдена (404)", None
+            return None, None, None
+        except Exception:
+            return None, None, None
+        m = re.search(r'"offer":\{"category":"[^"]*","status":"(\w+)"', h)
+        if not m:
+            return None, None, None
+        status = m.group(1)
+        archived = '"isArchived":true' in h[:2_000_000]
+        pm = re.search(r'"bargainTerms":\{[^{}]*?"priceRur":(\d+)', h)
+        price = int(pm.group(1)) if pm else None
+        if status == "published" and not archived:
+            return "active", "на ЦИАН объявление опубликовано, но не попало в поиск (дубль другого агента или цена вне фильтра)", price
+        return "removed", f"на ЦИАН статус объявления «{STATUS.get(status, status)}»", price
 
     def _normalize(self, o):
         bt = o.get("bargainTerms") or {}

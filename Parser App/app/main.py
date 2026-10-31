@@ -130,12 +130,53 @@ def _startup_maintenance():
     from . import db, dedupe, images
     from .runner import manager
 
+    from . import history
+
     con = db.connect()
     if con.execute("SELECT COUNT(*) FROM listings WHERE object_id IS NULL").fetchone()[0]:
         n = dedupe.rebuild(con)
         manager.log("db", f"объединение дублей: {n} объектов")
+    con.execute("UPDATE runs SET status='interrupted', message='прервано: программа была закрыта во время сбора' "
+                "WHERE status='running'")
+    con.commit()
+    history.backfill(con)
     con.close()
     images.repair_async(db.connect, log=lambda m: manager.log("db", m))
+
+
+def _changes_text(c):
+    parts = []
+    if c["new"]:
+        parts.append(f"+{c['new']} новых")
+    if c["removed"]:
+        parts.append(f"{c['removed']} снято")
+    if c["price_down"]:
+        parts.append(f"↓{c['price_down']} подешевели")
+    if c["price_up"]:
+        parts.append(f"↑{c['price_up']} подорожали")
+    if c["returned"]:
+        parts.append(f"{c['returned']} вернулись в продажу")
+    return " · ".join(parts)
+
+
+def _notify_hook(tray):
+    """После каждой пачки прогонов: уведомление, только если на рынке что-то изменилось."""
+    from . import db, history
+    from .runner import manager
+
+    def hook(started, auto):
+        con = db.connect()
+        c = history.changes_summary(con, started)
+        con.close()
+        text = _changes_text(c)
+        if not text:
+            manager.log("db", "сбор завершён — изменений на рынке нет")
+            return
+        manager.log("db", f"🔔 изменения на рынке: {text}")
+        if tray:
+            tray.notify("RealtyWatch: изменения на рынке", text + "\nНажмите, чтобы посмотреть", view="changes")
+
+    return hook
 
 
 class DesktopApi:
@@ -197,13 +238,21 @@ def main():
     url = f"http://127.0.0.1:{port}/"
     RUNTIME_FILE.write_text(json.dumps({"pid": os.getpid(), "url": url}), encoding="utf-8")
     threading.Thread(target=_startup_maintenance, daemon=True, name="maintenance").start()
+    from .runner import manager
+    from .server import scheduler
+
+    sched = scheduler()  # автообновление по таймеру работает и при свёрнутом окне
+    tray = None
     try:
         if server_only:
+            manager.on_batch_done.append(_notify_hook(None))
             print(f"RealtyWatch (сервер для отладки): {url}")
             while True:
                 time.sleep(1)
         else:
             import webview
+
+            from .tray import Tray
 
             _set_app_id()
             api = DesktopApi()
@@ -212,10 +261,22 @@ def main():
                                            background_color="#F3F1EC" if _light_theme() else "#0D0F12")
             DesktopApi._window = window
             window.events.shown += _apply_icon
+
+            def on_shown():
+                nonlocal tray
+                if tray is None:
+                    tray = Tray(window, str(paths.ROOT / "assets" / "icon.png"), TITLE,
+                                on_update=lambda: manager.start(sched.get()["sources"]))
+                    manager.on_batch_done.append(_notify_hook(tray))
+                    window.events.minimized += tray.hide  # свернуть = убрать в трей
+
+            window.events.shown += on_shown
             webview.start(private_mode=False, storage_path=str(paths.DATA / "webview"))
     except KeyboardInterrupt:
         pass
     finally:
+        if tray:
+            tray.stop()
         _shutdown_runs()
         server.should_exit = True
         try:

@@ -47,6 +47,8 @@ class Scraper:
         self.browser = None
         self.use_browser = self.mode == "browser"
         self.last_mode = None
+        # True — выдача пройдена до последней страницы; только тогда отсутствующие объявления проверяются на снятие
+        self.complete = False
 
     # --- переопределяется в наследниках ---
     def is_blocked(self, html, url):
@@ -55,6 +57,15 @@ class Scraper:
     def is_ip_banned(self, html, url):
         """Страница «ограничение по IP за частые запросы» (отличается от капчи)."""
         return False
+
+    def verify(self, row):
+        """Проверка объявления, пропавшего из поиска, по его странице на сайте.
+        Возвращает (state, reason, price): state — 'active' | 'removed' | None (не удалось узнать)."""
+        return None, None, None
+
+    def empty_page(self, page, pages):
+        """Пустая страница посреди выдачи — сбой (капча, ограничение), а не конец списка."""
+        raise IOError(f"страница {page} из {pages} пришла пустой — прогон неполный, снятие объявлений не выполняется")
 
     def listings(self):
         """Генератор нормализованных объявлений (dict)."""

@@ -5,7 +5,7 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import db, dedupe, geo, images, rules, settings, transfer
+from . import db, dedupe, geo, history, images, rules, settings, transfer
 from .paths import EXPORTS, WEB
 from .runner import manager
 from .scrapers import SCRAPERS
@@ -73,6 +73,55 @@ def image(source: str, source_id: str):
     if p is None:
         return Response(status_code=404)
     return FileResponse(p, media_type=MEDIA.get(p.suffix, "image/jpeg"), headers={"Cache-Control": "max-age=86400"})
+
+
+_scheduler = None
+
+
+def scheduler():
+    global _scheduler
+    if _scheduler is None:
+        from .scheduler import Scheduler
+
+        _scheduler = Scheduler(manager)
+    return _scheduler
+
+
+@app.get("/api/schedule")
+def schedule_get():
+    return scheduler().get()
+
+
+@app.post("/api/schedule")
+def schedule_set(body: dict = Body(...)):
+    return scheduler().update(body)
+
+
+@app.get("/api/changes")
+def changes(days: int = 7, baseline: int = 0):
+    con = db.connect()
+    rows = history.changes(con, days, bool(baseline))
+    con.close()
+    return rows
+
+
+@app.get("/api/dashboard")
+def dashboard():
+    con = db.connect()
+    d = history.dashboard(con)
+    con.close()
+    return d
+
+
+@app.post("/api/recheck_removed")
+def recheck_removed():
+    if manager.any_running():
+        raise HTTPException(409, "Дождитесь окончания сбора")
+    import threading
+
+    threading.Thread(target=history.recheck_removed, args=(SCRAPERS, settings.load(), lambda m: manager.log("db", m)),
+                     daemon=True).start()
+    return {"started": True}
 
 
 @app.post("/api/images/repair")

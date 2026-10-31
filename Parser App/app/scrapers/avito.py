@@ -89,6 +89,14 @@ class Avito(Scraper):
             if count:
                 pages = math.ceil(count / 50)
             items = doc.xpath('//*[@data-marker="item"]')
+            if not items and page < pages:
+                # Например, после капчи сайт отдаёт не ту страницу — это сбой, а не конец выдачи
+                self.log(f"страница {page}/{pages} пустая — повторяю")
+                self.wait()
+                doc = lxml.html.fromstring(self._get_html(self._page_url(page)))
+                items = doc.xpath('//*[@data-marker="item"]')
+                if not items:
+                    self.empty_page(page, pages)
             batch = []
             for it in items:
                 item = self._from_list(it, prefix)
@@ -98,11 +106,13 @@ class Avito(Scraper):
             self.progress(page=page, pages=min(pages, limit), total=count)
             self.log(f"страница {page}/{pages}: {len(items)} карточек, новых в прогоне {len(batch)}")
             yield from batch
-            if not items or not batch:
+            if not items:  # пустая только последняя страница (пустая в середине — ошибка выше)
+                page = pages + 1
                 break
             page += 1
-            if page <= pages:
+            if page <= pages and page <= limit:
                 self.wait()
+        self.complete = page > pages
 
     def _from_list(self, it, prefix):
         a = next(iter(it.xpath('.//a[@data-marker="item-title"]')), None)

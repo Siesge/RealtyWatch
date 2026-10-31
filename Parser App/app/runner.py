@@ -5,10 +5,14 @@ import traceback
 from collections import deque
 from datetime import datetime
 
-from . import db, dedupe, geo, images, rules, settings
-from .net import Blocked, Stopped
+from . import db, dedupe, geo, history, images, rules, settings
+from .net import Blocked, Stopped, pause
 from .paths import LOGS
 from .scrapers import SCRAPERS
+from .scrapers.base import Scraper
+
+MISSED_TO_REMOVE = 2  # без проверки по странице объявление снимается после стольких пропусков подряд
+SOURCE_NAME = {"cian": "ЦИАН", "avito": "Авито", "yandex": "Яндекса"}
 
 logging.basicConfig(
     filename=LOGS / "app.log", level=logging.INFO, encoding="utf-8",
@@ -25,6 +29,10 @@ class RunManager:
         self.stops = {}
         self.journal = deque(maxlen=600)
         self._seq = 0
+        self._active = 0              # прогонов в работе (для сигнала «пачка завершена»)
+        self.batch_started = None     # начало текущей пачки прогонов
+        self.batch_auto = False       # пачка запущена расписанием
+        self.on_batch_done = []       # обработчики: f(batch_started, auto)
 
     def _log(self, source, msg):
         with self.lock:
@@ -40,10 +48,14 @@ class RunManager:
         t = self.threads.get(source)
         return t is not None and t.is_alive()
 
-    def start(self, sources):
+    def start(self, sources, auto=False):
         started = []
         for s in sources:
             if s in SCRAPERS and not self.running(s):
+                with self.lock:
+                    if self._active == 0:
+                        self.batch_started, self.batch_auto = db.now(), auto
+                    self._active += 1
                 self.stops[s] = threading.Event()
                 t = threading.Thread(target=self._run, args=(s,), daemon=True, name=f"run-{s}")
                 self.threads[s] = t
@@ -82,6 +94,8 @@ class RunManager:
         con = db.connect()
         run_id = con.execute("INSERT INTO runs(source, mode, started, status) VALUES(?,?,?,?)",
                              (source, cfg["sites"][source].get("mode"), started, "running")).lastrowid
+        # Пока у сайта не было ни одного полного прогона, «новые» — это первичная загрузка, а не новинки рынка
+        baseline = int(not con.execute("SELECT 1 FROM runs WHERE source=? AND status='done' AND id<?", (source, run_id)).fetchone())
         con.commit()
         scraper = SCRAPERS[source](cfg, lg, stop, pr)
         counts = {"found": 0, "new": 0, "changed": 0, "excluded": 0, "details": 0}
@@ -89,10 +103,14 @@ class RunManager:
         lg(f"старт, режим {scraper.mode}")
         try:
             for item in scraper.listings():
-                self._process(con, scraper, cfg, item, counts)
+                self._process(con, scraper, cfg, item, counts, run_id, baseline)
                 pr(**counts)
-            removed = db.mark_removed(con, source, started)
-            message = f"найдено {counts['found']}, новых {counts['new']}, изменилось {counts['changed']}, снято {removed}"
+            if scraper.complete:
+                removed = self._handle_missing(con, scraper, started, run_id, lg, stop)
+                note = ""
+            else:
+                note = " (выдача пройдена не полностью — снятие не проверялось)"
+            message = f"найдено {counts['found']}, новых {counts['new']}, изменилось {counts['changed']}, снято {removed}{note}"
         except Stopped:
             state, message = "stopped", "остановлено пользователем"
         except Blocked as e:
@@ -111,8 +129,57 @@ class RunManager:
             lg(f"завершено: {state} — {message}")
         if state != "stopped":
             images.repair(db.connect, sources=[source], log=lg, stop=stop)
+        try:
+            c2 = db.connect()
+            history.snapshot(c2, run_id)
+            c2.close()
+        except Exception:
+            log.error(traceback.format_exc())
+        with self.lock:
+            self._active -= 1
+            last = self._active == 0
+        if last:
+            for hook in self.on_batch_done:
+                try:
+                    hook(self.batch_started, self.batch_auto)
+                except Exception:
+                    log.error(traceback.format_exc())
 
-    def _process(self, con, scraper, cfg, item, counts):
+    def _handle_missing(self, con, scraper, started, run_id, lg, stop):
+        """Объявления, пропавшие из полной выдачи: проверка на сайте или два пропуска подряд."""
+        cand = db.missing(con, scraper.name, started)
+        if not cand:
+            return 0
+        active = con.execute("SELECT COUNT(*) FROM listings WHERE source=? AND active=1", (scraper.name,)).fetchone()[0]
+        can_verify = type(scraper).verify is not Scraper.verify
+        if not can_verify and len(cand) > max(20, 0.3 * active):
+            lg(f"⚠ из поиска пропало подозрительно много объявлений ({len(cand)} из {active}) — снятие отложено до следующего прогона")
+            return 0
+        lg(f"не найдено в поиске: {len(cand)} — " + ("проверяю на сайте" if can_verify else "считаю пропуски"))
+        removed = 0
+        for row in cand:
+            state, reason, price = scraper.verify(row) if can_verify else (None, None, None)
+            if can_verify:
+                pause((1.0, 2.5), stop)
+            if state == "active":
+                con.execute("UPDATE listings SET missed=0 WHERE source=? AND source_id=?", (row["source"], row["source_id"]))
+                if price:
+                    db.set_price(con, row["source"], row["source_id"], price, "цена со страницы объявления (в поиске его не было)", run_id)
+            elif state == "removed":
+                db.remove(con, row["source"], row["source_id"], reason, run_id)
+                removed += 1
+            else:
+                missed = (row.get("missed") or 0) + 1
+                con.execute("UPDATE listings SET missed=? WHERE source=? AND source_id=?", (missed, row["source"], row["source_id"]))
+                if missed >= MISSED_TO_REMOVE:
+                    db.remove(con, row["source"], row["source_id"],
+                              f"не найдено в поиске {SOURCE_NAME[scraper.name]} {missed} полных прогона подряд"
+                              + ("; страницу объявления проверить не удалось" if can_verify else ""), run_id)
+                    removed += 1
+            con.commit()
+        return removed
+
+    def _process(self, con, scraper, cfg, item, counts, run_id=None, baseline=0):
         f = cfg["filters"]
         existing = db.get(con, item["source"], item["source_id"])
         # Данные со страницы объявления уже есть в базе — берём их, не запрашивая повторно
@@ -128,7 +195,7 @@ class RunManager:
                 counts["details"] += 1
         item["zone"] = geo.classify(item, cfg["zone"])
         item["excluded"] = rules.evaluate(item, f)
-        res = db.upsert(con, item)
+        res = db.upsert(con, item, run_id, baseline)
         dedupe.assign(con, item["source"], item["source_id"])  # объединение с дублями на лету
         con.commit()
         counts["found"] += 1

@@ -5,3 +5,5 @@ uvicorn==0.34.3
 lxml==5.4.0
 pywebview==5.4
 pythonnet==3.2.1
+pystray==0.19.5
+pillow==11.2.1

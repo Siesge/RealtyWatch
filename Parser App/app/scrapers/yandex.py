@@ -64,16 +64,39 @@ class Yandex(Scraper):
         while index < pages and index < limit:
             offers, pager = self._load(index)
             pages = pager.get("totalPages") or 1
+            if not offers and index + 1 < pages:
+                self.log(f"страница {index + 1}/{pages} пустая — повторяю")
+                self.wait()
+                offers, pager = self._load(index)
+                if not offers:
+                    self.empty_page(index + 1, pages)
             self.progress(page=index + 1, pages=min(pages, limit), total=pager.get("totalItems"))
             self.log(f"страница {index + 1}/{pages}: {len(offers)} объявлений")
             for o in offers:
                 if o.get("offerType") == "SELL" and o.get("offerCategory") in (None, "APARTMENT"):
                     yield self._normalize(o)
-            if not offers:
-                break
             index += 1
-            if index < pages:
+            if index < pages and index < limit:
                 self.wait()
+        self.complete = index >= pages
+
+    def verify(self, row):
+        """Страница объявления: offerCard.card.active / obsolete."""
+        try:
+            st = parse_state(self.http.get(row["url"]).text)
+        except IOError as e:
+            if "HTTP 404" in str(e) or "HTTP 410" in str(e):
+                return "removed", "на Яндексе страница объявления не найдена (404)", None
+            return None, None, None
+        except Exception:
+            return None, None, None
+        card = ((st or {}).get("offerCard") or {}).get("card") or {}
+        if "active" not in card:
+            return None, None, None
+        price = to_int((card.get("price") or {}).get("value"))
+        if card.get("active") and not card.get("obsolete"):
+            return "active", "на Яндексе объявление активно, но не попало в поиск (цена или параметры вне фильтра)", price
+        return "removed", "на Яндексе объявление снято с публикации", price
 
     def _normalize(self, o):
         loc = o.get("location") or {}
