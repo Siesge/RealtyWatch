@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "realtywatch",
+      "runtimeExecutable": "D:\\Claude\\RealtyWatch\\Parser App\\runtime\\python\\python.exe",
+      "runtimeArgs": ["-m", "app.main", "--no-browser"],
+      "port": 8765
+    }
+  ]
+}

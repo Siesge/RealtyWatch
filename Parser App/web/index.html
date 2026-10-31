@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RealtyWatch</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">RealtyWatch <span class="sub">Ялта · квартиры</span></div>
+  <div class="runbox">
+    <label><input type="checkbox" class="src-run" value="cian" checked> ЦИАН</label>
+    <label><input type="checkbox" class="src-run" value="avito" checked> Авито</label>
+    <label><input type="checkbox" class="src-run" value="yandex" checked> Яндекс</label>
+    <button id="btnRun" class="primary">▶ Запустить</button>
+    <button id="btnStop">■ Стоп</button>
+  </div>
+  <nav class="tabs">
+    <button data-view="cards" class="active">Карточки</button>
+    <button data-view="table">Таблица</button>
+    <button data-view="map">Карта</button>
+    <button data-view="runs">Прогоны</button>
+    <button data-view="settings">Настройки</button>
+  </nav>
+</header>
+
+<section id="status" class="status"></section>
+
+<div class="layout">
+  <aside class="filters" id="filters">
+    <h3>Фильтр просмотра</h3>
+    <div class="fgroup"><div class="flabel">Источник</div>
+      <label><input type="checkbox" name="src" value="cian" checked> ЦИАН</label>
+      <label><input type="checkbox" name="src" value="avito" checked> Авито</label>
+      <label><input type="checkbox" name="src" value="yandex" checked> Яндекс</label>
+    </div>
+    <div class="fgroup"><div class="flabel">Зона</div>
+      <label><input type="checkbox" name="zone" value="A" checked> A — красный круг</label>
+      <label><input type="checkbox" name="zone" value="B" checked> B — остальная Ялта</label>
+      <label><input type="checkbox" name="zone" value="C"> C — посёлки Б. Ялты</label>
+    </div>
+    <div class="fgroup"><div class="flabel">Комнаты</div>
+      <label class="inline"><input type="checkbox" name="rooms" value="1" checked> 1</label>
+      <label class="inline"><input type="checkbox" name="rooms" value="2" checked> 2</label>
+      <label class="inline"><input type="checkbox" name="rooms" value="3" checked> 3</label>
+    </div>
+    <div class="fgroup"><div class="flabel">Цена, млн ₽</div>
+      <div class="row2"><input type="number" id="fPmin" step="0.1" placeholder="от"><input type="number" id="fPmax" step="0.1" placeholder="до"></div>
+    </div>
+    <div class="fgroup"><div class="flabel">Площадь от, м²</div><input type="number" id="fAmin"></div>
+    <div class="fgroup"><div class="flabel">Ремонт</div>
+      <select id="fReno"><option value="">любой</option><option value="known">только указанный</option>
+        <option value="design">дизайнерский</option><option value="euro">евро</option><option value="cosmetic">косметический</option>
+        <option value="finish">чистовая</option><option value="old">старый</option></select>
+    </div>
+    <div class="fgroup"><div class="flabel">Тип</div>
+      <select id="fNew"><option value="">все</option><option value="0">вторичка</option><option value="1">новостройки</option></select>
+    </div>
+    <div class="fgroup"><div class="flabel">Статус</div>
+      <select id="fState">
+        <option value="pass">прошли отсев</option><option value="excluded">отсеянные</option><option value="all">все</option>
+      </select>
+      <label><input type="checkbox" id="fActive" checked> только активные</label>
+      <label><input type="checkbox" id="fNoCoords"> без координат</label>
+    </div>
+    <div class="fgroup"><div class="flabel">Поиск по тексту</div><input type="search" id="fText" placeholder="улица, ЖК, слово…"></div>
+    <div class="fgroup"><div class="flabel">Сортировка</div>
+      <select id="fSort">
+        <option value="new">сначала новые</option><option value="price">цена ↑</option><option value="-price">цена ↓</option>
+        <option value="ppm">цена за м² ↑</option><option value="-area">площадь ↓</option>
+      </select>
+    </div>
+    <button id="btnReset" class="ghost">Сбросить</button>
+  </aside>
+
+  <main>
+    <div id="summary" class="summary"></div>
+    <div id="view-cards" class="view"></div>
+    <div id="view-table" class="view hidden"></div>
+    <div id="view-map" class="view hidden"><div id="map"></div></div>
+    <div id="view-runs" class="view hidden"></div>
+    <div id="view-settings" class="view hidden"></div>
+  </main>
+</div>
+
+<div id="journal" class="journal collapsed">
+  <div class="jhead" id="jToggle">Журнал <span id="jLast"></span></div>
+  <div class="jbody" id="jBody"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

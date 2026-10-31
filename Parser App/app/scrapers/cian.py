@@ -1,0 +1,136 @@
+"""ЦИАН: JSON API поиска (HTTP) или состояние страницы выдачи (браузер)."""
+import math
+from urllib.parse import urlencode
+
+from .. import rules
+from .base import Scraper, to_float, to_int, ts_to_iso
+
+API = "https://api.cian.ru/search-offers/v2/search-offers-desktop/"
+PAGE_SIZE = 28
+
+DECORATION = {"without": "none", "rough": "none", "preFine": "none", "fine": "finish"}
+
+_JS_STATE = """() => {
+  const cfg = window._cianConfig && window._cianConfig['frontend-serp'];
+  const st = Array.isArray(cfg) ? (cfg.find(x => x.key === 'initialState') || {}).value : null;
+  if (!st || !st.results) return null;
+  return {offers: st.results.offers, total: st.results.totalOffers, aggregated: st.results.aggregatedOffers, jsonQuery: st.results.jsonQuery};
+}"""
+
+
+class Cian(Scraper):
+    name = "cian"
+    label = "ЦИАН"
+
+    def is_blocked(self, html, url):
+        head = (html or "")[:4000].lower()
+        return "/captcha" in url or ("<title" in head and "captcha" in head)
+
+    def _json_query(self, page):
+        f = self.cfg["filters"]
+        q = {
+            "_type": "flatsale",
+            "engine_version": {"type": "term", "value": 2},
+            "region": {"type": "terms", "value": [self.site["region"]]},
+            "price": {"type": "range", "value": {"gte": f["price_min"], "lte": f["price_max"]}},
+            "currency": {"type": "term", "value": 2},
+            "room": {"type": "terms", "value": f["rooms"]},
+            "total_area": {"type": "range", "value": {"gte": f["area_min"]}},
+            "page": {"type": "term", "value": page},
+        }
+        if f.get("renovation", "off") != "off":
+            q["repair"] = {"type": "terms", "value": [1, 2, 3]}  # косметический, евро, дизайнерский
+        return q
+
+    def _page_url(self, page):
+        f = self.cfg["filters"]
+        p = [("deal_type", "sale"), ("engine_version", 2), ("offer_type", "flat"), ("region", self.site["region"]),
+             ("minprice", f["price_min"]), ("maxprice", f["price_max"]), ("mintarea", f["area_min"])]
+        p += [(f"room{r}", 1) for r in f["rooms"]]
+        if f.get("renovation", "off") != "off":
+            p += [(f"repair[{i}]", v) for i, v in enumerate([1, 2, 3])]
+        if page > 1:
+            p.append(("p", page))
+        return "https://www.cian.ru/cat.php?" + urlencode(p)
+
+    def _load(self, page):
+        def via_http():
+            r = self.http.post(API, json={"jsonQuery": self._json_query(page)},
+                               headers={"Origin": "https://www.cian.ru", "Referer": "https://www.cian.ru/"})
+            d = r.json()["data"]
+            # aggregatedCount — уникальные объекты (offerCount включает дубли от разных агентов)
+            return d["offersSerialized"], d.get("aggregatedCount") or d["offerCount"]
+
+        def via_browser(b):
+            b.goto(self._page_url(page))
+            st = b.evaluate(_JS_STATE)
+            if not st:
+                raise IOError("ЦИАН: не найдено состояние страницы")
+            return st["offers"], st["aggregated"] or st["total"]
+
+        return self.fetch(via_http, via_browser)
+
+    def listings(self):
+        page, pages = 1, 1
+        while page <= pages and page <= self.site.get("max_pages", 40):
+            offers, total = self._load(page)
+            pages = max(1, math.ceil((total or 0) / PAGE_SIZE))
+            self.progress(page=page, pages=min(pages, self.site.get("max_pages", 40)), total=total)
+            self.log(f"страница {page}/{pages}: {len(offers)} объявлений")
+            for o in offers:
+                yield self._normalize(o)
+            if not offers:
+                break
+            page += 1
+            if page <= pages:
+                self.wait()
+
+    def _normalize(self, o):
+        bt = o.get("bargainTerms") or {}
+        geo = o.get("geo") or {}
+        c = geo.get("coordinates") or {}
+        b = o.get("building") or {}
+        desc = o.get("description") or ""
+        rooms = 0 if o.get("flatType") == "studio" else o.get("roomsCount")
+        area = to_float(o.get("totalArea"))
+        price = to_int(bt.get("priceRur") or bt.get("price"))
+        reno = DECORATION.get(o.get("decoration"))
+        text_reno = rules.renovation_from_text(desc)
+        if text_reno == "none" or not reno:
+            reno = text_reno or reno
+        if not reno and self.cfg["filters"].get("renovation", "off") != "off":
+            reno = "any"  # ЦИАН отфильтровал по «есть ремонт», но вид не указан
+        address = geo.get("userInput") or ", ".join(a.get("fullName") or a.get("name", "") for a in geo.get("address") or [])
+        user = o.get("user") or {}
+        seller = "owner" if o.get("isByHomeowner") else ("developer" if o.get("fromDeveloper") else ("agent" if user.get("isAgent") else None))
+        photos = o.get("photos") or []
+        return {
+            "source": self.name,
+            "source_id": str(o.get("cianId") or o.get("id")),
+            "url": (o.get("fullUrl") or "").split("?")[0],
+            "title": f"{'Студия' if rooms == 0 else f'{rooms}-к. квартира'}, {area} м², {o.get('floorNumber')}/{b.get('floorsCount')} эт.",
+            "price": price,
+            "price_m2": round(price / area) if price and area else None,
+            "rooms": rooms,
+            "area": area,
+            "living_area": to_float(o.get("livingArea")),
+            "kitchen_area": to_float(o.get("kitchenArea")),
+            "floor": o.get("floorNumber"),
+            "floors": b.get("floorsCount"),
+            "address": address,
+            "lat": c.get("lat"),
+            "lon": c.get("lng"),
+            "renovation": reno,
+            "renovation_raw": o.get("decoration") or ("фильтр ЦИАН: с ремонтом" if reno == "any" else None),
+            "building_type": b.get("materialType"),
+            "build_year": b.get("buildYear"),
+            "is_new_building": int(o.get("category") == "newBuildingFlatSale"),
+            "is_share": o.get("category") == "flatShareSale",
+            "seller_type": seller,
+            "description": desc,
+            "photo": (photos[0].get("fullUrl") or photos[0].get("thumbnailUrl")) if photos else None,
+            "published_at": ts_to_iso(o.get("addedTimestamp")),
+            "fetch_mode": self.last_mode,
+            "raw": {"category": o.get("category"), "flatType": o.get("flatType"), "decoration": o.get("decoration"),
+                    "isApartments": o.get("isApartments"), "creationDate": o.get("creationDate")},
+        }
