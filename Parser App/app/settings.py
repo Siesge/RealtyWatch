@@ -30,8 +30,9 @@ DEFAULTS = {
             "mode": "auto",
             "search_url": "https://www.avito.ru/yalta/kvartiry/prodam-ASgBAgICAUSSA8YQ",
             "details": True,
-            "max_details": 400,
-            "delay": [4.0, 9.0],
+            # Авито ограничивает IP при частых запросах: первичная загрузка растягивается на несколько прогонов
+            "max_details": 150,
+            "delay": [6.0, 14.0],
             "max_pages": 40,
         },
         "yandex": {"enabled": True, "mode": "auto", "region_path": "yalta", "delay": [2.5, 6.0], "max_pages": 40},

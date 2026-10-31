@@ -152,12 +152,24 @@ class Browser:
                 self._place_window(80, 60)
             self.log(f"⚠ НУЖНА РУЧНАЯ ПРОВЕРКА: пройдите капчу в окне браузера ({self.captcha_wait // 60} мин)")
             end = time.time() + self.captcha_wait
+            last_retry = time.time()
             while time.time() < end:
                 pause((3, 3), self.stop)
                 try:
                     html = self.page.content()
                 except Exception:
                     continue
+                # «Проверка пройдена, перенаправление...» — сайт снял ограничение, но сам не переходит
+                passed = "Проверка пройдена" in html and "captcha" not in html.lower()
+                if self.is_blocked(html, self.page.url) and (passed and time.time() - last_retry > 10):
+                    self.log("сайт пишет «проверка пройдена» — открываю страницу заново")
+                    last_retry = time.time()
+                    try:
+                        self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        pause(settle, self.stop)
+                        html = self.page.content()
+                    except Exception:
+                        continue
                 if not self.is_blocked(html, self.page.url):
                     self.log("проверка пройдена")
                     if self.window == "hidden":
