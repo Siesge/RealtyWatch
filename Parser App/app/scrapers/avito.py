@@ -57,6 +57,10 @@ class Avito(Scraper):
     detail_fields = ("lat", "lon", "address", "description", "renovation", "renovation_raw", "building_type",
                      "build_year", "floors", "living_area", "kitchen_area", "details_fetched", "published_at")
 
+    def is_ip_banned(self, html, url):
+        # «Доступ ограничен: проблема с IP» — «с него идёт очень много запросов»
+        return "проблема с IP" in (html or "")[:30000]
+
     def is_blocked(self, html, url):
         head = (html or "")[:6000]
         return "Доступ ограничен" in head or "firewall-container" in (html or "")[:50000] or "/blocked" in url

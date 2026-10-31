@@ -6,7 +6,7 @@ const RENO = { design: "дизайнерский ремонт", euro: "евро�
   finish: "чистовая отделка", none: "без ремонта", any: "с ремонтом" };
 const RENO_RANK = { design: 6, euro: 5, cosmetic: 4, finish: 3, old: 2, any: 1 };
 const SELLER = { owner: "собственник", agent: "агент", developer: "застройщик" };
-const STATE = { running: "идёт сбор", done: "готово", error: "ошибка", blocked: "блокировка", stopped: "остановлен" };
+const STATE = { running: "идёт сбор", paused: "пауза", done: "готово", error: "ошибка", blocked: "блокировка", stopped: "остановлен" };
 const VIEW_TITLE = { cards: "Подборка", table: "Таблица", map: "Карта", runs: "Прогоны", settings: "Настройки" };
 const ICON = {
   pin: '<svg viewBox="0 0 24 24"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></svg>',
@@ -348,6 +348,7 @@ async function renderRuns() {
 
 // ---------- настройки и база ----------
 async function renderSettings() {
+  await loadSettings();  // свежие значения: задержка Авито могла вырасти во время сбора
   const f = SETTINGS.filters, z = SETTINGS.zone, s = SETTINGS.sites, b = SETTINGS.browser || {};
   const sw = (id, on) => `<span class="sw"><input type="checkbox" id="${id}" ${on ? "checked" : ""}><i></i></span>`;
   const modeSel = k => `<select data-site="${k}">${[["auto", "авто"], ["http", "только HTTP"], ["browser", "только браузер"]]
@@ -376,6 +377,8 @@ async function renderSettings() {
       <div class="field"><label>Авито</label>${modeSel("avito")}</div>
       <div class="field"><label>Яндекс</label>${modeSel("yandex")}</div>
       <div class="field"><label>Авито: страниц объявлений за прогон</label><input type="number" id="sAvDet" value="${s.avito.max_details}"></div>
+      <div class="field"><label>Авито: пауза между запросами, с<br><span class="meta">растёт сама при ограничении IP</span></label>
+        <span class="pair"><input type="number" step="1" min="1" id="sAvD0" value="${s.avito.delay[0]}"><i>—</i><input type="number" step="1" min="1" id="sAvD1" value="${s.avito.delay[1]}"></span></div>
       <div class="field"><label>Окно браузера</label><select id="sWin">
         ${[["hidden", "скрытое"], ["visible", "видимое"], ["headless", "без окна (headless)"]]
           .map(([v, t]) => `<option value="${v}" ${(b.window || "hidden") === v ? "selected" : ""}>${t}</option>`).join("")}</select></div>
@@ -456,6 +459,8 @@ async function saveSettings() {
   z.center = [+$("#zLat").value, +$("#zLon").value]; z.radius_m = +$("#zR").value;
   $$("#view-settings select[data-site]").forEach(el => s[el.dataset.site].mode = el.value);
   s.avito.max_details = +$("#sAvDet").value;
+  const d0 = Math.max(1, +$("#sAvD0").value), d1 = Math.max(d0, +$("#sAvD1").value);
+  s.avito.delay = [d0, d1];
   SETTINGS.browser = Object.assign(SETTINGS.browser || {}, { window: $("#sWin").value });
   SETTINGS = await post("/api/settings", SETTINGS);
   const r = await post("/api/reclassify");
@@ -477,9 +482,11 @@ function toast(kind, title, text) {
 function renderSources(status) {
   $("#sources").innerHTML = Object.keys(SRC).map(k => {
     const v = status[k], on = $(`.src-run[value=${k}]`)?.checked ?? true;
-    const state = v ? (v.running ? "running" : v.state) : "";
+    const paused = v && v.running && v.paused_until;
+    const state = v ? (paused ? "paused" : v.running ? "running" : v.state) : "";
     const pct = v && v.pages ? Math.round(100 * v.page / v.pages) : 0;
     const meta = !v ? "ещё не запускался"
+      : paused ? `⏸ ограничение IP — пауза до ${new Date(v.paused_until).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}, задержка ${v.delay ? v.delay.join("–") + " с" : "увеличена"}`
       : v.running ? `стр. ${v.page || 0} из ${v.pages || "?"} · найдено ${v.found}${v.details ? ` · карточек ${v.details}` : ""}`
       : v.message || "";
     return `<label class="src-row ${state}"><input type="checkbox" class="src-run" value="${k}" ${on ? "checked" : ""}><span class="switch"></span>
@@ -502,8 +509,13 @@ async function poll() {
       const body = $("#jBody");
       s.journal.forEach(j => {
         const d = document.createElement("div");
-        const warn = j.msg.includes("⚠");
-        d.className = "jl" + (warn ? " warn" : "");
+        const warn = j.msg.includes("⚠"), ban = j.msg.includes("⛔");
+        d.className = "jl" + (warn || ban ? " warn" : "");
+        if (ban) {
+          toast("warn", `${SRC[j.src]}: ограничение по IP`, j.msg.replace(/^⛔\s*/, ""));
+          $("#jDot").classList.remove("hidden");
+          loadSettings();  // задержка в настройках увеличилась
+        }
         d.innerHTML = `<span class="t">${j.t}</span><span class="s">${SRC[j.src] || (j.src === "db" ? "База" : j.src)}</span>${esc(j.msg)}`;
         body.appendChild(d);
         jAfter = j.n;

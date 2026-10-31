@@ -17,6 +17,10 @@ class Stopped(Exception):
     """Пользователь остановил прогон."""
 
 
+class IpBanned(Exception):
+    """Сайт временно ограничил IP за частые запросы — нужна пауза, а не человек."""
+
+
 def pause(delay, stop=None):
     t = random.uniform(*delay)
     end = time.time() + t
@@ -80,9 +84,10 @@ class Browser:
             visible — обычное окно, headless — без окна (быстрее, но сайты чаще распознают бота).
     При капче скрытое окно выводится на экран, пока её не пройдёт человек."""
 
-    def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10):
+    def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10, is_ip_banned=None):
         self.site = site
         self.is_blocked = is_blocked
+        self.is_ip_banned = is_ip_banned or (lambda html, url: False)
         self.log = log
         self.stop = stop
         self.window = window
@@ -145,6 +150,9 @@ class Browser:
             self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             pause(settle, self.stop)
             html = self.page.content()
+        if self.is_ip_banned(html, self.page.url) and "Проверка пройдена" not in html:
+            # Ограничение IP за частоту запросов: человек тут не поможет, нужна пауза (её делает парсер)
+            raise IpBanned(self.page.url)
         if self.is_blocked(html, self.page.url):
             if self.window == "headless":
                 raise Blocked("капча в режиме без окна — переключите «Окно браузера» на «скрытое» или «видимое»")
