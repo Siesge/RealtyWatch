@@ -8,6 +8,7 @@ import socket
 import sys
 import threading
 import time
+from pathlib import Path
 
 from . import paths
 from . import settings
@@ -124,6 +125,53 @@ def _apply_icon():
         pass
 
 
+def _startup_maintenance():
+    """Объекты для объявлений, собранных до появления объединения, и догрузка недостающих фото."""
+    from . import db, dedupe, images
+    from .runner import manager
+
+    con = db.connect()
+    if con.execute("SELECT COUNT(*) FROM listings WHERE object_id IS NULL").fetchone()[0]:
+        n = dedupe.rebuild(con)
+        manager.log("db", f"объединение дублей: {n} объектов")
+    con.close()
+    images.repair_async(db.connect, log=lambda m: manager.log("db", m))
+
+
+class DesktopApi:
+    """Методы, доступные странице как window.pywebview.api.* — нативные диалоги Windows."""
+
+    _window = None
+
+    def _dialog(self, kind, **kw):
+        import webview
+
+        fd = getattr(webview, "FileDialog", None)
+        mode = getattr(fd, kind) if fd else getattr(webview, f"{kind}_DIALOG")
+        res = DesktopApi._window.create_file_dialog(mode, file_types=("Архив базы RealtyWatch (*.zip)",), **kw)
+        if not res:
+            return None
+        return res if isinstance(res, str) else res[0]
+
+    def export_db(self):
+        from . import transfer
+
+        path = self._dialog("SAVE", directory=str(Path.home() / "Desktop"), save_filename=transfer.default_name())
+        if not path:
+            return {"cancelled": True}
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        return {"path": transfer.export_zip(path)}
+
+    def open_db_folder(self):
+        os.startfile(str(paths.DB_DIR))
+        return {"ok": True}
+
+    def pick_import(self):
+        path = self._dialog("OPEN", directory=str(Path.home() / "Desktop"))
+        return {"path": path} if path else {"cancelled": True}
+
+
 def _shutdown_runs():
     from .runner import manager
 
@@ -148,6 +196,7 @@ def main():
         return
     url = f"http://127.0.0.1:{port}/"
     RUNTIME_FILE.write_text(json.dumps({"pid": os.getpid(), "url": url}), encoding="utf-8")
+    threading.Thread(target=_startup_maintenance, daemon=True, name="maintenance").start()
     try:
         if server_only:
             print(f"RealtyWatch (сервер для отладки): {url}")
@@ -157,9 +206,11 @@ def main():
             import webview
 
             _set_app_id()
+            api = DesktopApi()
             window = webview.create_window(TITLE, url, width=1440, height=900,
-                                           min_size=(1100, 680), maximized=True,
+                                           min_size=(1100, 680), maximized=True, js_api=api,
                                            background_color="#F3F1EC" if _light_theme() else "#0D0F12")
+            DesktopApi._window = window
             window.events.shown += _apply_icon
             webview.start(private_mode=False, storage_path=str(paths.DATA / "webview"))
     except KeyboardInterrupt:

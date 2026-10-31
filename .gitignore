@@ -4,6 +4,8 @@ Parser App/browsers/
 
 # Данные пользователя: база, профили браузера, логи
 Parser App/data/
+Parser App/database/
+Parser App/exports/
 Parser App/profiles/
 Parser App/logs/
 

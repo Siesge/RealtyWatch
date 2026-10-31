@@ -5,7 +5,7 @@ import traceback
 from collections import deque
 from datetime import datetime
 
-from . import db, geo, rules, settings
+from . import db, dedupe, geo, images, rules, settings
 from .net import Blocked, Stopped
 from .paths import LOGS
 from .scrapers import SCRAPERS
@@ -56,6 +56,12 @@ class RunManager:
             if sources is None or s in sources:
                 ev.set()
 
+    def any_running(self):
+        return any(self.running(s) for s in list(self.threads))
+
+    def log(self, source, msg):
+        self._log(source, msg)
+
     def snapshot(self, after=0):
         with self.lock:
             return {
@@ -103,6 +109,8 @@ class RunManager:
             con.close()
             pr(state=state, message=message, finished=db.now())
             lg(f"завершено: {state} — {message}")
+        if state != "stopped":
+            images.repair(db.connect, sources=[source], log=lg, stop=stop)
 
     def _process(self, con, scraper, cfg, item, counts):
         f = cfg["filters"]
@@ -121,6 +129,7 @@ class RunManager:
         item["zone"] = geo.classify(item, cfg["zone"])
         item["excluded"] = rules.evaluate(item, f)
         res = db.upsert(con, item)
+        dedupe.assign(con, item["source"], item["source_id"])  # объединение с дублями на лету
         con.commit()
         counts["found"] += 1
         if item["excluded"]:

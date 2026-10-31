@@ -242,6 +242,49 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
 .open-btn:hover { background: var(--accent); color: var(--on-accent); }
 .open-btn svg { width: 14px; height: 14px; }
 
+/* фото, сердечко, ссылки на объявления */
+.media img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.media.noimg { background: linear-gradient(135deg, var(--sunken), var(--surface-2)); }
+.media.noimg::before { content: "нет фото"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-weight: 700; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+.media-top .left { display: flex; gap: 6px; }
+.heart {
+  width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255, 255, 255, .25); display: grid; place-items: center;
+  background: rgba(14, 18, 24, .40); backdrop-filter: blur(10px); color: #fff; transition: transform .15s, background .15s;
+}
+.heart:hover { transform: scale(1.08); background: rgba(14, 18, 24, .6); }
+.heart svg { width: 17px; height: 17px; }
+.heart.on { background: #fff; border-color: #fff; color: #E0475B; }
+.heart.on svg { fill: currentColor; }
+.heart.pop { animation: pop .35s ease; }
+@keyframes pop { 40% { transform: scale(1.3); } }
+.offers { display: flex; flex-direction: column; gap: 4px; }
+.offer {
+  display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 9px;
+  background: var(--surface-2); border: 1px solid var(--line); color: var(--ink); text-decoration: none; font-size: 12.5px; font-weight: 700; transition: border-color .15s, background .15s;
+}
+.offer:hover { border-color: var(--accent); background: var(--accent-soft); }
+.offer b { font-weight: 800; }
+.offer svg { width: 13px; height: 13px; color: var(--muted); }
+.offer.gone { opacity: .55; text-decoration: line-through; }
+.offer .best { font-size: 10.5px; color: var(--ok); font-weight: 800; }
+.multi { background: linear-gradient(135deg, rgba(226, 191, 128, .95), rgba(180, 135, 59, .95)) !important; color: #1B1408 !important; border-color: transparent !important; }
+.like-toggle { cursor: pointer; }
+.like-toggle input { display: none; }
+.like-toggle span { display: inline-flex; align-items: center; gap: 7px; height: 38px; padding: 0 14px; border-radius: 11px; background: var(--sunken); color: var(--muted); font-weight: 700; font-size: 13px; transition: all .15s; }
+.like-toggle span em { font-style: normal; font-weight: 600; font-size: 11.5px; }
+.like-toggle input:checked + span { background: #E0475B; color: #fff; box-shadow: 0 8px 18px -10px #E0475B; }
+.like-toggle input:checked + span svg { fill: currentColor; }
+.db-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+.db-stats div { background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+.db-stats b { display: block; font-size: 18px; font-weight: 800; }
+.db-stats span { font-size: 11.5px; color: var(--muted); font-weight: 600; }
+.db-path { font-size: 12px; color: var(--muted); word-break: break-all; margin-bottom: 14px; }
+.btn-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.btn-sec { height: 38px; padding: 0 16px; border-radius: 11px; border: 1px solid var(--line-2); background: var(--surface); font-weight: 700; color: var(--ink); display: inline-flex; align-items: center; gap: 8px; }
+.btn-sec:hover { border-color: var(--accent); color: var(--accent); }
+.btn-sec svg { width: 16px; height: 16px; }
+.btn-row select { height: 38px; border-radius: 11px; border: 1px solid var(--line-2); background: var(--surface-2); padding: 0 10px; font-weight: 700; }
+
 .split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; }
 .split .side { display: none; }
 .split.with-map { grid-template-columns: minmax(0, 1fr) 40%; }
@@ -274,7 +317,7 @@ table.grid a { color: var(--accent); font-weight: 700; text-decoration: none; }
 .st-badge.error, .st-badge.blocked { background: var(--bad-soft); color: var(--bad); } .st-badge.stopped { background: var(--warn-soft); color: var(--warn); }
 
 /* ---------- настройки ---------- */
-.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; max-width: 1180px; }
+.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 18px; max-width: 1240px; }
 .s-card { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 22px; box-shadow: var(--shadow-1); }
 .s-card h3 { margin: 0 0 4px; font-size: 16px; font-weight: 800; }
 .s-card .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; }

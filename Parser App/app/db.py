@@ -1,12 +1,12 @@
-"""SQLite-база в data/realty.db. Каждый поток открывает своё соединение."""
+"""SQLite-база в database/realty.db. Каждый поток открывает своё соединение."""
 import json
 import sqlite3
 import threading
 from datetime import datetime
 
-from .paths import DATA
+from .paths import DB_DIR
 
-DB_FILE = DATA / "realty.db"
+DB_FILE = DB_DIR / "realty.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings(
@@ -28,6 +28,17 @@ CREATE TABLE IF NOT EXISTS runs(
     id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT, mode TEXT, started TEXT, finished TEXT,
     status TEXT, pages INTEGER, found INTEGER, new INTEGER, changed INTEGER, removed INTEGER, message TEXT
 );
+CREATE TABLE IF NOT EXISTS likes(source TEXT, source_id TEXT, ts TEXT, PRIMARY KEY(source, source_id));
+"""
+
+# Колонки, добавленные после первой версии (ALTER TABLE для старых баз)
+MIGRATIONS = {
+    "object_id": "TEXT",          # объект недвижимости: общий для дублей с разных сайтов
+    "img_tries": "INTEGER DEFAULT 0",  # неудачные попытки скачать фото
+}
+INDEXES = """
+CREATE INDEX IF NOT EXISTS ix_obj ON listings(object_id);
+CREATE INDEX IF NOT EXISTS ix_match ON listings(rooms, floor);
 """
 
 FIELDS = [
@@ -52,12 +63,30 @@ def connect():
         if not _initialized:
             con = sqlite3.connect(DB_FILE, timeout=30)
             con.execute("PRAGMA journal_mode=WAL")
-            con.executescript(SCHEMA)
+            migrate(con)
             con.close()
             _initialized = True
     con = sqlite3.connect(DB_FILE, timeout=30)
     con.row_factory = sqlite3.Row
     return con
+
+
+def migrate(con):
+    """Создаёт таблицы и добавляет недостающие колонки (в т.ч. в импортируемой старой базе)."""
+    con.executescript(SCHEMA)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(listings)")}
+    for name, decl in MIGRATIONS.items():
+        if name not in cols:
+            con.execute(f"ALTER TABLE listings ADD COLUMN {name} {decl}")
+    con.executescript(INDEXES)
+    con.commit()
+
+
+def reset():
+    """После замены файла базы (импорт) — заново проверить схему при следующем подключении."""
+    global _initialized
+    with _init_lock:
+        _initialized = False
 
 
 def get(con, source, source_id):
@@ -88,6 +117,10 @@ def upsert(con, item):
     for k in FIELDS:
         if row[k] is None and old.get(k) is not None:
             row[k] = old[k]
+    if row["photo"] and not str(row["photo"]).startswith("http"):
+        row["photo"] = old["photo"]
+    if row["photo"] != old["photo"]:
+        con.execute("UPDATE listings SET img_tries=0 WHERE source=? AND source_id=?", (item["source"], item["source_id"]))
     changed = old["price"] != row["price"] or not old["active"]
     if row["price"] and old["price"] != row["price"]:
         con.execute("INSERT INTO price_history VALUES(?,?,?,?)", (item["source"], item["source_id"], ts, row["price"]))

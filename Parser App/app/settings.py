@@ -3,9 +3,9 @@ import copy
 import json
 import threading
 
-from .paths import DATA
+from .paths import DB_DIR
 
-SETTINGS_FILE = DATA / "settings.json"
+SETTINGS_FILE = DB_DIR / "settings.json"
 
 DEFAULTS = {
     "filters": {

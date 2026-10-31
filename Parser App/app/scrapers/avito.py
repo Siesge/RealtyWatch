@@ -23,6 +23,18 @@ def _txt(el):
     return re.sub(r"\s+", " ", el.text_content()).strip() if el is not None else ""
 
 
+def _photo_from_list(it):
+    """Фото подгружаются лениво: у дальних карточек нет <img src>, но адрес есть в data-marker слайдера."""
+    for m in it.xpath('.//*[starts-with(@data-marker, "slider-image/image-")]/@data-marker'):
+        url = m[len("slider-image/image-"):]
+        if url.startswith("http"):
+            return url
+    for src in it.xpath(".//img/@src | .//img/@data-src"):
+        if src.startswith("http"):
+            return src
+    return None
+
+
 def _clean_address(s):
     return re.sub(r"\s*·\s*\d+\s+отзыв\w*.*$", "", s or "").strip()
 
@@ -101,7 +113,7 @@ class Avito(Scraper):
         area = t.get("area")
         paras = [_txt(p) for p in it.xpath(".//p")]
         desc = max(paras, key=len) if paras else ""
-        img = next(iter(it.xpath(".//img/@src")), None)
+        img = _photo_from_list(it)
         address = _clean_address(_txt(next(iter(it.xpath('.//*[@data-marker="item-address"]')), None)))
         return {
             "source": self.name,
@@ -157,6 +169,10 @@ class Avito(Scraper):
             item["description"] = rules.fix_homoglyphs(_txt(desc[0]))
             if not item.get("renovation"):
                 item["renovation"] = rules.renovation_from_text(item["description"])
+        if not item.get("photo"):
+            og = doc.xpath('//meta[@property="og:image"]/@content')
+            if og and og[0].startswith("http"):
+                item["photo"] = og[0]
         date = doc.xpath('//*[@data-marker="item-view/item-date"]')
         if date:
             item.setdefault("raw", {})["date_text"] = _txt(date[0]).strip(" ·")
