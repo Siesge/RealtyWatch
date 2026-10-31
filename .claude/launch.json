@@ -4,7 +4,7 @@
     {
       "name": "realtywatch",
       "runtimeExecutable": "D:\\Claude\\RealtyWatch\\Parser App\\runtime\\python\\python.exe",
-      "runtimeArgs": ["-m", "app.main", "--no-browser"],
+      "runtimeArgs": ["-m", "app.main", "--server"],
       "port": 8765
     }
   ]

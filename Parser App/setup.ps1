@@ -32,6 +32,8 @@ if (-not (Test-Path (Join-Path $PyDir "Scripts\pip.exe"))) {
 } else { Write-Host "[2/4] pip уже установлен" }
 
 Write-Host "[3/4] Устанавливаю библиотеки..."
+# setuptools нужен для пакетов, которые ставятся только из исходников (proxy_tools для pywebview)
+& $PyExe -m pip install --no-warn-script-location --disable-pip-version-check -q setuptools wheel
 & $PyExe -m pip install --no-warn-script-location --disable-pip-version-check -q -r (Join-Path $Root "requirements.txt")
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
