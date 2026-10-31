@@ -281,13 +281,33 @@ let MAIN = null, SIDE = null, hl = null;
 function makeMap(el) {
   const m = L.map(el, { zoomControl: true, attributionControl: true }).setView([44.49, 34.155], 13);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(m);
+  legend().addTo(m);
   return { map: m, layer: L.layerGroup().addTo(m), zone: null, markers: {} };
+}
+
+// Цвет точки — сайт объявления; если в фильтре выбраны не все сайты, берётся сайт из выбранных
+function markerSource(o) {
+  const src = checked("src");
+  return (o.items.find(i => src.includes(i.source)) || o.p).source;
 }
 
 function markerStyle(o, on) {
   const multi = o.sources.length > 1;
   return { radius: on ? 11 : multi ? 8 : 6.5, color: on ? "#fff" : multi ? "#D8B474" : "rgba(255,255,255,.9)", weight: on ? 3 : multi ? 2.5 : 1.5,
-    fillColor: o.liked ? "#E0475B" : COLOR[o.p.source], fillOpacity: o.excluded ? .35 : .95 };
+    fillColor: o.liked ? "#E0475B" : COLOR[markerSource(o)], fillOpacity: o.excluded ? .35 : .95 };
+}
+
+function legend() {
+  const c = L.control({ position: "bottomleft" });
+  c.onAdd = () => {
+    const d = L.DomUtil.create("div", "map-legend");
+    d.innerHTML = Object.keys(SRC).map(k => `<span><i style="background:${COLOR[k]}"></i>${SRC[k]}</span>`).join("") +
+      `<span><i class="ring"></i>на 2–3 сайтах</span><span><i style="background:#E0475B"></i>избранное</span>` +
+      `<span><i class="dim"></i>отсеяно</span><span><i class="zone"></i>красный круг</span>`;
+    L.DomEvent.disableClickPropagation(d);
+    return d;
+  };
+  return c;
 }
 
 function drawMap(M, rows) {

@@ -318,6 +318,15 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
 .leaflet-popup-content { margin: 12px 14px; font-size: 12.5px; line-height: 1.45; }
 .leaflet-popup-content b { font-size: 15px; }
 .leaflet-popup-content a { color: var(--accent); font-weight: 700; }
+.map-legend {
+  display: flex; flex-wrap: wrap; gap: 6px 12px; max-width: 340px; padding: 8px 12px; border-radius: 12px; font-size: 11.5px; font-weight: 700;
+  background: color-mix(in srgb, var(--surface) 90%, transparent); backdrop-filter: blur(8px); color: var(--ink-2); box-shadow: var(--shadow-1); border: 1px solid var(--line);
+}
+.map-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.map-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; border: 1.5px solid #fff; box-shadow: 0 0 0 1px var(--line-2); }
+.map-legend i.ring { background: var(--sunken); border: 2.5px solid #D8B474; box-shadow: none; width: 12px; height: 12px; }
+.map-legend i.dim { background: #3E7BFA; opacity: .35; }
+.map-legend i.zone { border-radius: 3px; border: 2px dashed var(--gold); background: var(--gold-soft); box-shadow: none; }
 .leaflet-bar a { background: var(--surface); color: var(--ink); border-color: var(--line); }
 .leaflet-control-attribution { background: color-mix(in srgb, var(--surface) 70%, transparent) !important; color: var(--muted); }
 
