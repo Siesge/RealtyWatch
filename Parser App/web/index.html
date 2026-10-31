@@ -91,13 +91,17 @@
         <label class="check"><input type="checkbox" id="fActive" checked><span>активные</span></label>
         <label class="check"><input type="checkbox" id="fNoCoords"><span>без координат</span></label>
         <button id="btnReset" class="link">Сбросить</button>
+        <span class="tb-right">
+        <button id="btnGroup" class="toggle" title="Разделить карточки на блоки по зонам"><svg viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6" rx="1.5"/><rect x="3.5" y="14" width="17" height="6" rx="1.5"/></svg>По зонам</button>
         <button id="btnSide" class="toggle"><svg viewBox="0 0 24 24"><path d="M9 4 3 6.5v13.5l6-2.5 6 2.5 6-2.5V4l-6 2.5L9 4z"/></svg>Карта рядом</button>
+        </span>
       </div>
     </div>
 
     <section id="view-cards" class="view">
       <div id="split" class="split">
         <div id="cardsList"></div>
+        <div class="gutter" id="gutter" title="Потяните, чтобы изменить ширину карты. Двойной клик — по умолчанию"><i></i></div>
         <div class="side"><div id="sideMap" class="map"></div></div>
       </div>
     </section>

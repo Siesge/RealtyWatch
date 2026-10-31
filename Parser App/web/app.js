@@ -217,6 +217,10 @@ function renderCards(rows) {
     return;
   }
   const LIMIT = 240;
+  if (!groupOn()) {
+    el.innerHTML = `<div class="cards flat">${rows.slice(0, LIMIT * 2).map(card).join("")}</div>`;
+    return;
+  }
   el.innerHTML = Object.keys(ZONE).map(z => {
     const zr = rows.filter(o => o.zone === z);
     if (!zr.length) return "";
@@ -324,6 +328,47 @@ function focusCard(id) {
   el.scrollIntoView({ block: "center", behavior: "smooth" });
   el.classList.add("focus");
   setTimeout(() => el.classList.remove("focus"), 1800);
+}
+
+const groupOn = () => $("#btnGroup").classList.contains("active");
+function setGroup(on) {
+  $("#btnGroup").classList.toggle("active", on);
+  store.set("rw.group", on ? "1" : "0");
+  render();
+}
+
+// Перетаскиваемый разделитель карточек и карты; ширина карты хранится в % от ширины области
+function initGutter() {
+  const g = $("#gutter"), split = $("#split");
+  const saved = parseFloat(store.get("rw.mapW", ""));
+  if (saved) split.style.setProperty("--map-w", `${saved}%`);
+  let drag = null;
+  g.addEventListener("pointerdown", e => {
+    drag = split.getBoundingClientRect();
+    g.setPointerCapture(e.pointerId);
+    split.classList.add("dragging");
+    e.preventDefault();
+  });
+  g.addEventListener("pointermove", e => {
+    if (!drag) return;
+    const w = Math.max(260, Math.min(drag.right - e.clientX - 8, drag.width - 300));
+    split.style.setProperty("--map-w", `${(100 * w / drag.width).toFixed(2)}%`);
+    if (SIDE) SIDE.map.invalidateSize({ pan: false });
+  });
+  const end = () => {
+    if (!drag) return;
+    drag = null;
+    split.classList.remove("dragging");
+    store.set("rw.mapW", parseFloat(split.style.getPropertyValue("--map-w")) || "");
+    if (SIDE) SIDE.map.invalidateSize();
+  };
+  g.addEventListener("pointerup", end);
+  g.addEventListener("pointercancel", end);
+  g.addEventListener("dblclick", () => {
+    split.style.removeProperty("--map-w");
+    store.set("rw.mapW", "");
+    if (SIDE) setTimeout(() => SIDE.map.invalidateSize(), 50);
+  });
 }
 
 const sideOn = () => $("#split").classList.contains("with-map");
@@ -544,10 +589,13 @@ function setView(v) {
   const lists = v === "cards" || v === "table" || v === "map";
   $("#filters").classList.toggle("hidden", !lists);
   $("#btnSide").classList.toggle("hidden", v !== "cards");
+  $("#btnGroup").classList.toggle("hidden", v !== "cards");
+  $(".main").classList.toggle("inner-scroll", v === "cards");
   if (v === "runs") { renderHeader([]); renderRuns(); }
   else if (v === "settings") { renderHeader([]); renderSettings(); }
   else render();
   $(".main").scrollTop = 0;
+  $("#cardsList").scrollTop = 0;
 }
 
 function resetFilters() {
@@ -578,6 +626,7 @@ $("#btnStop").onclick = () => { post("/api/stop", {}); toast("warn", "Остан
 $("#jToggle").onclick = () => { $("#journal").classList.toggle("collapsed"); $("#jDot").classList.add("hidden"); };
 $("#jClose").onclick = () => $("#journal").classList.add("collapsed");
 $("#btnSide").onclick = () => setSide(!sideOn());
+$("#btnGroup").onclick = () => setGroup(!groupOn());
 $$("#theme button").forEach(b => b.onclick = () => setTheme(b.dataset.t));
 $("#cardsList").addEventListener("mouseover", e => {
   const c = e.target.closest(".card");
@@ -597,6 +646,9 @@ $("#cardsList").addEventListener("click", e => {
   const on = store.get("rw.sideMap", "1") !== "0";
   $("#split").classList.toggle("with-map", on);
   $("#btnSide").classList.toggle("active", on);
+  $("#btnGroup").classList.toggle("active", store.get("rw.group", "1") !== "0");
+  $(".main").classList.add("inner-scroll");
+  initGutter();
   $$("#theme button").forEach(b => b.classList.toggle("on", b.dataset.t === store.get("rw.theme", "")));
   renderSources({});
   await loadSettings();

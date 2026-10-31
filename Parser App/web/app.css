@@ -186,7 +186,8 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
 .check input { accent-color: var(--accent); width: 15px; height: 15px; }
 .link { background: none; border: 0; color: var(--accent); font-weight: 700; padding: 6px 8px; border-radius: 8px; }
 .link:hover { background: var(--accent-soft); }
-.toggle { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); font-weight: 700; color: var(--ink-2); }
+.tb-right { margin-left: auto; display: flex; gap: 8px; }
+.toggle { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); font-weight: 700; color: var(--ink-2); }
 .toggle.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .toolbar.compact .tb-row:nth-child(2) { display: none; }
 
@@ -289,10 +290,23 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
 .btn-sec svg { width: 16px; height: 16px; }
 .btn-row select { height: 38px; border-radius: 11px; border: 1px solid var(--line-2); background: var(--surface-2); padding: 0 10px; font-weight: 700; }
 
-.split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; }
-.split .side { display: none; }
-.split.with-map { grid-template-columns: minmax(0, 1fr) 40%; }
-.split.with-map .side { display: block; position: sticky; top: 132px; height: calc(100vh - 160px); align-self: start; }
+/* подборка: прокручивается только список карточек, карта и фильтры стоят на месте */
+.main.inner-scroll { overflow: hidden; }
+.main.inner-scroll #view-cards { flex: 1; min-height: 0; display: flex; flex-direction: column; padding-bottom: 16px; }
+.main.inner-scroll .split { flex: 1; min-height: 0; }
+.main.inner-scroll #cardsList { overflow-y: auto; min-height: 0; padding: 4px 12px 40px 2px; scrollbar-gutter: stable; }
+.split { display: grid; grid-template-columns: minmax(0, 1fr); }
+.split .side, .split .gutter { display: none; }
+.split.with-map { grid-template-columns: minmax(0, 1fr) 16px var(--map-w, 40%); }
+.split.with-map .side { display: block; height: 100%; min-height: 0; }
+.split.with-map .gutter { display: flex; justify-content: center; cursor: col-resize; touch-action: none; }
+.gutter i { width: 4px; height: 100%; border-radius: 4px; background: transparent; transition: background .15s; position: relative; }
+.gutter i::after { content: ""; position: absolute; top: 50%; left: 50%; width: 4px; height: 44px; margin: -22px 0 0 -2px; border-radius: 4px; background: var(--line-2); }
+.gutter:hover i, .split.dragging .gutter i { background: var(--accent-soft); }
+.gutter:hover i::after, .split.dragging .gutter i::after { background: var(--accent); }
+.split.dragging { cursor: col-resize; user-select: none; }
+.split.dragging .side, .split.dragging #cardsList { pointer-events: none; }
+.cards.flat { margin-top: 2px; }
 
 /* ---------- карта ---------- */
 .map { height: 100%; border-radius: 18px; overflow: hidden; border: 1px solid var(--line); box-shadow: var(--shadow-1); background: var(--sunken); }
@@ -368,10 +382,11 @@ table.grid a { color: var(--accent); font-weight: 700; text-decoration: none; }
 .empty { text-align: center; padding: 80px 20px; color: var(--muted); }
 .empty b { display: block; color: var(--ink); font-size: 17px; margin-bottom: 6px; }
 
-@media (max-width: 1280px) { .split.with-map { grid-template-columns: minmax(0, 1fr) 42%; } .kpi { min-width: 110px; } }
+@media (max-width: 1280px) { .kpi { min-width: 110px; } }
 @media (max-width: 1000px) {
   .app { grid-template-columns: 1fr; }
   .sidebar { display: none; }
-  .split.with-map { grid-template-columns: 1fr; }
-  .split.with-map .side { position: static; height: 340px; order: -1; }
+  .split.with-map { grid-template-columns: 1fr; grid-template-rows: 300px minmax(0, 1fr); gap: 12px; }
+  .split.with-map .side { order: -1; }
+  .split.with-map .gutter { display: none; }
 }
