@@ -192,6 +192,13 @@ function goneTip(i) {
   return `снято ${dtt(i.removed_at) || "—"}. ${i.removed_reason || "Не найдено в поиске сайта"}. Последний раз в поиске: ${dtt(i.last_seen)}`;
 }
 
+// Пропало из полной выдачи, но сайт не подтвердил снятие (страницу не удалось проверить) — не снято
+function missTip(i) {
+  return `Нет в поиске ${SRC[i.source]} ${i.missed} ${plural(i.missed, "полный сбор", "полных сбора", "полных сборов")} подряд (последний раз видели ${dtt(i.last_seen)}). ` +
+    "Страницу объявления проверить не удалось, поэтому оно не считается снятым и остаётся в продаже. " +
+    "Снятым объявление станет, только если сайт сам покажет, что оно снято или удалено (статус на странице, страница не найдена)";
+}
+
 function tags(o) {
   const t = [], r = o.p;
   if (o.renovation) t.push(`<span class="tag ${o.renovation === "none" ? "bad" : "good"}" title="${esc(renoTip(o))}">${RENO[o.renovation] || o.renovation}</span>`);
@@ -215,10 +222,11 @@ function offers(o) {
     const ch = i.active ? lastChange(i) : null;
     const tip = i.active
       ? `Открыть объявление на ${SRC[i.source]}.\nЦена ${fmt(i.price)} ₽` + (ch ? `, до ${dtt(ch[2])} было ${fmt(ch[0])} ₽` : ", не менялась") +
-        `.\nВ базе с ${dtt(i.first_seen)}, последний раз в поиске ${dtt(i.last_seen)}` + (i.seller_type ? `.\n${SELLER_TIP[i.seller_type]}` : "")
+        `.\nВ базе с ${dtt(i.first_seen)}, последний раз в поиске ${dtt(i.last_seen)}` + (i.seller_type ? `.\n${SELLER_TIP[i.seller_type]}` : "") +
+        (i.missed ? `.\n\n${missTip(i)}` : "")
       : `Перечёркнуто — объявление считается снятым с продажи: ${goneTip(i)}.\nЕсли оно на сайте есть — «Настройки → База данных → Перепроверить снятые»`;
     return `<a class="offer ${i.active ? "" : "gone"}" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(tip)}">
-    <i class="sdot ${i.source}"></i><span>${SRC[i.source]}${i.excluded && !o.excluded ? ` <span class="tag warn" title="${esc(`Это объявление не прошло отсев (${i.excluded}), но другое объявление этой квартиры прошло`)}">!</span>` : ""}</span>
+    <i class="sdot ${i.source}"></i><span>${SRC[i.source]}${i.active && i.missed ? ` <span class="tag miss" title="${esc(missTip(i))}">нет в поиске</span>` : ""}${i.excluded && !o.excluded ? ` <span class="tag warn" title="${esc(`Это объявление не прошло отсев (${i.excluded}), но другое объявление этой квартиры прошло`)}">!</span>` : ""}</span>
     <span>${best && i.price === best && i.active ? '<span class="best" title="Здесь цена ниже, чем на других сайтах">дешевле</span> ' : ""}${ch ? `<s class="old-mini">${mln(ch[0])}</s> ` : ""}<b>${fmt(i.price)} ₽</b></span>${ICON.ext}</a>`;
   }).join("")}</div>`;
 }
@@ -539,7 +547,7 @@ async function renderSettings() {
       </div>
       <div class="btn-row" style="margin-top:8px">
         <button class="btn-sec" id="btnImages" title="Скачать фото, которые не загрузились (повторяется и само — после сбора и при запуске)">${ICON.img}Догрузить фото</button>
-        <button class="btn-sec" id="btnRecheck" title="Открыть на сайтах все объявления ЦИАН и Яндекса, помеченные снятыми, и вернуть те, что на самом деле активны">${ICON.ok}Перепроверить снятые</button>
+        <button class="btn-sec" id="btnRecheck" title="Открыть на сайтах все объявления, помеченные снятыми, и вернуть те, что на самом деле активны. Авито проверяется через браузер — это дольше">${ICON.ok}Перепроверить снятые</button>
         ${desktop() ? `<button class="btn-sec" id="btnFolder" title="Открыть папку database в Проводнике">${ICON.folder}Открыть папку</button>` : ""}
       </div>
     </div>

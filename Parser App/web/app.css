@@ -275,6 +275,7 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
 .offer b { font-weight: 800; }
 .offer svg { width: 13px; height: 13px; color: var(--muted); }
 .offer.gone { opacity: .55; text-decoration: line-through; }
+.tag.miss { font-size: 10px; padding: 1px 6px; vertical-align: 1px; }
 .offer .best { font-size: 10.5px; color: var(--ok); font-weight: 800; }
 .multi { background: linear-gradient(135deg, rgba(226, 191, 128, .95), rgba(180, 135, 59, .95)) !important; color: #1B1408 !important; border-color: transparent !important; }
 .like-toggle { cursor: pointer; }

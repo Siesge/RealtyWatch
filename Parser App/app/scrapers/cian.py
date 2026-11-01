@@ -4,14 +4,18 @@ import re
 from urllib.parse import urlencode
 
 from .. import rules
+from ..net import Blocked, IpBanned
 from .base import Scraper, to_float, to_int, ts_to_iso
 
 API = "https://api.cian.ru/search-offers/v2/search-offers-desktop/"
 PAGE_SIZE = 28
 
 DECORATION = {"without": "none", "rough": "none", "preFine": "none", "fine": "finish"}
+# Статусы страницы объявления, которые однозначно означают «не в продаже»
 STATUS = {"deactivated": "снято с публикации", "removed": "удалено", "draft": "черновик", "blocked": "заблокировано",
-          "moderate": "на модерации", "refused": "отклонено модерацией", "sold": "продано"}
+          "refused": "отклонено модерацией", "sold": "продано"}
+# Временные статусы: объявление может вернуться — это не снятие
+STATUS_PENDING = {"moderate", "onModeration"}
 
 _JS_STATE = """() => {
   const cfg = window._cianConfig && window._cianConfig['frontend-serp'];
@@ -60,7 +64,9 @@ class Cian(Scraper):
         def via_http():
             r = self.http.post(API, json={"jsonQuery": self._json_query(page)},
                                headers={"Origin": "https://www.cian.ru", "Referer": "https://www.cian.ru/"})
-            d = r.json()["data"]
+            d = r.json().get("data") or {}
+            if "offersSerialized" not in d:
+                raise IOError("ЦИАН: в ответе API нет списка объявлений")
             # aggregatedCount — уникальные объекты (offerCount включает дубли от разных агентов)
             return d["offersSerialized"], d.get("aggregatedCount") or d["offerCount"]
 
@@ -75,6 +81,7 @@ class Cian(Scraper):
 
     def listings(self):
         page, pages, limit = 1, 1, self.site.get("max_pages", 40)
+        total, ids = None, set()
         while page <= pages and page <= limit:
             offers, total = self._load(page)
             pages = max(1, math.ceil((total or 0) / PAGE_SIZE))
@@ -87,16 +94,20 @@ class Cian(Scraper):
             self.progress(page=page, pages=min(pages, limit), total=total)
             self.log(f"страница {page}/{pages}: {len(offers)} объявлений")
             for o in offers:
-                yield self._normalize(o)
+                item = self._normalize(o)
+                ids.add(item["source_id"])
+                yield item
             page += 1
             if page <= pages and page <= limit:
                 self.wait()
-        self.complete = page > pages
+        self.finish(page, pages, limit, len(ids), total)
 
     def verify(self, row):
-        """Страница объявления: offer.status — published (активно) или другой статус / 404."""
+        """Страница объявления: offer.status — published (активно), статус снятия или 404."""
         try:
             h = self.http.get(row["url"]).text
+        except (Blocked, IpBanned):
+            raise
         except IOError as e:
             if "HTTP 404" in str(e) or "HTTP 410" in str(e):
                 return "removed", "на ЦИАН страница объявления не найдена (404)", None
@@ -104,15 +115,19 @@ class Cian(Scraper):
         except Exception:
             return None, None, None
         m = re.search(r'"offer":\{"category":"[^"]*","status":"(\w+)"', h)
-        if not m:
-            return None, None, None
+        if not m or str(row["source_id"]) not in h:
+            return None, None, None  # не страница этого объявления (заглушка, редирект) — статус неизвестен
         status = m.group(1)
+        if status in STATUS_PENDING:
+            return None, None, None
         archived = '"isArchived":true' in h[:2_000_000]
         pm = re.search(r'"bargainTerms":\{[^{}]*?"priceRur":(\d+)', h)
         price = int(pm.group(1)) if pm else None
         if status == "published" and not archived:
             return "active", "на ЦИАН объявление опубликовано, но не попало в поиск (дубль другого агента или цена вне фильтра)", price
-        return "removed", f"на ЦИАН статус объявления «{STATUS.get(status, status)}»", price
+        if status in STATUS or archived:
+            return "removed", f"на ЦИАН статус объявления «{STATUS.get(status) or 'в архиве'}»", price
+        return None, None, None  # незнакомый статус — не гадаем
 
     def _normalize(self, o):
         bt = o.get("bargainTerms") or {}

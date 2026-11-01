@@ -7,6 +7,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import lxml.html
 
 from .. import rules
+from ..net import Blocked, IpBanned
 from .base import Scraper, to_float, to_int
 
 BASE = "https://www.avito.ru"
@@ -15,6 +16,9 @@ RENOVATION = {
     "дизайнерский": "design", "евро": "euro", "косметический": "cosmetic", "требует ремонта": "none",
     "без отделки": "none", "черновая": "none", "предчистовая": "none", "чистовая": "finish", "под ключ": "finish",
 }
+
+# Состояние страницы объявления: closedItem=true — объявление закрыто (снято с публикации, продано, истёк срок)
+_CLOSED = re.compile(r'closedItem\\?"\s*:\s*(true|false)')
 
 _TITLE = re.compile(r"(?:(\d+)-к\.|(студия)|(своб\. планировка))[^,]*,\s*([\d\s,\.]+)\s*м²(?:,\s*(\d+)/(\d+)\s*эт)?", re.I)
 
@@ -54,6 +58,8 @@ def parse_title(title):
 class Avito(Scraper):
     name = "avito"
     label = "Авито"
+    # Счётчик «N объявлений» у Авито включает соседние города и не совпадает с выдачей — по нему полноту не проверяем
+    MIN_COVERAGE = None
     detail_fields = ("lat", "lon", "address", "description", "renovation", "renovation_raw", "building_type",
                      "build_year", "floors", "living_area", "kitchen_area", "details_fetched", "published_at")
 
@@ -79,30 +85,37 @@ class Avito(Scraper):
     def _get_html(self, url):
         return self.fetch(lambda: self.http.get(url).text, lambda b: b.goto(url))
 
+    def _load_page(self, page):
+        doc = lxml.html.fromstring(self._get_html(self._page_url(page)))
+        count = to_int(_txt(next(iter(doc.xpath('//*[@data-marker="page-title/count"]')), None)))
+        return count, doc.xpath('//*[@data-marker="item"]')
+
     def listings(self):
         page, pages, limit = 1, 1, self.site.get("max_pages", 40)
-        seen = set()
+        seen, declared = set(), None
         prefix = self._region_prefix()
         while page <= pages and page <= limit:
-            doc = lxml.html.fromstring(self._get_html(self._page_url(page)))
-            count = to_int(_txt(next(iter(doc.xpath('//*[@data-marker="page-title/count"]')), None)))
-            if count:
-                pages = math.ceil(count / 50)
-            items = doc.xpath('//*[@data-marker="item"]')
-            if not items and page < pages:
-                # Например, после капчи сайт отдаёт не ту страницу — это сбой, а не конец выдачи
-                self.log(f"страница {page}/{pages} пустая — повторяю")
+            count, items = self._load_page(page)
+            # Страница без счётчика и без карточек — не выдача (после капчи сайт открывает другую страницу).
+            # Карточки, которые все уже были на прошлых страницах, — сайт вернул не ту страницу.
+            # Это сбой, а не конец списка: повторяем, а затем прерываем прогон без снятия объявлений.
+            stale = items and all(it.get("data-item-id") in seen for it in items)
+            if count is None and not items or (not items and page < pages) or (stale and page < pages):
+                what = "без списка объявлений" if not items else "с объявлениями прошлых страниц"
+                self.log(f"страница {page}/{pages} пришла {what} — повторяю")
                 self.wait()
-                doc = lxml.html.fromstring(self._get_html(self._page_url(page)))
-                items = doc.xpath('//*[@data-marker="item"]')
-                if not items:
-                    self.empty_page(page, pages)
+                count, items = self._load_page(page)
+                stale = items and all(it.get("data-item-id") in seen for it in items)
+                if count is None and not items or (not items and page < pages) or (stale and page < pages):
+                    raise IOError(f"страница {page} выдачи пришла {what} дважды — прогон неполный, снятие объявлений не выполняется")
+            if count:
+                pages, declared = math.ceil(count / 50), count
             batch = []
             for it in items:
                 item = self._from_list(it, prefix)
                 if item and item["source_id"] not in seen:
-                    seen.add(item["source_id"])
                     batch.append(item)
+                seen.add(it.get("data-item-id"))
             self.progress(page=page, pages=min(pages, limit), total=count)
             self.log(f"страница {page}/{pages}: {len(items)} карточек, новых в прогоне {len(batch)}")
             yield from batch
@@ -112,7 +125,47 @@ class Avito(Scraper):
             page += 1
             if page <= pages and page <= limit:
                 self.wait()
-        self.complete = page > pages
+        self.finish(page, pages, limit, len(seen), declared)
+
+    def verify(self, row):
+        """Страница объявления. Снято — только по явному признаку: closedItem=true на странице,
+        404/410 или редирект со страницы объявления в каталог (объявления с таким номером больше нет)."""
+        sid = str(row["source_id"])
+
+        def via_http():
+            r = self.http.get(row["url"])
+            return r.text, str(r.url), r.status_code
+
+        def via_browser(b):
+            html = b.goto(row["url"])
+            return html, b.page.url, b.last_status
+
+        try:
+            html, url, status = self._fetch_once(via_http, via_browser)
+        except (Blocked, IpBanned):
+            raise
+        except IOError as e:
+            if "HTTP 404" in str(e) or "HTTP 410" in str(e):
+                return "removed", "на Авито страница объявления не найдена (404)", None
+            return None, None, None
+        except Exception:
+            return None, None, None
+        if status in (404, 410):
+            return "removed", f"на Авито страница объявления не найдена ({status})", None
+        doc = lxml.html.fromstring(html)
+        if sid not in url:
+            # Сайт увёл со страницы объявления: в каталог — объявления больше нет; куда-то ещё — неизвестно
+            if doc.xpath('//*[@data-marker="page-title/count"]') or doc.xpath('//*[@data-marker="item"]'):
+                return "removed", "на Авито объявления больше нет: ссылка ведёт в каталог", None
+            return None, None, None
+        id_el = doc.xpath('//*[@data-marker="item-view/item-id"]')
+        m = _CLOSED.search(html)
+        if not id_el or sid not in _txt(id_el[0]) or not m:
+            return None, None, None  # не распознана страница объявления — статус неизвестен
+        if m.group(1) == "true":
+            return "removed", "на Авито объявление закрыто (снято с публикации)", None
+        price = to_int(re.sub(r"\D", "", _txt(next(iter(doc.xpath('//*[@data-marker="item-view/item-price"]')), None))))
+        return "active", "на Авито объявление открыто, но не попало в поиск (цена или параметры вне фильтра)", price
 
     def _from_list(self, it, prefix):
         a = next(iter(it.xpath('.//a[@data-marker="item-title"]')), None)

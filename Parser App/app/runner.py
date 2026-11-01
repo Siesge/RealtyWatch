@@ -6,13 +6,13 @@ from collections import deque
 from datetime import datetime
 
 from . import db, dedupe, geo, history, images, rules, settings
-from .net import Blocked, Stopped, pause
+from .net import Blocked, IpBanned, Stopped, pause
 from .paths import LOGS
 from .scrapers import SCRAPERS
-from .scrapers.base import Scraper
 
-MISSED_TO_REMOVE = 2  # без проверки по странице объявление снимается после стольких пропусков подряд
-SOURCE_NAME = {"cian": "ЦИАН", "avito": "Авито", "yandex": "Яндекса"}
+# Если из полной выдачи пропало больше этой доли активных объявлений (и больше MASS_MIN), это сбой сайта
+# или парсера, а не рынок: прогон считается неполным, объявления не проверяются и не снимаются
+MASS_SHARE, MASS_MIN = 0.25, 20
 
 logging.basicConfig(
     filename=LOGS / "app.log", level=logging.INFO, encoding="utf-8",
@@ -100,16 +100,17 @@ class RunManager:
         scraper = SCRAPERS[source](cfg, lg, stop, pr)
         counts = {"found": 0, "new": 0, "changed": 0, "excluded": 0, "details": 0}
         state, message, removed = "done", "", 0
+        seen = set()  # номера объявлений, реально полученные в этом прогоне
         lg(f"старт, режим {scraper.mode}")
         try:
             for item in scraper.listings():
                 self._process(con, scraper, cfg, item, counts, run_id, baseline)
+                seen.add(str(item["source_id"]))
                 pr(**counts)
             if scraper.complete:
-                removed = self._handle_missing(con, scraper, started, run_id, lg, stop)
-                note = ""
+                removed, note = self._handle_missing(con, scraper, seen, run_id, lg, stop)
             else:
-                note = " (выдача пройдена не полностью — снятие не проверялось)"
+                note = f" (выдача неполная: {scraper.incomplete_reason} — снятие не проверялось)"
             message = f"найдено {counts['found']}, новых {counts['new']}, изменилось {counts['changed']}, снято {removed}{note}"
         except Stopped:
             state, message = "stopped", "остановлено пользователем"
@@ -145,22 +146,33 @@ class RunManager:
                 except Exception:
                     log.error(traceback.format_exc())
 
-    def _handle_missing(self, con, scraper, started, run_id, lg, stop):
-        """Объявления, пропавшие из полной выдачи: проверка на сайте или два пропуска подряд."""
-        cand = db.missing(con, scraper.name, started)
+    def _handle_missing(self, con, scraper, seen, run_id, lg, stop):
+        """Объявления, пропавшие из полной выдачи, проверяются на своих страницах.
+        Снятым считается только то, что сайт явно показывает снятым (статус, закрыто) или не находит (404,
+        редирект в каталог). Если проверить не удалось, объявление остаётся в продаже с отметкой «нет в поиске»
+        (счётчик missed) и проверяется снова в следующем прогоне. Возвращает (снято, примечание)."""
+        cand = db.missing(con, scraper.name, seen)
         if not cand:
-            return 0
+            return 0, ""
         active = con.execute("SELECT COUNT(*) FROM listings WHERE source=? AND active=1", (scraper.name,)).fetchone()[0]
-        can_verify = type(scraper).verify is not Scraper.verify
-        if not can_verify and len(cand) > max(20, 0.3 * active):
-            lg(f"⚠ из поиска пропало подозрительно много объявлений ({len(cand)} из {active}) — снятие отложено до следующего прогона")
-            return 0
-        lg(f"не найдено в поиске: {len(cand)} — " + ("проверяю на сайте" if can_verify else "считаю пропуски"))
-        removed = 0
-        for row in cand:
-            state, reason, price = scraper.verify(row) if can_verify else (None, None, None)
-            if can_verify:
-                pause((1.0, 2.5), stop)
+        if len(cand) > max(MASS_MIN, MASS_SHARE * active):
+            lg(f"⚠ из поиска пропало подозрительно много объявлений ({len(cand)} из {active}) — это похоже на сбой выдачи, "
+               "снятие не проверяется")
+            return 0, f" (пропало {len(cand)} из {active} — похоже на сбой выдачи, снятие не проверялось)"
+        limit = scraper.site.get("max_verify", 60)
+        lg(f"не найдено в поиске: {len(cand)} — проверяю страницы объявлений" + (f" (не больше {limit})" if len(cand) > limit else ""))
+        cand.sort(key=lambda r: -(r.get("missed") or 0))  # дольше всех без подтверждения — первыми
+        removed = unknown = 0
+        aborted = None
+        for n, row in enumerate(cand):
+            state = reason = price = None
+            if aborted is None and n < limit:
+                try:
+                    state, reason, price = scraper.verify(row)
+                except (Blocked, IpBanned) as e:
+                    aborted = f"{type(e).__name__}: {e}"
+                    lg(f"⚠ проверка страниц прервана — сайт ограничил доступ ({e}); остальные проверю в следующий раз")
+                pause((1.0, 2.5) if scraper.name != "avito" else scraper.delay, stop)
             if state == "active":
                 con.execute("UPDATE listings SET missed=0 WHERE source=? AND source_id=?", (row["source"], row["source_id"]))
                 if price:
@@ -169,15 +181,13 @@ class RunManager:
                 db.remove(con, row["source"], row["source_id"], reason, run_id)
                 removed += 1
             else:
-                missed = (row.get("missed") or 0) + 1
-                con.execute("UPDATE listings SET missed=? WHERE source=? AND source_id=?", (missed, row["source"], row["source_id"]))
-                if missed >= MISSED_TO_REMOVE:
-                    db.remove(con, row["source"], row["source_id"],
-                              f"не найдено в поиске {SOURCE_NAME[scraper.name]} {missed} полных прогона подряд"
-                              + ("; страницу объявления проверить не удалось" if can_verify else ""), run_id)
-                    removed += 1
+                unknown += 1
+                con.execute("UPDATE listings SET missed=? WHERE source=? AND source_id=?",
+                            ((row.get("missed") or 0) + 1, row["source"], row["source_id"]))
             con.commit()
-        return removed
+        if unknown:
+            lg(f"статус не подтверждён у {unknown}: остаются в продаже с отметкой «нет в поиске», проверю в следующем прогоне")
+        return removed, (f" (не подтверждено {unknown} — оставлены в продаже)" if unknown else "")
 
     def _process(self, con, scraper, cfg, item, counts, run_id=None, baseline=0):
         f = cfg["filters"]

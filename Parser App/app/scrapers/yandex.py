@@ -3,6 +3,7 @@ import json
 from urllib.parse import urlencode
 
 from .. import rules
+from ..net import Blocked, IpBanned
 from .base import Scraper, to_float, to_int
 
 YALTA_CITY_RGID = "682310"
@@ -56,14 +57,19 @@ class Yandex(Scraper):
         st = parse_state(html)
         if not st:
             raise IOError("Яндекс: нет INITIAL_STATE на странице")
-        so = st["search"]["offers"]
-        return so.get("entities") or [], so.get("pager") or {}
+        so = (st.get("search") or {}).get("offers") or {}
+        pager = so.get("pager") or {}
+        if not pager.get("totalPages") and so.get("entities"):
+            raise IOError("Яндекс: на странице нет данных о числе страниц выдачи")
+        return so.get("entities") or [], pager
 
     def listings(self):
         index, pages, limit = 0, 1, self.site.get("max_pages", 40)
+        total, ids = None, set()
         while index < pages and index < limit:
             offers, pager = self._load(index)
             pages = pager.get("totalPages") or 1
+            total = pager.get("totalItems", total)
             if not offers and index + 1 < pages:
                 self.log(f"страница {index + 1}/{pages} пустая — повторяю")
                 self.wait()
@@ -73,17 +79,20 @@ class Yandex(Scraper):
             self.progress(page=index + 1, pages=min(pages, limit), total=pager.get("totalItems"))
             self.log(f"страница {index + 1}/{pages}: {len(offers)} объявлений")
             for o in offers:
+                ids.add(str(o.get("offerId")))
                 if o.get("offerType") == "SELL" and o.get("offerCategory") in (None, "APARTMENT"):
                     yield self._normalize(o)
             index += 1
             if index < pages and index < limit:
                 self.wait()
-        self.complete = index >= pages
+        self.finish(index + 1, pages, limit, len(ids), total)
 
     def verify(self, row):
         """Страница объявления: offerCard.card.active / obsolete."""
         try:
             st = parse_state(self.http.get(row["url"]).text)
+        except (Blocked, IpBanned):
+            raise
         except IOError as e:
             if "HTTP 404" in str(e) or "HTTP 410" in str(e):
                 return "removed", "на Яндексе страница объявления не найдена (404)", None

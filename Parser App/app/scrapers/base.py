@@ -47,8 +47,9 @@ class Scraper:
         self.browser = None
         self.use_browser = self.mode == "browser"
         self.last_mode = None
-        # True — выдача пройдена до последней страницы; только тогда отсутствующие объявления проверяются на снятие
+        # True — выдача прочитана полностью и достоверно; только тогда отсутствующие объявления проверяются на снятие
         self.complete = False
+        self.incomplete_reason = "прогон не дошёл до конца выдачи"
 
     # --- переопределяется в наследниках ---
     def is_blocked(self, html, url):
@@ -58,10 +59,33 @@ class Scraper:
         """Страница «ограничение по IP за частые запросы» (отличается от капчи)."""
         return False
 
+    # Доля объявлений от заявленного сайтом числа, которую надо собрать, чтобы выдача считалась полной
+    # (None — у сайта счётчик неточный, см. Авито)
+    MIN_COVERAGE = 0.95
+
     def verify(self, row):
         """Проверка объявления, пропавшего из поиска, по его странице на сайте.
-        Возвращает (state, reason, price): state — 'active' | 'removed' | None (не удалось узнать)."""
+        Возвращает (state, reason, price): state — 'active' | 'removed' | None (не удалось узнать).
+        'removed' — только по явному признаку: страница не найдена (404/410, редирект в каталог)
+        или сайт показывает статус «снято/закрыто». Любой сбой загрузки — None, такое объявление не снимается.
+        Капча и ограничение IP пробрасываются (Blocked/IpBanned): проверка остальных прекращается."""
         return None, None, None
+
+    def finish(self, page, pages, limit, found, declared):
+        """Решает, можно ли доверять выдаче настолько, чтобы искать по ней снятые объявления."""
+        why = None
+        if page <= pages:
+            why = f"прочитано {page - 1} из {pages} страниц" + (f" (ограничение {limit} страниц в настройках)" if pages > limit else "")
+        elif declared is None:
+            why = "сайт не сообщил число объявлений в выдаче"
+        elif found == 0 and declared > 0:
+            why = f"сайт заявил {declared} объявлений, а получено 0"
+        elif self.MIN_COVERAGE and declared and found < self.MIN_COVERAGE * declared:
+            why = f"получено {found} из {declared} заявленных сайтом (меньше {self.MIN_COVERAGE:.0%})"
+        self.complete = why is None
+        self.incomplete_reason = why or ""
+        if why:
+            self.log(f"⚠ выдача неполная: {why} — снятие объявлений не проверяется")
 
     def empty_page(self, page, pages):
         """Пустая страница посреди выдачи — сбой (капча, ограничение), а не конец списка."""

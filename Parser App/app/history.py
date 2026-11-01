@@ -120,8 +120,8 @@ def backfill(con):
 
 
 def recheck_removed(scrapers, cfg, log=lambda m: None):
-    """Повторная проверка «снятых» ЦИАН и Яндекса по их страницам; ложно снятые возвращаются."""
-    from .net import pause
+    """Повторная проверка «снятых» по их страницам на сайтах; ложно снятые возвращаются."""
+    from .net import Blocked, IpBanned, pause
     from .scrapers.base import Scraper
 
     con = db.connect()
@@ -132,7 +132,11 @@ def recheck_removed(scrapers, cfg, log=lambda m: None):
         sc = cls(cfg, log, None, lambda **k: None)
         rows = [dict(r) for r in con.execute("SELECT * FROM listings WHERE source=? AND active=0", (name,))]
         for r in rows:
-            state, reason, price = sc.verify(r)
+            try:
+                state, reason, price = sc.verify(r)
+            except (Blocked, IpBanned) as e:
+                log(f"{sc.label}: перепроверка прервана — сайт ограничил доступ ({e})")
+                break
             if state == "active":
                 con.execute("UPDATE listings SET active=1, missed=0, removed_at=NULL, removed_reason=NULL WHERE source=? AND source_id=?",
                             (r["source"], r["source_id"]))
@@ -146,7 +150,7 @@ def recheck_removed(scrapers, cfg, log=lambda m: None):
                             (reason, db.now(), r["source"], r["source_id"]))
                 confirmed += 1
             con.commit()
-            pause((0.8, 1.8))
+            pause((0.8, 1.8) if name != "avito" else sc.delay)
         sc.close()
     con.close()
     log(f"перепроверка снятых: возвращено {back}, снятие подтверждено {confirmed}")

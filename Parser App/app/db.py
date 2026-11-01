@@ -172,7 +172,7 @@ def upsert(con, item, run_id=None, baseline=0):
     return "changed" if changed else "same"
 
 
-def missing(con, source, run_started):
-    """Активные объявления сайта, которых не было в поиске этого (полного) прогона."""
-    return [dict(r) for r in con.execute(
-        "SELECT * FROM listings WHERE source=? AND active=1 AND last_seen < ?", (source, run_started))]
+def missing(con, source, seen):
+    """Активные объявления сайта, которых не было в поиске этого (полного) прогона; seen — полученные номера."""
+    return [dict(r) for r in con.execute("SELECT * FROM listings WHERE source=? AND active=1", (source,))
+            if str(r["source_id"]) not in seen]

@@ -95,6 +95,11 @@ class Browser:
         self._pw = None
         self.ctx = None
         self.page = None
+        self.last_status = None
+
+    def _nav(self, url):
+        resp = self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        self.last_status = resp.status if resp else None  # код ответа сайта — нужен для проверки «страница не найдена»
 
     def start(self):
         if self.ctx:
@@ -139,7 +144,7 @@ class Browser:
 
     def goto(self, url, settle=(2.5, 5.0)):
         self.start()
-        self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        self._nav(url)
         pause(settle, self.stop)
         self._humanize()
         html = self.page.content()
@@ -147,7 +152,7 @@ class Browser:
             # Иногда это «мягкая» проверка, которая проходит сама после перезагрузки
             self.log("проверка безопасности — пробую перезагрузить")
             pause((8, 14), self.stop)
-            self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            self._nav(url)
             pause(settle, self.stop)
             html = self.page.content()
         if self.is_ip_banned(html, self.page.url) and "Проверка пройдена" not in html:
@@ -173,7 +178,7 @@ class Browser:
                     self.log("сайт пишет «проверка пройдена» — открываю страницу заново")
                     last_retry = time.time()
                     try:
-                        self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        self._nav(url)
                         pause(settle, self.stop)
                         html = self.page.content()
                     except Exception:
@@ -183,7 +188,7 @@ class Browser:
                     if self.window == "hidden":
                         self._place_window(OFFSCREEN, OFFSCREEN)
                     if self.page.url.rstrip("/") != url.rstrip("/"):
-                        self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        self._nav(url)
                         pause(settle, self.stop)
                         html = self.page.content()
                     break
