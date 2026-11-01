@@ -80,6 +80,10 @@ const pct = (a, b) => (a && b ? (100 * (a - b) / b) : null);
 const signed = (v, d = 1) => v == null ? "" : `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v).toFixed(d)}%`;
 
 // ---------- дашборд ----------
+// Период, за который графики показывают проверки рынка (число дней или «всё время»)
+const DASH_PERIODS = [["7", "Неделя"], ["30", "Месяц"], ["182", "Полгода"], ["365", "Год"], ["all", "Всё время"]];
+let DASH_PERIOD = store.get("rw.dashPeriod", "all"), DASH_S = [];
+
 async function renderDashboard() {
   const el = $("#view-dashboard");
   let d;
@@ -109,6 +113,12 @@ async function renderDashboard() {
         ${kpi(e7.removed, "снято за неделю", "Объявлений, снятых с продажи за 7 дней (снятие подтверждено на странице объявления: статус «снято/закрыто» или страница не найдена)")}
         ${kpi(`↓${e7.price_down} ↑${e7.price_up}`, "цены за неделю", "Сколько объявлений подешевело (↓) и подорожало (↑) за 7 дней")}
         ${kpi(last ? last.multi : "—", "на 2+ сайтах", "Объектов в Ялте, найденных сразу на нескольких сайтах")}
+      </div>
+
+      <div class="dash-period" title="Какой отрезок истории показывают графики и их таблицы. Показатели вверху и таблицы ниже — всегда на текущий момент">
+        <span class="lbl">Период графиков</span>
+        <div class="seg small">${DASH_PERIODS.map(([v, l]) => `<label><input type="radio" name="dashPeriod" value="${v}" ${v === DASH_PERIOD ? "checked" : ""}><span>${l}</span></label>`).join("")}</div>
+        <span class="meta" id="dashPeriodNote"></span>
       </div>
 
       <div class="panel dash-card span2"><div class="dc-head"><h3>Медианная цена по комнатности</h3><span class="meta">Ялта (зоны A+B), каждая точка — одна проверка рынка <button class="link sm" data-tbl="chRooms" title="Показать значения таблицей">таблица</button></span></div>
@@ -148,7 +158,23 @@ async function renderDashboard() {
     b.textContent = on ? "таблица" : "график";
     $(`#${b.dataset.tbl}`).parentNode.classList.toggle("hidden", !on);
   });
-  if (!S.length) return;
+  el.querySelectorAll("input[name=dashPeriod]").forEach(r => r.onchange = () => {
+    DASH_PERIOD = r.value;
+    store.set("rw.dashPeriod", r.value);
+    drawDashCharts();
+  });
+  DASH_S = S;
+  drawDashCharts();
+}
+
+function drawDashCharts() {
+  const from = DASH_PERIOD === "all" ? 0 : Date.now() - +DASH_PERIOD * 864e5;
+  const S = DASH_S.filter(s => new Date(s.ts).getTime() >= from);
+  const name = (DASH_PERIODS.find(p => p[0] === DASH_PERIOD) || [, ""])[1].toLowerCase();
+  const note = $("#dashPeriodNote");
+  if (note) note.textContent = !DASH_S.length ? "проверок ещё не было"
+    : S.length ? `${S.length} ${plural(S.length, "проверка", "проверки", "проверок")} · с ${tsLabel(S[0].ts)}`
+    : `за ${DASH_PERIOD === "7" ? "неделю" : DASH_PERIOD === "30" ? "месяц" : name} проверок не было — последняя ${tsLabel(DASH_S[DASH_S.length - 1].ts)}`;
   const labels = S.map(s => tsLabel(s.ts));
   lineChart("chRooms", labels, [
     { label: "Все", data: S.map(s => s.city.median_price) },

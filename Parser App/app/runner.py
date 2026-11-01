@@ -10,9 +10,11 @@ from .net import Blocked, IpBanned, Stopped, pause
 from .paths import LOGS
 from .scrapers import SCRAPERS
 
-# Если из полной выдачи пропало больше этой доли активных объявлений (и больше MASS_MIN), это сбой сайта
-# или парсера, а не рынок: прогон считается неполным, объявления не проверяются и не снимаются
-MASS_SHARE, MASS_MIN = 0.25, 20
+# Массовое пропадание: если из полной выдачи пропало больше, чем рынок реально успевает снять за прошедшее время,
+# это сбой сайта или парсера — объявления не проверяются. Допуск = ожидаемое снятие (по сроку жизни объявлений
+# и времени с прошлого раза, см. history.expected_gone) + MASS_MARGIN, но не меньше MASS_SHARE (и MASS_MIN штук)
+# и не больше MASS_CAP. Пауза в несколько дней — около 25%, месяц — ~40%, три месяца — ~70%, полгода — ~95%.
+MASS_SHARE, MASS_MIN, MASS_MARGIN, MASS_CAP = 0.25, 20, 0.20, 0.95
 
 logging.basicConfig(
     filename=LOGS / "app.log", level=logging.INFO, encoding="utf-8",
@@ -101,6 +103,8 @@ class RunManager:
         counts = {"found": 0, "new": 0, "changed": 0, "excluded": 0, "details": 0}
         state, message, removed = "done", "", 0
         seen = set()  # номера объявлений, реально полученные в этом прогоне
+        # когда каждое активное объявление видели в поиске до этого прогона — для допуска на массовое пропадание
+        prev_seen = dict(con.execute("SELECT source_id, last_seen FROM listings WHERE source=? AND active=1", (source,)).fetchall())
         lg(f"старт, режим {scraper.mode}")
         try:
             for item in scraper.listings():
@@ -108,7 +112,7 @@ class RunManager:
                 seen.add(str(item["source_id"]))
                 pr(**counts)
             if scraper.complete:
-                removed, note = self._handle_missing(con, scraper, seen, run_id, lg, stop)
+                removed, note = self._handle_missing(con, scraper, seen, prev_seen, started, run_id, lg, stop)
             else:
                 note = f" (выдача неполная: {scraper.incomplete_reason} — снятие не проверялось)"
             message = f"найдено {counts['found']}, новых {counts['new']}, изменилось {counts['changed']}, снято {removed}{note}"
@@ -146,7 +150,7 @@ class RunManager:
                 except Exception:
                     log.error(traceback.format_exc())
 
-    def _handle_missing(self, con, scraper, seen, run_id, lg, stop):
+    def _handle_missing(self, con, scraper, seen, prev_seen, started, run_id, lg, stop):
         """Объявления, пропавшие из полной выдачи, проверяются на своих страницах.
         Снятым считается только то, что сайт явно показывает снятым (статус, закрыто) или не находит (404,
         редирект в каталог). Если проверить не удалось, объявление остаётся в продаже с отметкой «нет в поиске»
@@ -154,12 +158,14 @@ class RunManager:
         cand = db.missing(con, scraper.name, seen)
         if not cand:
             return 0, ""
-        active = con.execute("SELECT COUNT(*) FROM listings WHERE source=? AND active=1", (scraper.name,)).fetchone()[0]
-        if len(cand) > max(MASS_MIN, MASS_SHARE * active):
-            lg(f"⚠ из поиска пропало подозрительно много объявлений ({len(cand)} из {active}) — это похоже на сбой выдачи, "
-               "снятие не проверяется")
-            return 0, f" (пропало {len(cand)} из {active} — похоже на сбой выдачи, снятие не проверялось)"
-        limit = scraper.site.get("max_verify", 60)
+        limit_n, expected, tau, gap = mass_limit(con, scraper.name, prev_seen, started)
+        active = len(prev_seen)
+        if len(cand) > limit_n:
+            lg(f"⚠ из поиска пропало {len(cand)} из {active} объявлений за {gap:g} дн. — больше, чем рынок успевает снять "
+               f"(ожидаемо ~{expected:.0f}, допуск {limit_n:.0f} при сроке жизни объявления ~{tau:.0f} дн.). "
+               "Похоже на сбой выдачи — снятие не проверяется")
+            return 0, f" (пропало {len(cand)} из {active} за {gap:g} дн., допуск {limit_n:.0f} — похоже на сбой выдачи, снятие не проверялось)"
+        limit = scraper.site.get("max_verify", 300)
         lg(f"не найдено в поиске: {len(cand)} — проверяю страницы объявлений" + (f" (не больше {limit})" if len(cand) > limit else ""))
         cand.sort(key=lambda r: -(r.get("missed") or 0))  # дольше всех без подтверждения — первыми
         removed = unknown = 0
@@ -215,6 +221,19 @@ class RunManager:
             counts["new"] += 1
         elif res == "changed":
             counts["changed"] += 1
+
+
+def mass_limit(con, source, prev_seen, started):
+    """Сколько объявлений может пропасть из полной выдачи без подозрения на сбой.
+    Возвращает (допуск, ожидаемо снятых, срок жизни τ в днях, медианный промежуток в днях)."""
+    t0 = datetime.fromisoformat(started)
+    gaps = [(t0 - datetime.fromisoformat(ts)).total_seconds() / 86400 for ts in prev_seen.values() if ts]
+    tau, _ = history.lifetime_days(con, source)
+    expected = history.expected_gone(gaps, tau)
+    n = len(prev_seen)
+    limit_n = min(MASS_CAP * n, max(MASS_MIN, MASS_SHARE * n, expected + MASS_MARGIN * n))
+    gap = round(sorted(gaps)[len(gaps) // 2], 1) if gaps else 0
+    return limit_n, expected, tau, gap
 
 
 manager = RunManager()

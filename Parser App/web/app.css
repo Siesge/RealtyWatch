@@ -428,6 +428,8 @@ table.grid a { color: var(--accent); font-weight: 700; text-decoration: none; }
 .dash-card { padding: 16px 18px; min-width: 0; }
 .dash-card.span2 { grid-column: span 2; }
 .dash-card.span3 { grid-column: 1 / -1; }
+.dash-period { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dash-period .lbl { font-size: 12px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
 .dc-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
 .dc-head h3 { margin: 0; font-size: 15px; font-weight: 800; }
 .chart-box { position: relative; height: 240px; }

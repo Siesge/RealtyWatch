@@ -1,6 +1,7 @@
 """История рынка: снимки после каждого прогона (для графиков дашборда), события (для экрана «Изменения»),
 восстановление истории по уже собранным данным и повторная проверка «снятых» объявлений."""
 import json
+import math
 import statistics
 from collections import defaultdict
 
@@ -163,6 +164,34 @@ def changes(con, days=7, include_baseline=False):
            FROM events e JOIN listings l ON l.source=e.source AND l.source_id=e.source_id
            WHERE e.ts >= replace(datetime('now', 'localtime', ?), ' ', 'T')""" +("" if include_baseline else " AND e.baseline=0") + " ORDER BY e.ts DESC"
     return [dict(r) for r in con.execute(q, (f"-{int(days)} days",))]
+
+
+# Средний срок экспозиции вторичной квартиры в РФ в 2025 г.: ~100 дней по крупным регионам (Домклик),
+# 110 дней по миллионникам, 83–137 по городам (Яндекс Недвижимость, I кв. 2025). Курортный рынок медленнее —
+# берём 120 дней как стартовую оценку, пока своя статистика не накопилась.
+PRIOR_LIFETIME_DAYS = 120
+PRIOR_WEIGHT = 10        # «вес» стартовой оценки в подтверждённых снятиях
+LIFETIME_RANGE = (45, 365)
+
+
+def lifetime_days(con, source):
+    """Средний срок жизни объявления на сайте, дней. Оценка для экспоненциального срока жизни с учётом
+    ещё не снятых: (дни наблюдения всех объявлений) / (подтверждённые снятия), сглаженная к PRIOR_LIFETIME_DAYS.
+    Возвращает (τ, снятий в статистике)."""
+    now = db.now()
+    r = con.execute(
+        """SELECT SUM(active=0 AND removed_at IS NOT NULL) n,
+                  SUM(MAX(0, julianday(CASE WHEN active=0 AND removed_at IS NOT NULL THEN removed_at ELSE ? END)
+                             - julianday(first_seen))) days
+           FROM listings WHERE source=?""", (now, source)).fetchone()
+    n, days = r["n"] or 0, r["days"] or 0.0
+    tau = (days + PRIOR_LIFETIME_DAYS * PRIOR_WEIGHT) / (n + PRIOR_WEIGHT)
+    return min(max(tau, LIFETIME_RANGE[0]), LIFETIME_RANGE[1]), n
+
+
+def expected_gone(gaps_days, tau):
+    """Сколько объявлений ожидаемо снимут за прошедшее у каждого время: Σ (1 − e^(−t/τ))."""
+    return sum(1 - math.exp(-max(g, 0) / tau) for g in gaps_days)
 
 
 def dashboard(con):
