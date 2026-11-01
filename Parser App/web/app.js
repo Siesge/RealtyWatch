@@ -235,7 +235,8 @@ function card(o) {
   const n = o.items.length;
   const multiTip = `Эта квартира найдена на: ${o.sources.map(s => SRC[s]).join(", ")} — объявления объединены в одну карточку.\n` +
     "Признаки одной квартиры: те же комнаты, этаж и этажность, площадь ±1 м², адрес в пределах 150 м, цена ±10%";
-  return `<article class="card ${o.excluded ? "excl" : ""} ${o.active ? "" : "inactive"}" data-id="${esc(o.id)}">
+  return `<article class="card ${o.excluded ? "excl" : ""} ${o.active ? "" : "inactive"} ${o.id === PICK ? "picked" : ""}" data-id="${esc(o.id)}">
+    ${o.id === PICK ? `<div class="pick-note" title="Подсветка снимется по клику на карточку">${ICON.pin}<span>Вы перешли к этой квартире</span></div>` : ""}
     ${media(o)}
       <div class="media-top"><span class="left"><span class="pill zone-${o.zone}" title="${esc(ZONE_TIP[o.zone] || "")}">${ZONE_SHORT[o.zone] || o.zone}</span>
         ${o.sources.length > 1 ? `<span class="pill multi" title="${esc(multiTip)}">${o.sources.length} ${plural(o.sources.length, "сайт", "сайта", "сайтов")}</span>` : ""}</span>
@@ -267,13 +268,19 @@ function renderCards(rows) {
     hl = null;
   }
   const el = $("#cardsList");
+  const LIMIT = 240;
+  if (PICK) {
+    // выбранная квартира показывается, даже если её скрывают фильтры или лимит карточек
+    const p = OBJS.find(o => o.id === PICK);
+    const shown = groupOn() ? rows.filter(o => o.zone === p?.zone).slice(0, LIMIT) : rows.slice(0, LIMIT * 2);
+    if (p && !shown.includes(p)) rows = [p, ...rows.filter(o => o !== p)];
+  }
   if (!rows.length) {
     const liked = $("#fLiked").checked;
     el.innerHTML = `<div class="empty"><b>${liked ? "В избранном пока пусто" : ALL.length ? "Ничего не найдено" : "База пока пуста"}</b>${
       liked ? "Нажмите ♥ на карточке, чтобы добавить объект" : ALL.length ? "Ослабьте фильтры или включите другие зоны" : "Нажмите «Запустить» слева, чтобы собрать объявления"}</div>`;
     return;
   }
-  const LIMIT = 240;
   if (!groupOn()) {
     el.innerHTML = `<div class="cards flat">${rows.slice(0, LIMIT * 2).map(card).join("")}</div>`;
     return;
@@ -322,7 +329,7 @@ function renderTable(rows) {
     const v = o => (k === "sources" ? o.sources.length : o[k]) ?? "";
     rows = [...rows].sort((a, b) => (v(a) > v(b) ? 1 : v(a) < v(b) ? -1 : 0) * d);
   }
-  $("#view-table").innerHTML = `<div class="panel"><table class="grid"><thead><tr>${COLS.map(c => `<th data-k="${c[0]}">${c[1]}${tableSort && tableSort[0] === c[0] ? (tableSort[1] > 0 ? " ↑" : " ↓") : ""}</th>`).join("")}</tr></thead>
+  $("#view-table").innerHTML = `<div class="panel"><table class="grid"><thead><tr>${COLS.map(c => `<th data-k="${c[0]}" class="${c[3] ? "num" : ""}">${c[1]}${tableSort && tableSort[0] === c[0] ? (tableSort[1] > 0 ? " ↑" : " ↓") : ""}</th>`).join("")}</tr></thead>
     <tbody>${rows.slice(0, 1500).map(o => `<tr class="${o.excluded ? "excl" : ""}" data-id="${esc(o.id)}" title="Клик — открыть карточку в подборке">${COLS.map(c => `<td class="${c[3] ? "num" : ""}">${c[2](o)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
   $$("#view-table tbody tr").forEach(tr => tr.onclick = e => { if (!e.target.closest("a")) goToCard(tr.dataset.id); });
   $$("#view-table th").forEach(th => th.onclick = () => {
@@ -335,6 +342,7 @@ function renderTable(rows) {
 // ---------- карты ----------
 const COLOR = { cian: "#3E7BFA", avito: "#1FAF6A", yandex: "#F2552F" };
 let MAIN = null, SIDE = null, hl = null;
+let PICK = null;  // карточка, к которой перешли из таблицы/дашборда: подсвечена, пока по ней не кликнут
 
 function makeMap(el) {
   const m = L.map(el, { zoomControl: true, attributionControl: true }).setView([44.49, 34.155], 13);
@@ -472,7 +480,7 @@ async function renderRuns() {
   const runs = await api("/api/runs");
   const t = s => (s || "").replace("T", " ").slice(5, 16);
   $("#view-runs").innerHTML = runs.length ? `<div class="panel"><table class="grid"><thead><tr><th>Сайт</th><th>Статус</th><th>Старт</th><th>Финиш</th><th>Режим</th>
-    <th>Стр.</th><th>Найдено</th><th>Новых</th><th>Изм.</th><th>Снято</th><th>Итог</th></tr></thead><tbody>${runs.map(r => `<tr>
+    <th class="num">Стр.</th><th class="num">Найдено</th><th class="num">Новых</th><th class="num">Изм.</th><th class="num">Снято</th><th>Итог</th></tr></thead><tbody>${runs.map(r => `<tr>
     <td><i class="sdot ${r.source}"></i> ${SRC[r.source]}</td><td><span class="st-badge ${r.status}">${STATE[r.status] || r.status}</span></td>
     <td>${t(r.started)}</td><td>${t(r.finished)}</td><td>${r.mode}</td><td class="num">${r.pages ?? ""}</td><td class="num">${r.found ?? ""}</td>
     <td class="num">${r.new ?? ""}</td><td class="num">${r.changed ?? ""}</td><td class="num">${r.removed ?? ""}</td><td>${esc(r.message || "")}</td></tr>`).join("")}</tbody></table></div>`
@@ -695,6 +703,7 @@ async function poll() {
 // ---------- навигация и события ----------
 function setView(v) {
   view = v;
+  if (v !== "cards") PICK = null;
   $$(".nav button").forEach(b => b.classList.toggle("active", b.dataset.view === v));
   $$(".view").forEach(el => el.classList.add("hidden"));
   $(`#view-${v}`).classList.remove("hidden");
@@ -751,6 +760,7 @@ $("#cardsList").addEventListener("mouseover", e => {
 $("#cardsList").addEventListener("click", e => {
   const c = e.target.closest(".card");
   if (!c) return;
+  if (c.classList.contains("picked")) { PICK = null; c.classList.remove("picked"); c.querySelector(".pick-note")?.remove(); }
   if (e.target.closest(".heart")) { e.preventDefault(); toggleLike(c.dataset.id, e.target.closest(".heart")); return; }
   if (e.target.closest(".pin")) {
     if (!sideOn()) setSide(true);
@@ -763,13 +773,11 @@ $("#cardsList").addEventListener("click", e => {
 
 // Таблица и изменения → карточка в подборке: открыть, прокрутить и подсветить
 function goToCard(id) {
-  const o = OBJS.find(x => x.id === id);
-  if (o && !$(`input[name=zone][value=${o.zone}]`).checked) $(`input[name=zone][value=${o.zone}]`).checked = true;
-  if (o && o.excluded && $("#fState").value === "pass") $("#fState").value = "all";
-  if (o && !o.active) $("#fActive").checked = false;
+  PICK = id;
   setView("cards");
   setTimeout(() => {
-    focusCard(id);
+    const el = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+    if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
     highlight(id, false);
   }, 80);
 }
