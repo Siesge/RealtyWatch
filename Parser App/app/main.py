@@ -160,21 +160,23 @@ def _changes_text(c):
 
 
 def _notify_hook(tray):
-    """После каждой пачки прогонов: уведомление, только если на рынке что-то изменилось."""
+    """Когда закончили все сайты одного запуска: уведомление, только если на рынке что-то изменилось.
+    Сайт, который собирает ещё с прошлого запуска, уведомляет отдельно, когда закончит."""
     from . import db, history
-    from .runner import manager
+    from .runner import SOURCE_LABEL, manager
 
-    def hook(started, auto):
+    def hook(run_ids, sources, auto):
         con = db.connect()
-        c = history.changes_summary(con, started)
+        c = history.runs_summary(con, run_ids)
         con.close()
         text = _changes_text(c)
+        names = ", ".join(SOURCE_LABEL.get(s, s) for s in sources)
         if not text:
-            manager.log("db", "сбор завершён — изменений на рынке нет")
+            manager.log("db", f"сбор завершён ({names}) — изменений на рынке нет")
             return
-        manager.log("db", f"🔔 изменения на рынке: {text}")
+        manager.log("db", f"🔔 изменения на рынке ({names}): {text}")
         if tray:
-            tray.notify("RealtyWatch: изменения на рынке", text + "\nНажмите, чтобы посмотреть", view="changes")
+            tray.notify(f"RealtyWatch: изменения на рынке — {names}", text + "\nНажмите, чтобы посмотреть", view="changes")
 
     return hook
 
@@ -245,7 +247,7 @@ def main():
     tray = None
     try:
         if server_only:
-            manager.on_batch_done.append(_notify_hook(None))
+            manager.on_launch_done.append(_notify_hook(None))
             print(f"RealtyWatch (сервер для отладки): {url}")
             while True:
                 time.sleep(1)
@@ -267,7 +269,7 @@ def main():
                 if tray is None:
                     tray = Tray(window, str(paths.ROOT / "assets" / "icon.png"), TITLE,
                                 on_update=lambda: manager.start(sched.get()["sources"]))
-                    manager.on_batch_done.append(_notify_hook(tray))
+                    manager.on_launch_done.append(_notify_hook(tray))
                     window.events.minimized += tray.hide  # свернуть = убрать в трей
 
             window.events.shown += on_shown

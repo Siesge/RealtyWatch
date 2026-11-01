@@ -420,6 +420,7 @@ table.grid a { color: var(--accent); font-weight: 700; text-decoration: none; }
 .auto-cfg select, .auto-cfg input { height: 28px; border-radius: 8px; border: 1px solid var(--side-line); background: var(--side-2); color: var(--side-ink); font-weight: 700; padding: 0 6px; }
 .auto-cfg input { width: 64px; }
 .auto-timer { font-size: 11.5px; color: var(--side-muted); }
+.auto-skip { margin-top: 4px; font-size: 11px; line-height: 1.35; color: var(--warn); }
 .auto-timer b { color: var(--side-ink); font-variant-numeric: tabular-nums; }
 
 /* ---------- дашборд ---------- */

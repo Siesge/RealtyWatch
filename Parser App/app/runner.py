@@ -15,6 +15,7 @@ from .scrapers import SCRAPERS
 # и времени с прошлого раза, см. history.expected_gone) + MASS_MARGIN, но не меньше MASS_SHARE (и MASS_MIN штук)
 # и не больше MASS_CAP. Пауза в несколько дней — около 25%, месяц — ~40%, три месяца — ~70%, полгода — ~95%.
 MASS_SHARE, MASS_MIN, MASS_MARGIN, MASS_CAP = 0.25, 20, 0.20, 0.95
+SOURCE_LABEL = {"cian": "ЦИАН", "avito": "Авито", "yandex": "Яндекс"}
 
 logging.basicConfig(
     filename=LOGS / "app.log", level=logging.INFO, encoding="utf-8",
@@ -31,10 +32,13 @@ class RunManager:
         self.stops = {}
         self.journal = deque(maxlen=600)
         self._seq = 0
-        self._active = 0              # прогонов в работе (для сигнала «пачка завершена»)
-        self.batch_started = None     # начало текущей пачки прогонов
-        self.batch_auto = False       # пачка запущена расписанием
-        self.on_batch_done = []       # обработчики: f(batch_started, auto)
+        # Запуск — сайты, стартовавшие одной командой (кнопкой или по расписанию). Когда закончили все сайты
+        # запуска, вызываются on_launch_done: f(run_ids, sources, auto). Сайт, который ещё собирает с прошлого
+        # запуска, в новый не входит, поэтому медленный сайт не задерживает уведомление о быстрых.
+        self.launches = {}            # id → {"left": сайты в работе, "runs": [(сайт, run_id)], "auto": bool}
+        self.run_launch = {}          # сайт → id запуска
+        self._launch_seq = 0
+        self.on_launch_done = []
 
     def _log(self, source, msg):
         with self.lock:
@@ -51,18 +55,20 @@ class RunManager:
         return t is not None and t.is_alive()
 
     def start(self, sources, auto=False):
-        started = []
-        for s in sources:
-            if s in SCRAPERS and not self.running(s):
-                with self.lock:
-                    if self._active == 0:
-                        self.batch_started, self.batch_auto = db.now(), auto
-                    self._active += 1
-                self.stops[s] = threading.Event()
-                t = threading.Thread(target=self._run, args=(s,), daemon=True, name=f"run-{s}")
-                self.threads[s] = t
-                t.start()
-                started.append(s)
+        """Запускает сайты, которые сейчас не собираются; идущие сборы продолжаются. Возвращает запущенные."""
+        started = [s for s in dict.fromkeys(sources) if s in SCRAPERS and not self.running(s)]
+        if not started:
+            return []
+        with self.lock:
+            self._launch_seq += 1
+            self.launches[self._launch_seq] = {"left": set(started), "runs": [], "auto": auto}
+            for s in started:
+                self.run_launch[s] = self._launch_seq
+        for s in started:
+            self.stops[s] = threading.Event()
+            t = threading.Thread(target=self._run, args=(s,), daemon=True, name=f"run-{s}")
+            self.threads[s] = t
+            t.start()
         return started
 
     def stop(self, sources=None):
@@ -141,14 +147,35 @@ class RunManager:
         except Exception:
             log.error(traceback.format_exc())
         with self.lock:
-            self._active -= 1
-            last = self._active == 0
-        if last:
-            for hook in self.on_batch_done:
-                try:
-                    hook(self.batch_started, self.batch_auto)
-                except Exception:
-                    log.error(traceback.format_exc())
+            launch = self.launches.get(self.run_launch.pop(source, None))
+            done = None
+            if launch:
+                launch["runs"].append((source, run_id))
+                launch["left"].discard(source)
+                if not launch["left"]:
+                    done = launch
+                    self.launches = {k: v for k, v in self.launches.items() if v is not launch}
+        if done:
+            self._fire(done["runs"], done["auto"])
+
+    def flush_partial(self):
+        """Уведомить о сайтах, которые уже закончили, не дожидаясь медленного сайта того же запуска
+        (вызывается при следующем запуске по расписанию). Медленный сайт уведомит отдельно, когда закончит."""
+        parts = []
+        with self.lock:
+            for launch in self.launches.values():
+                if launch["runs"] and launch["left"]:
+                    parts.append((launch["runs"], launch["auto"]))
+                    launch["runs"] = []
+        for runs, auto in parts:
+            self._fire(runs, auto)
+
+    def _fire(self, runs, auto):
+        for hook in self.on_launch_done:
+            try:
+                hook([r for _, r in runs], [s for s, _ in runs], auto)
+            except Exception:
+                log.error(traceback.format_exc())
 
     def _handle_missing(self, con, scraper, seen, prev_seen, started, run_id, lg, stop):
         """Объявления, пропавшие из полной выдачи, проверяются на своих страницах.

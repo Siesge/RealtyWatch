@@ -1,4 +1,7 @@
 """Автообновление по таймеру: раз в N часов запускает сбор выбранных сайтов.
+Запуски идут строго по расписанию. Сайт, который ещё собирает с прошлого запуска, не перезапускается
+и не прерывается — он пропускает этот запуск и стартует в первый запуск после того, как закончит.
+Остальные сайты стартуют как обычно.
 Настройка хранится в data/schedule.json — она относится к этому компьютеру и не экспортируется с базой."""
 import json
 import os
@@ -7,9 +10,11 @@ import time
 from datetime import datetime, timedelta
 
 from .paths import DATA
+from .runner import SOURCE_LABEL
 
 FILE = DATA / "schedule.json"
-DEFAULT = {"enabled": False, "hours": 6, "sources": ["cian", "avito", "yandex"], "next_run": None}
+DEFAULT = {"enabled": False, "hours": 6, "sources": ["cian", "avito", "yandex"], "next_run": None,
+           "last_tick": None, "skipped": {}}  # skipped: сайт → время пропущенного запуска
 CATCH_UP_DELAY_S = 90  # если время прогона прошло, пока программа была закрыта, — запуск вскоре после старта
 
 
@@ -33,10 +38,22 @@ class Scheduler:
     def _plan(self):
         self.cfg["next_run"] = (datetime.now() + timedelta(hours=float(self.cfg["hours"]))).isoformat(timespec="seconds")
 
+    def _plan_next(self):
+        """Следующий запуск — через шаг от запланированного, а не от фактического: расписание не уплывает."""
+        step, now = timedelta(hours=float(self.cfg["hours"])), datetime.now()
+        nxt = datetime.fromisoformat(self.cfg["next_run"]) if self.cfg["next_run"] else now
+        while nxt <= now:
+            nxt += step
+        self.cfg["next_run"] = nxt.isoformat(timespec="seconds")
+
     def get(self):
         with self.lock:
             out = dict(self.cfg)
         out["now"] = datetime.now().isoformat(timespec="seconds")
+        # Пропустившие запуск, которые всё ещё собирают: когда начали текущий сбор
+        st = self.manager.status
+        out["skipped"] = {s: {"tick": t, "since": (st.get(s) or {}).get("started")}
+                          for s, t in (out.get("skipped") or {}).items() if self.manager.running(s)}
         return out
 
     def update(self, data):
@@ -61,16 +78,27 @@ class Scheduler:
     def _loop(self):
         while True:
             time.sleep(10)
-            with self.lock:
-                due = self.cfg["enabled"] and self.cfg["next_run"] and datetime.now().isoformat() >= self.cfg["next_run"]
-                sources = list(self.cfg["sources"])
-            if not due:
-                continue
-            if self.manager.any_running():
-                continue  # дождёмся окончания текущего сбора
-            started = self.manager.start(sources, auto=True)
-            self.manager.log("db", f"автообновление: запущено ({', '.join(started) or 'нет выбранных сайтов'}), "
-                                   f"следующее через {self.cfg['hours']:g} ч")
-            with self.lock:
-                self._plan()
-                self._save()
+            self._tick()
+
+    def _tick(self):
+        with self.lock:
+            due = self.cfg["enabled"] and self.cfg["next_run"] and datetime.now().isoformat() >= self.cfg["next_run"]
+            sources = list(self.cfg["sources"])
+        if not due:
+            return
+        tick = datetime.now().isoformat(timespec="seconds")
+        self.manager.flush_partial()  # о закончивших с прошлого запуска — не ждать медленного сайта
+        started = self.manager.start(sources, auto=True)  # идущие сборы он сам пропускает
+        busy = [s for s in sources if s not in started]
+        with self.lock:
+            self.cfg["last_tick"] = tick
+            self.cfg["skipped"] = {s: tick for s in busy}
+            self._plan_next()
+            self._save()
+        names = lambda ss: ", ".join(SOURCE_LABEL.get(s, s) for s in ss)
+        msg = f"автообновление: запущено — {names(started)}" if started else "автообновление: все выбранные сайты ещё собирают"
+        if busy:
+            since = {s: (self.manager.status.get(s) or {}).get("started", "")[11:16] for s in busy}
+            msg += ("; ещё собирают с прошлого раза — " + ", ".join(f"{SOURCE_LABEL.get(s, s)} (с {since[s]})" for s in busy)
+                    + " — продолжают, перезапустятся в первый запуск после окончания")
+        self.manager.log("db", msg + f". Следующий запуск в {self.cfg['next_run'][11:16]}")

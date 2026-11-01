@@ -77,8 +77,22 @@ def snapshot(con, run_id=None):
 
 
 def changes_summary(con, since):
-    """Изменения рынка с момента since (для уведомления после прогона)."""
+    """Изменения рынка с момента since."""
     return _event_counts(con, since, "9999")
+
+
+def runs_summary(con, run_ids):
+    """Изменения рынка, найденные указанными прогонами (для уведомления после запуска)."""
+    c = {"new": 0, "removed": 0, "returned": 0, "price_down": 0, "price_up": 0}
+    if not run_ids:
+        return c
+    q = f"SELECT kind, old_value, new_value FROM events WHERE baseline=0 AND run_id IN ({','.join('?' * len(run_ids))})"
+    for r in con.execute(q, list(run_ids)):
+        if r["kind"] == "price":
+            c["price_down" if (r["new_value"] or 0) < (r["old_value"] or 0) else "price_up"] += 1
+        elif r["kind"] in c:
+            c[r["kind"]] += 1
+    return c
 
 
 def backfill(con):

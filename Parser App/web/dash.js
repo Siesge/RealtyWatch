@@ -436,14 +436,20 @@ async function initAuto() {
   custom.onchange = () => { if (+custom.value > 0) save({ hours: +custom.value }); };
   $("#sources").addEventListener("change", () => save({ sources: $$(".src-run:checked").map(i => i.value) }));
   setInterval(tick, 1000);
+  // пропуски запуска и идущие сборы меняются со временем — обновляем расписание раз в 20 с
+  setInterval(() => api("/api/schedule").then(a => { AUTO = a; }).catch(() => {}), 20000);
   tick();
 }
 function currentHours() { return $("#autoHours").value === "custom" ? +$("#autoCustom").value || 6 : +$("#autoHours").value; }
 let autoSkew = 0;
+const hhmm = t => new Date(t).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
 function tick() {
   const t = $("#autoTimer");
   if (!AUTO) return;
   $("#autoRow").classList.toggle("on", AUTO.enabled);
+  const skip = $("#autoSkip"), sk = AUTO.enabled ? Object.entries(AUTO.skipped || {}) : [];
+  skip.classList.toggle("hidden", !sk.length);
+  skip.innerHTML = sk.map(([s, v]) => `${SRC[s]} ещё собирает${v.since ? ` с ${hhmm(v.since)}` : ""} — пропустил запуск ${hhmm(v.tick)}`).join("<br>");
   if (!AUTO.enabled || !AUTO.next_run) { t.textContent = "выключено"; return; }
   const left = Math.max(0, (new Date(AUTO.next_run) - new Date()) / 1000);
   const h = Math.floor(left / 3600), m = Math.floor(left % 3600 / 60), s = Math.floor(left % 60);
