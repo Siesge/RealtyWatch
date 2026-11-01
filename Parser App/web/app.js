@@ -369,7 +369,35 @@ function makeMap(el) {
   legend().addTo(m);
   const M = { map: m, layer: L.layerGroup().addTo(m), zone: null, markers: {} };
   lockControl(M).addTo(m);
+  popupFollowsMouse(M);
   return M;
+}
+
+// Подсказка точки (цена, ссылки на объявления) после клика держится, пока мышь на точке, и закрывается, как только
+// мышь уходит, — чтобы не загораживать соседние точки. На саму подсказку перейти можно: по её ссылкам кликают.
+// Закрывает только движение мыши: если карта сама сдвинулась, чтобы показать подсказку целиком, подсказка остаётся.
+function popupFollowsMouse(M) {
+  const map = M.map;
+  let timer = null;
+  const hold = () => { clearTimeout(timer); timer = null; };
+  const drop = () => { timer = timer || setTimeout(() => { timer = null; map.closePopup(); }, 250); };
+  const tracked = () => M.clicked && M.clicked.isPopupOpen();
+  map.on("mousemove", e => {
+    if (!tracked()) return;
+    if (e.originalEvent.target.closest(".leaflet-popup")) return hold();
+    const d = map.latLngToContainerPoint(M.clicked.getLatLng()).distanceTo(e.containerPoint);
+    d <= M.clicked.getRadius() + 6 ? hold() : drop();
+  });
+  map.on("popupopen", e => {
+    const el = e.popup.getElement();
+    if (el && !el.rwHold) {
+      el.rwHold = true;
+      el.addEventListener("mouseenter", hold);
+      el.addEventListener("mousemove", hold);
+    }
+  });
+  map.on("popupclose", hold);
+  map.getContainer().addEventListener("mouseleave", () => { if (tracked()) drop(); });
 }
 
 // Цвет точки — набор сайтов объекта (среди выбранных в фильтре): один сайт — его цвет, два — смешанный,
@@ -423,7 +451,7 @@ function drawMap(M, rows) {
       .bindPopup(`<b>${fmt(o.price)} ₽</b>${o.liked ? " ♥" : ""}<br>${o.rooms ?? "?"}-к, ${o.area ?? "?"} м², ${o.floor ?? "?"}/${o.floors ?? "?"} эт.<br><span style="opacity:.7">${esc(o.address)}</span><br>${links}`)
       .addTo(M.layer);
     mk.obj = o;
-    mk.on("click", () => focusCard(o.id));
+    mk.on("click", () => { M.clicked = mk; focusCard(o.id); });
     M.markers[o.id] = mk;
   });
 }
