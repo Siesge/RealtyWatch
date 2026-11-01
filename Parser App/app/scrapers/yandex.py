@@ -56,10 +56,12 @@ class Yandex(Scraper):
         html = self.fetch(lambda: self.http.get(url).text, lambda b: b.goto(url))
         st = parse_state(html)
         if not st:
+            self.snapshot_last("нет INITIAL_STATE")
             raise IOError("Яндекс: нет INITIAL_STATE на странице")
         so = (st.get("search") or {}).get("offers") or {}
         pager = so.get("pager") or {}
         if not pager.get("totalPages") and so.get("entities"):
+            self.snapshot_last("нет числа страниц")
             raise IOError("Яндекс: на странице нет данных о числе страниц выдачи")
         return so.get("entities") or [], pager
 

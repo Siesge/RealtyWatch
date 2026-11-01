@@ -5,7 +5,7 @@ import traceback
 from collections import deque
 from datetime import datetime
 
-from . import db, dedupe, geo, history, images, rules, settings
+from . import db, dedupe, geo, history, images, rules, runlog, settings
 from .net import Blocked, IpBanned, Stopped, pause
 from .paths import LOGS
 from .scrapers import SCRAPERS
@@ -16,18 +16,22 @@ from .scrapers import SCRAPERS
 # и не больше MASS_CAP. Пауза в несколько дней — около 25%, месяц — ~40%, три месяца — ~70%, полгода — ~95%.
 MASS_SHARE, MASS_MIN, MASS_MARGIN, MASS_CAP = 0.25, 20, 0.20, 0.95
 SOURCE_LABEL = {"cian": "ЦИАН", "avito": "Авито", "yandex": "Яндекс"}
+STATE_LABEL = {"done": "готово", "partial": "неполный", "error": "ошибка", "blocked": "блокировка", "stopped": "остановлено"}
 
-logging.basicConfig(
-    filename=LOGS / "app.log", level=logging.INFO, encoding="utf-8",
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+runlog.setup_logging()
 log = logging.getLogger("realtywatch")
+
+# Пауза Авито после ограничений IP растёт; после стольких чистых прогонов подряд (без капчи и ограничений)
+# она понемногу возвращается к заданной в настройках
+CLEAN_RUNS_TO_EASE = 3
+EASE_FACTOR = 1.5
 
 
 class RunManager:
     def __init__(self):
         self.lock = threading.Lock()
         self.status = {}
+        self.runlogs = {}             # сайт → подробный журнал идущего прогона
         self.threads = {}
         self.stops = {}
         self.journal = deque(maxlen=600)
@@ -44,7 +48,10 @@ class RunManager:
         with self.lock:
             self._seq += 1
             self.journal.append({"n": self._seq, "t": datetime.now().strftime("%H:%M:%S"), "src": source, "msg": msg})
+            rl = self.runlogs.get(source)
         log.info("[%s] %s", source, msg)
+        if rl:
+            rl.line(msg)
 
     def _progress(self, source, **kw):
         with self.lock:
@@ -105,7 +112,13 @@ class RunManager:
         # Пока у сайта не было ни одного полного прогона, «новые» — это первичная загрузка, а не новинки рынка
         baseline = int(not con.execute("SELECT 1 FROM runs WHERE source=? AND status='done' AND id<?", (source, run_id)).fetchone())
         con.commit()
+        rl = runlog.RunLog(run_id, source)
+        with self.lock:
+            self.runlogs[source] = rl
         scraper = SCRAPERS[source](cfg, lg, stop, pr)
+        scraper.runlog = rl
+        rl.line(f"прогон №{run_id}, {SOURCE_LABEL.get(source, source)}, режим {scraper.mode}, пауза {scraper.delay[0]:g}–{scraper.delay[1]:g} с, "
+                f"фильтры {cfg['filters']['price_min'] / 1e6:g}–{cfg['filters']['price_max'] / 1e6:g} млн, от {cfg['filters']['area_min']} м²")
         counts = {"found": 0, "new": 0, "changed": 0, "excluded": 0, "details": 0}
         state, message, removed = "done", "", 0
         seen = set()  # номера объявлений, реально полученные в этом прогоне
@@ -121,6 +134,8 @@ class RunManager:
                 removed, note = self._handle_missing(con, scraper, seen, prev_seen, started, run_id, lg, stop)
             else:
                 note = f" (выдача неполная: {scraper.incomplete_reason} — снятие не проверялось)"
+            if not scraper.complete:
+                state = "partial"  # выдаче нельзя доверять: снятые не проверялись (см. Scraper.finish и mass_limit)
             message = f"найдено {counts['found']}, новых {counts['new']}, изменилось {counts['changed']}, снято {removed}{note}"
         except Stopped:
             state, message = "stopped", "остановлено пользователем"
@@ -131,15 +146,23 @@ class RunManager:
             log.error(traceback.format_exc())
         finally:
             scraper.close()
-            con.execute("UPDATE runs SET finished=?, status=?, pages=?, found=?, new=?, changed=?, removed=?, message=? WHERE id=?",
+            con.execute("UPDATE runs SET finished=?, status=?, pages=?, found=?, new=?, changed=?, removed=?, message=?, "
+                        "declared=?, collected=?, requests=? WHERE id=?",
                         (db.now(), state, self.status[source].get("page"), counts["found"], counts["new"],
-                         counts["changed"], removed, message, run_id))
+                         counts["changed"], removed, message, scraper.declared, len(seen), rl.requests, run_id))
             con.commit()
             con.close()
             pr(state=state, message=message, finished=db.now())
-            lg(f"завершено: {state} — {message}")
+            lg(f"завершено: {STATE_LABEL.get(state, state)} — {message}")
+            rl.line(f"итог: заявлено сайтом {scraper.declared if scraper.declared is not None else '—'}, собрано уникальных {len(seen)}, "
+                    f"запросов {rl.requests}, капч {scraper.captchas}, ограничений IP {scraper.bans}")
+            if state in ("done", "partial"):
+                self._ease_delay(scraper, lg)
         if state != "stopped":
             images.repair(db.connect, sources=[source], log=lg, stop=stop)
+        with self.lock:
+            self.runlogs.pop(source, None)
+        rl.close()
         try:
             c2 = db.connect()
             history.snapshot(c2, run_id)
@@ -157,6 +180,25 @@ class RunManager:
                     self.launches = {k: v for k, v in self.launches.items() if v is not launch}
         if done:
             self._fire(done["runs"], done["auto"])
+
+    def _ease_delay(self, scraper, lg):
+        """Пауза, выросшая после ограничений IP, возвращается к заданной в настройках после чистых прогонов."""
+        if scraper.name != "avito":
+            return
+        cfg = settings.load()
+        site = cfg["sites"]["avito"]
+        base = site.get("delay_base") or site["delay"]
+        if scraper.captchas or scraper.bans:
+            site["clean_runs"] = 0
+        else:
+            site["clean_runs"] = site.get("clean_runs", 0) + 1
+            cur = site["delay"]
+            if site["clean_runs"] >= CLEAN_RUNS_TO_EASE and (cur[0] > base[0] or cur[1] > base[1]):
+                new = [max(base[0], round(cur[0] / EASE_FACTOR)), max(base[1], round(cur[1] / EASE_FACTOR))]
+                lg(f"{CLEAN_RUNS_TO_EASE} прогона подряд без капчи и ограничений — пауза уменьшена "
+                   f"{cur[0]:g}–{cur[1]:g} → {new[0]:g}–{new[1]:g} с (не ниже заданной {base[0]:g}–{base[1]:g} с)")
+                site["delay"], site["clean_runs"] = new, 0
+        settings.save(cfg)
 
     def flush_partial(self):
         """Уведомить о сайтах, которые уже закончили, не дожидаясь медленного сайта того же запуска
@@ -188,6 +230,8 @@ class RunManager:
         limit_n, expected, tau, gap = mass_limit(con, scraper.name, prev_seen, started)
         active = len(prev_seen)
         if len(cand) > limit_n:
+            scraper.complete = False
+            scraper.incomplete_reason = f"пропало {len(cand)} из {active} за {gap:g} дн. — больше допуска {limit_n:.0f}"
             lg(f"⚠ из поиска пропало {len(cand)} из {active} объявлений за {gap:g} дн. — больше, чем рынок успевает снять "
                f"(ожидаемо ~{expected:.0f}, допуск {limit_n:.0f} при сроке жизни объявления ~{tau:.0f} дн.). "
                "Похоже на сбой выдачи — снятие не проверяется")

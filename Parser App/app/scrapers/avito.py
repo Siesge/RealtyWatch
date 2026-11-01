@@ -107,10 +107,12 @@ class Avito(Scraper):
             if count is None and not items or (not items and page < pages) or (stale and page < pages):
                 what = "без списка объявлений" if not items else "с объявлениями прошлых страниц"
                 self.log(f"страница {page}/{pages} пришла {what} — повторяю")
+                self.snapshot_last(f"страница {page} {what}")
                 self.wait()
                 count, items = self._load_page(page)
                 stale = items and all(it.get("data-item-id") in seen for it in items)
                 if count is None and not items or (not items and page < pages) or (stale and page < pages):
+                    self.snapshot_last(f"страница {page} {what} повторно")
                     raise IOError(f"страница {page} выдачи пришла {what} дважды — прогон неполный, снятие объявлений не выполняется")
             if count:
                 pages, declared = math.ceil(count / 50), count

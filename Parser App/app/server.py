@@ -1,11 +1,12 @@
 """Локальный веб-интерфейс: http://127.0.0.1:<port>/"""
 import json
+import os
 
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import db, dedupe, geo, history, images, rules, settings, transfer
+from . import db, dedupe, geo, history, images, paths, rules, runlog, settings, transfer
 from .paths import EXPORTS, WEB
 from .runner import manager
 from .scrapers import SCRAPERS
@@ -217,4 +218,41 @@ def runs():
     con = db.connect()
     rows = [dict(r) for r in con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 50")]
     con.close()
+    for r in rows:
+        r["has_log"] = runlog.run_log_path(r["id"]) is not None
     return rows
+
+
+def run_log_text(run_id):
+    """Подробный журнал прогона + список сохранённых при сбоях страниц."""
+    p = runlog.run_log_path(run_id)
+    if p is None:
+        return None, []
+    snaps = sorted(x.name for x in runlog.SNAP_DIR.glob(f"{int(run_id):06d}_*")) if runlog.SNAP_DIR.exists() else []
+    return p.read_text(encoding="utf-8", errors="replace"), snaps
+
+
+@app.get("/api/runs/{run_id}/log")
+def run_log(run_id: int):
+    text, snaps = run_log_text(run_id)
+    if text is None:
+        raise HTTPException(404, "подробного журнала у этого прогона нет (он был до появления журналов или удалён)")
+    return {"text": text, "snapshots": snaps, "file": f"logs/runs/{runlog.run_log_path(run_id).name}"}
+
+
+@app.post("/api/runs/{run_id}/log/export")
+def run_log_export(run_id: int):
+    """Без окна программы (отладочный сервер): сохраняет журнал в папку exports."""
+    text, snaps = run_log_text(run_id)
+    if text is None:
+        raise HTTPException(404, "журнала нет")
+    paths.EXPORTS.mkdir(exist_ok=True)
+    out = paths.EXPORTS / f"realtywatch-run-{run_id}.log"
+    out.write_text(text + (("\nСохранённые страницы (logs/snapshots):\n" + "\n".join(snaps)) if snaps else ""), encoding="utf-8")
+    return {"path": str(out)}
+
+
+@app.post("/api/logs/open")
+def logs_open():
+    os.startfile(str(paths.LOGS))
+    return {"ok": True}

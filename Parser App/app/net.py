@@ -38,6 +38,8 @@ class Http:
         self.s = cffi.Session(impersonate="chrome", timeout=40)
         self.s.headers.update({"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6"})
         self._load_cookies()
+        self.trace = None      # trace(kind, method, url, status, ms, size, note, body, reason) — подробный журнал
+        self.last_text = None  # тело последнего ответа (для снимка страницы при сбое)
 
     def _load_cookies(self):
         if self.cookie_file.exists():
@@ -57,15 +59,26 @@ class Http:
             self.s.cookies.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
         self.save_cookies()
 
+    def _trace(self, *a, **k):
+        if self.trace:
+            self.trace(*a, **k)
+
     def request(self, method, url, **kw):
+        t0 = time.time()
         try:
             r = self.s.request(method, url, **kw)
         except Exception as e:  # сетевые ошибки curl
+            self._trace("http", method, url, None, round((time.time() - t0) * 1000), None, f"{type(e).__name__}: {e}")
             raise IOError(f"{type(e).__name__}: {e}") from e
-        if r.status_code in (401, 403, 429, 439) or self.is_blocked(r.text, str(r.url)):
+        ms, text = round((time.time() - t0) * 1000), r.text
+        self.last_text = text
+        if r.status_code in (401, 403, 429, 439) or self.is_blocked(text, str(r.url)):
+            self._trace("http", method, url, r.status_code, ms, len(text), "блокировка/капча", text, f"http {r.status_code} блокировка")
             raise Blocked(f"HTTP {r.status_code} {r.url}")
         if r.status_code >= 400:
+            self._trace("http", method, url, r.status_code, ms, len(text), "ошибка сервера", text, f"http {r.status_code}")
             raise IOError(f"HTTP {r.status_code} {url}")
+        self._trace("http", method, url, r.status_code, ms, len(text), "" if str(r.url) == url else f"→ {r.url}")
         return r
 
     def get(self, url, **kw):
@@ -96,6 +109,8 @@ class Browser:
         # is_ready(html, url): на странице уже нужное содержимое (выдача, объявление), а не промежуточная заглушка
         self.is_ready = is_ready or (lambda html, url: True)
         self._cooldown = False
+        self.trace = None   # см. Http.trace
+        self.captchas = 0   # капч за время жизни браузера (прогон)
         self.log = log
         self.stop = stop
         self.window = window
@@ -150,16 +165,23 @@ class Browser:
         except Exception:
             pass
 
+    def _trace(self, *a, **k):
+        if self.trace:
+            self.trace(*a, **k)
+
     def goto(self, url, settle=(2.5, 5.0)):
         self.start()
         if self._cooldown:
             # сразу после капчи сайт следит особенно внимательно — не торопимся со следующей страницей
             self._cooldown = False
             pause(self.COOLDOWN_AFTER_CAPTCHA, self.stop)
+        t0 = time.time()
         self._nav(url)
         pause(settle, self.stop)
         self._humanize()
         html = self.page.content()
+        self._trace("browser", "GET", url, self.last_status, round((time.time() - t0) * 1000), len(html),
+                    "" if self.page.url == url else f"→ {self.page.url}")
         if self.is_blocked(html, self.page.url):
             # Иногда это «мягкая» проверка, которая проходит сама после перезагрузки
             self.log("проверка безопасности — пробую перезагрузить")
@@ -169,8 +191,11 @@ class Browser:
             html = self.page.content()
         if self.is_ip_banned(html, self.page.url) and "Проверка пройдена" not in html:
             # Ограничение IP за частоту запросов: человек тут не поможет, нужна пауза (её делает парсер)
+            self._trace("browser", "GET", url, self.last_status, None, len(html), "ограничение IP", html, "ограничение ip")
             raise IpBanned(self.page.url)
         if self.is_blocked(html, self.page.url):
+            self.captchas += 1
+            self._trace("browser", "GET", url, self.last_status, None, len(html), "капча", html, "капча")
             if self.window == "headless":
                 raise Blocked("капча в режиме без окна — переключите «Окно браузера» на «скрытое» или «видимое»")
             if self.window == "hidden":

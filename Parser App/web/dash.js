@@ -448,8 +448,10 @@ function tick() {
   if (!AUTO) return;
   $("#autoRow").classList.toggle("on", AUTO.enabled);
   const skip = $("#autoSkip"), sk = AUTO.enabled ? Object.entries(AUTO.skipped || {}) : [];
-  skip.classList.toggle("hidden", !sk.length);
-  skip.innerHTML = sk.map(([s, v]) => `${SRC[s]} ещё собирает${v.since ? ` с ${hhmm(v.since)}` : ""} — пропустил запуск ${hhmm(v.tick)}`).join("<br>");
+  const ov = AUTO.enabled ? Object.entries(AUTO.overrun || {}) : [];
+  skip.classList.toggle("hidden", !sk.length && !ov.length);
+  skip.innerHTML = [...sk.map(([s, v]) => `${SRC[s]} ещё собирает${v.since ? ` с ${hhmm(v.since)}` : ""} — пропустил запуск ${hhmm(v.tick)}`),
+    ...ov.map(([s, v]) => `⚠ ${SRC[s]}: ${v.streak} сбора подряд не уложились в шаг${v.avg_hours ? ` (сбор ~${v.avg_hours.toFixed(1)} ч)` : ""} — увеличьте шаг`)].join("<br>");
   if (!AUTO.enabled || !AUTO.next_run) { t.textContent = "выключено"; return; }
   const left = Math.max(0, (new Date(AUTO.next_run) - new Date()) / 1000);
   const h = Math.floor(left / 3600), m = Math.floor(left % 3600 / 60), s = Math.floor(left % 60);

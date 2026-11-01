@@ -91,8 +91,20 @@ def migrate(con):
     for name, decl in MIGRATIONS.items():
         if name not in cols:
             con.execute(f"ALTER TABLE listings ADD COLUMN {name} {decl}")
+    run_cols = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
+    for name, decl in RUN_MIGRATIONS.items():
+        if name not in run_cols:
+            con.execute(f"ALTER TABLE runs ADD COLUMN {name} {decl}")
     con.executescript(INDEXES)
     con.commit()
+
+
+# Колонки прогонов, добавленные позже
+RUN_MIGRATIONS = {
+    "declared": "INTEGER",   # сколько объявлений заявил сайт
+    "collected": "INTEGER",  # сколько уникальных собрано
+    "requests": "INTEGER",   # запросов к сайту за прогон
+}
 
 
 def reset():

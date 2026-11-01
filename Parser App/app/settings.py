@@ -32,7 +32,7 @@ DEFAULTS = {
             "details": True,
             # Авито ограничивает IP при частых запросах: первичная загрузка растягивается на несколько прогонов
             "max_details": 150,
-            "delay": [6.0, 10.0], "max_verify": 20,
+            "delay": [6.0, 10.0], "delay_base": [6.0, 10.0], "max_verify": 20,
             "max_pages": 40,
         },
         "yandex": {"enabled": True, "mode": "auto", "region_path": "yalta", "delay": [2.5, 6.0], "max_pages": 40},

@@ -66,6 +66,7 @@ class Cian(Scraper):
                                headers={"Origin": "https://www.cian.ru", "Referer": "https://www.cian.ru/"})
             d = r.json().get("data") or {}
             if "offersSerialized" not in d:
+                self.snapshot_last("нет списка в ответе API")
                 raise IOError("ЦИАН: в ответе API нет списка объявлений")
             # aggregatedCount — уникальные объекты (offerCount включает дубли от разных агентов)
             return d["offersSerialized"], d.get("aggregatedCount") or d["offerCount"]
@@ -74,6 +75,7 @@ class Cian(Scraper):
             b.goto(self._page_url(page))
             st = b.evaluate(_JS_STATE)
             if not st:
+                self.snapshot_last("нет состояния страницы")
                 raise IOError("ЦИАН: не найдено состояние страницы")
             return st["offers"], st["aggregated"] or st["total"]
 
@@ -121,7 +123,7 @@ class Cian(Scraper):
         if status in STATUS_PENDING:
             return None, None, None
         archived = '"isArchived":true' in h[:2_000_000]
-        pm = re.search(r'"bargainTerms":\{[^{}]*?"priceRur":(\d+)', h)
+        pm = re.search(r'"bargainTerms":\{[^{}]*?"price":(\d+)[^{}]*?"currency":"rur"', h)
         price = int(pm.group(1)) if pm else None
         if status == "published" and not archived:
             return "active", "на ЦИАН объявление опубликовано, но не попало в поиск (дубль другого агента или цена вне фильтра)", price

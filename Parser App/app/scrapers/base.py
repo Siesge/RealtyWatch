@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 from ..net import Blocked, Browser, Http, IpBanned, pause
+from ..runlog import NullRunLog
 
 # Ограничение IP: паузы перед повтором (мин) — растут с каждой блокировкой подряд в одном прогоне
 BAN_COOLDOWNS_MIN = [10, 20, 40, 60]
@@ -43,13 +44,17 @@ class Scraper:
         self.stop = stop
         self.progress = progress
         self.delay = tuple(self.site.get("delay", (3, 7)))
+        self.runlog = NullRunLog()  # подробный журнал прогона (назначает RunManager)
         self.http = Http(self.name, self.is_blocked)
+        self.http.trace = self._trace
         self.browser = None
         self.use_browser = self.mode == "browser"
         self.last_mode = None
         # True — выдача прочитана полностью и достоверно; только тогда отсутствующие объявления проверяются на снятие
         self.complete = False
         self.incomplete_reason = "прогон не дошёл до конца выдачи"
+        self.declared = None  # сколько объявлений заявил сайт
+        self.bans = 0         # ограничений IP за прогон
 
     # --- переопределяется в наследниках ---
     def is_blocked(self, html, url):
@@ -75,8 +80,33 @@ class Scraper:
         Капча и ограничение IP пробрасываются (Blocked/IpBanned): проверка остальных прекращается."""
         return None, None, None
 
+    @property
+    def captchas(self):
+        return self.browser.captchas if self.browser else 0
+
+    def _trace(self, kind, method, url, status=None, ms=None, size=None, note="", body=None, reason=None):
+        self.runlog.request(kind, method, url, status, ms, size, note)
+        if body is not None and reason:
+            self.runlog.snapshot(body, reason, "json" if body.lstrip()[:1] in "{[" else "html")
+
+    def snapshot_last(self, reason):
+        """Сохраняет последнюю полученную страницу (при пустой или странной странице выдачи)."""
+        body = None
+        try:
+            if self.last_mode == "browser" and self.browser and self.browser.page:
+                body = self.browser.page.content()
+            else:
+                body = self.http.last_text
+        except Exception:
+            pass
+        if body:
+            self.runlog.snapshot(body, reason, "json" if body.lstrip()[:1] in "{[" else "html")
+
     def finish(self, page, pages, limit, found, declared):
         """Решает, можно ли доверять выдаче настолько, чтобы искать по ней снятые объявления."""
+        self.declared = declared
+        self.runlog.line(f"выдача: прочитано страниц {page - 1} из {pages}, заявлено сайтом "
+                         f"{'—' if declared is None else declared}, собрано уникальных {found}")
         why = None
         if page <= pages:
             why = f"прочитано {page - 1} из {pages} страниц" + (f" (ограничение {limit} страниц в настройках)" if pages > limit else "")
@@ -93,6 +123,7 @@ class Scraper:
 
     def empty_page(self, page, pages):
         """Пустая страница посреди выдачи — сбой (капча, ограничение), а не конец списка."""
+        self.snapshot_last(f"пустая страница {page}")
         raise IOError(f"страница {page} из {pages} пришла пустой — прогон неполный, снятие объявлений не выполняется")
 
     def listings(self):
@@ -106,6 +137,7 @@ class Scraper:
             self.browser = Browser(self.name, self.is_blocked, self.log, self.stop,
                                    window=b.get("window", "hidden"), captcha_wait_min=b.get("captcha_wait_min", 10),
                                    is_ip_banned=self.is_ip_banned, is_ready=self.is_ready)
+            self.browser.trace = self._trace
         return self.browser
 
     def fetch(self, via_http, via_browser):
@@ -114,6 +146,7 @@ class Scraper:
             try:
                 return self._fetch_once(via_http, via_browser)
             except IpBanned:
+                self.bans += 1
                 if attempt == len(BAN_COOLDOWNS_MIN):
                     raise Blocked(f"IP ограничен, {attempt} пауз(ы) не помогли — попробуйте позже")
                 self._on_ip_ban(BAN_COOLDOWNS_MIN[attempt])
@@ -136,7 +169,11 @@ class Scraper:
         from .. import settings
 
         cfg = settings.load()
-        cfg["sites"][self.name]["delay"] = list(delay)
+        site = cfg["sites"][self.name]
+        # Заданная пауза запоминается до первого роста — к ней пауза вернётся после чистых сборов
+        site.setdefault("delay_base", list(site.get("delay") or self.delay))
+        site["delay"] = list(delay)
+        site["clean_runs"] = 0
         settings.save(cfg)
 
     def _fetch_once(self, via_http, via_browser):

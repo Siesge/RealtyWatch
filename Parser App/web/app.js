@@ -6,7 +6,14 @@ const RENO = { design: "дизайнерский ремонт", euro: "евро�
   finish: "чистовая отделка", none: "без ремонта", any: "с ремонтом" };
 const RENO_RANK = { design: 6, euro: 5, cosmetic: 4, finish: 3, old: 2, any: 1 };
 const SELLER = { owner: "собственник", agent: "агент", developer: "застройщик" };
-const STATE = { running: "идёт сбор", paused: "пауза", done: "готово", error: "ошибка", blocked: "блокировка", stopped: "остановлен" };
+const STATE = { running: "идёт сбор", paused: "пауза", done: "готово", partial: "неполный", error: "ошибка", blocked: "блокировка", stopped: "остановлен" };
+const STATE_TIP = {
+  done: "Выдача прочитана полностью; пропавшие из поиска объявления проверены на сайте",
+  partial: "Сбор закончился, но выдаче нельзя доверять полностью (не все страницы, сайт отдал меньше заявленного или из поиска пропало слишком много). Новые и изменённые цены записаны, а снятые с продажи не проверялись — подробности в итоге и журнале прогона",
+  error: "Сбор прерван ошибкой (сайт не ответил, страница пришла пустой и т.п.). Снятые не проверялись. Подробности — в журнале прогона",
+  blocked: "Сайт заблокировал доступ (капча не пройдена, ограничение IP). Снятые не проверялись",
+  stopped: "Остановлено вручную или при закрытии программы",
+};
 const VIEW_TITLE = { dashboard: "Дашборд", cards: "Подборка", table: "Таблица", changes: "Изменения", map: "Карта", runs: "Прогоны", settings: "Настройки" };
 const ICON = {
   pin: '<svg viewBox="0 0 24 24"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></svg>',
@@ -18,6 +25,7 @@ const ICON = {
   down: '<svg viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></svg>',
   up: '<svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></svg>',
   folder: '<svg viewBox="0 0 24 24"><path d="M3.5 6.5a1.5 1.5 0 0 1 1.5-1.5h4.5l2 2.5H19a1.5 1.5 0 0 1 1.5 1.5v8.5A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5z"/></svg>',
+  list: '<svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
   chart: '<svg viewBox="0 0 24 24"><path d="M4 19h16M6 15l4-4 3 3 5-6"/></svg>',
   img: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 5-4.5 4 3.5 3-2.5 4 3.5"/></svg>',
 };
@@ -488,11 +496,32 @@ async function renderRuns() {
   const runs = await api("/api/runs");
   const t = s => (s || "").replace("T", " ").slice(5, 16);
   $("#view-runs").innerHTML = runs.length ? `<div class="panel"><table class="grid"><thead><tr><th>Сайт</th><th>Статус</th><th>Старт</th><th>Финиш</th><th>Режим</th>
-    <th class="num">Стр.</th><th class="num">Найдено</th><th class="num">Новых</th><th class="num">Изм.</th><th class="num">Снято</th><th>Итог</th></tr></thead><tbody>${runs.map(r => `<tr>
-    <td><i class="sdot ${r.source}"></i> ${SRC[r.source]}</td><td><span class="st-badge ${r.status}">${STATE[r.status] || r.status}</span></td>
-    <td>${t(r.started)}</td><td>${t(r.finished)}</td><td>${r.mode}</td><td class="num">${r.pages ?? ""}</td><td class="num">${r.found ?? ""}</td>
-    <td class="num">${r.new ?? ""}</td><td class="num">${r.changed ?? ""}</td><td class="num">${r.removed ?? ""}</td><td>${esc(r.message || "")}</td></tr>`).join("")}</tbody></table></div>`
+    <th class="num">Стр.</th><th class="num" title="Сколько объявлений сайт заявил в выдаче">Заявлено</th><th class="num" title="Сколько уникальных объявлений получено">Собрано</th>
+    <th class="num">Новых</th><th class="num">Изм.</th><th class="num">Снято</th><th>Итог</th><th></th></tr></thead><tbody>${runs.map(r => `<tr>
+    <td><i class="sdot ${r.source}"></i> ${SRC[r.source]}</td><td><span class="st-badge ${r.status}" title="${esc(STATE_TIP[r.status] || "")}">${STATE[r.status] || r.status}</span></td>
+    <td>${t(r.started)}</td><td>${t(r.finished)}</td><td>${r.mode}</td><td class="num">${r.pages ?? ""}</td>
+    <td class="num">${r.declared ?? ""}</td><td class="num ${r.declared && r.collected != null && r.collected < 0.95 * r.declared && r.source !== "avito" ? "bad" : ""}">${r.collected ?? r.found ?? ""}</td>
+    <td class="num">${r.new ?? ""}</td><td class="num">${r.changed ?? ""}</td><td class="num">${r.removed ?? ""}</td><td>${esc(r.message || "")}</td>
+    <td>${r.has_log ? `<button class="icon-btn" data-log="${r.id}" title="Подробный журнал прогона: каждый запрос, коды ответов, время, страницы выдачи, сохранённые при сбоях страницы">${ICON.list}</button>` : ""}</td></tr>`).join("")}</tbody></table></div>`
     : `<div class="empty"><b>Прогонов ещё не было</b>Запустите сбор данных в панели слева</div>`;
+  $$("#view-runs [data-log]").forEach(b => b.onclick = () => openRunLog(+b.dataset.log));
+}
+
+// Подробный журнал прогона в окне: просмотр, сохранение в файл, папка журналов
+async function openRunLog(id) {
+  let d;
+  try { d = await api(`/api/runs/${id}/log`); } catch (e) { return toast("warn", "Журнала нет", e.message); }
+  $("#modalBody").innerHTML = `<div class="log-head"><h3>Журнал прогона №${id}</h3><span class="meta">${esc(d.file)}</span>
+      <span class="log-acts"><button class="btn-sec" id="logSave" title="Сохранить журнал прогона в файл">${ICON.down}Сохранить в файл…</button>
+      <button class="btn-sec" id="logFolder" title="Открыть папку logs: общий журнал, журналы прогонов (runs) и сохранённые страницы (snapshots)">${ICON.folder}Папка журналов</button></span></div>
+    ${d.snapshots.length ? `<div class="log-snaps" title="Страницы, которые сайт показал при сбое, — лежат в logs/snapshots">Сохранённые страницы: ${d.snapshots.map(esc).join(", ")}</div>` : ""}
+    <pre class="log-text">${esc(d.text)}</pre>`;
+  $("#modal").classList.remove("hidden");
+  $("#logSave").onclick = async () => {
+    const r = desktop() ? await desktop().export_run_log(id) : await post(`/api/runs/${id}/log/export`);
+    if (r && r.path) toast("ok", "Журнал сохранён", r.path);
+  };
+  $("#logFolder").onclick = () => desktop() ? desktop().open_logs_folder() : post("/api/logs/open");
 }
 
 // ---------- настройки и база ----------
@@ -531,7 +560,9 @@ async function renderSettings() {
       ${field("Яндекс", modeSel("yandex"), "Яндекс обычно стабильно отвечает на быстрые HTTP-запросы.")}
       ${field("Авито: страниц объявлений за прогон", `<input type="number" id="sAvDet" value="${s.avito.max_details}">`, "Сколько новых объявлений Авито открывать за один сбор (ради координат и вида ремонта). Остальные — в следующий раз. Больше — дольше и выше риск ограничения IP.")}
       ${field("Авито: пауза между запросами, с", `<span class="pair"><input type="number" step="1" min="1" id="sAvD0" value="${s.avito.delay[0]}"><i>—</i><input type="number" step="1" min="1" id="sAvD1" value="${s.avito.delay[1]}"></span>`,
-        "Случайная пауза в этом диапазоне перед каждым запросом. При ограничении IP растёт сама в ~1,5 раза и сохраняется.")}
+        "Случайная пауза в этом диапазоне перед каждым запросом. При ограничении IP растёт сама в ~1,5 раза и сохраняется. " +
+        `После 3 сборов подряд без капчи и ограничений понемногу возвращается к заданной здесь${s.avito.delay_base && s.avito.delay_base.join() !== s.avito.delay.join() ? ` (задано ${s.avito.delay_base.join("–")} с, сейчас выросла)` : ""}.`)}
+      ${field("Авито: проверок снятых за прогон", `<input type="number" min="0" id="sAvVer" value="${s.avito.max_verify ?? 20}">`, "Сколько пропавших из поиска объявлений Авито открывать за один сбор, чтобы проверить, сняты ли они. Каждая проверка — отдельная страница через браузер с паузой, поэтому много проверок подряд вызывает капчу. Непроверенные остаются в продаже с отметкой «нет в поиске» и проверяются в следующих сборах.")}
       ${field("Окно браузера", `<select id="sWin">
         ${[["hidden", "скрытое"], ["visible", "видимое"], ["headless", "без окна (headless)"]]
           .map(([v, t]) => `<option value="${v}" ${(b.window || "hidden") === v ? "selected" : ""}>${t}</option>`).join("")}</select>`,
@@ -623,6 +654,8 @@ async function saveSettings() {
   s.avito.max_details = +$("#sAvDet").value;
   const d0 = Math.max(1, +$("#sAvD0").value), d1 = Math.max(d0, +$("#sAvD1").value);
   s.avito.delay = [d0, d1];
+  s.avito.delay_base = [d0, d1];  // заданная вручную — к ней пауза возвращается после чистых сборов
+  s.avito.max_verify = Math.max(0, +$("#sAvVer").value || 0);
   SETTINGS.browser = Object.assign(SETTINGS.browser || {}, { window: $("#sWin").value });
   SETTINGS = await post("/api/settings", SETTINGS);
   const r = await post("/api/reclassify");

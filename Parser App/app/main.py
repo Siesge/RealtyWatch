@@ -186,12 +186,12 @@ class DesktopApi:
 
     _window = None
 
-    def _dialog(self, kind, **kw):
+    def _dialog(self, kind, file_types=("Архив базы RealtyWatch (*.zip)",), **kw):
         import webview
 
         fd = getattr(webview, "FileDialog", None)
         mode = getattr(fd, kind) if fd else getattr(webview, f"{kind}_DIALOG")
-        res = DesktopApi._window.create_file_dialog(mode, file_types=("Архив базы RealtyWatch (*.zip)",), **kw)
+        res = DesktopApi._window.create_file_dialog(mode, file_types=file_types, **kw)
         if not res:
             return None
         return res if isinstance(res, str) else res[0]
@@ -208,6 +208,24 @@ class DesktopApi:
 
     def open_db_folder(self):
         os.startfile(str(paths.DB_DIR))
+        return {"ok": True}
+
+    def export_run_log(self, run_id):
+        from .server import run_log_text
+
+        text, snaps = run_log_text(run_id)
+        if text is None:
+            return {"error": "журнала нет"}
+        path = self._dialog("SAVE", file_types=("Журнал (*.log;*.txt)",), directory=str(Path.home() / "Desktop"),
+                            save_filename=f"realtywatch-run-{run_id}.log")
+        if not path:
+            return {"cancelled": True}
+        Path(path).write_text(text + (("\nСохранённые страницы (logs/snapshots):\n" + "\n".join(snaps)) if snaps else ""),
+                              encoding="utf-8")
+        return {"path": path}
+
+    def open_logs_folder(self):
+        os.startfile(str(paths.LOGS))
         return {"ok": True}
 
     def pick_import(self):
