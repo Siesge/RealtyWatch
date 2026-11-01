@@ -503,6 +503,9 @@ table.grid td.num.bad { color: var(--bad); }
 .d-more { padding: 6px 8px 0; }
 .chart-box { position: relative; height: 240px; }
 .chart-box.tall { height: 280px; }
+.chart-box.no-data canvas { display: none; }
+.chart-box.no-data::before { content: attr(data-empty); position: absolute; inset: 0; display: grid; place-items: center; padding: 0 32px;
+  text-align: center; color: var(--muted); font-size: 13px; line-height: 1.5; border: 1px dashed var(--line-2); border-radius: 12px; }
 .kpi em { font-style: normal; font-size: 11.5px; font-weight: 800; margin-left: 6px; }
 .kpi em.pos { color: var(--warn); } .kpi em.neg { color: var(--ok); }
 table.grid.compact td, table.grid.compact th { padding: 8px 10px; }

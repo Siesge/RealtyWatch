@@ -16,3 +16,6 @@ __pycache__/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Сборки релиза и проверочные установки
+dist/

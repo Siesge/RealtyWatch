@@ -237,11 +237,26 @@ function drawDashCharts() {
   if (note) note.textContent = S.length ? `${checks} ${plural(checks, "проверка", "проверки", "проверок")}${checks > S.length ? ` (на графике ${S.length} точек)` : ""} · с ${tsLabel(S[0].ts)}`
     : recent.length ? `за ${DASH_PERIOD === "7" ? "неделю" : DASH_PERIOD === "30" ? "месяц" : name} проверок не было — последняя ${tsLabel(recent[recent.length - 1].ts)}`
     : "проверок ещё не было";
+  // Нет проверок за период — вместо пустых осей пояснение
+  const empty = !S.length ? (recent.length ? "За выбранный период проверок не было — выберите период длиннее" : "Графики появятся после первого сбора: каждая точка — одна проверка рынка") : "";
+  for (const id of ["chRooms", "chPpm", "chEvents", "chCount"]) {
+    const box = document.getElementById(id) && document.getElementById(id).parentNode;
+    if (!box) continue;
+    box.classList.toggle("no-data", !!empty);
+    box.dataset.empty = empty;
+    if (empty && charts[id]) { charts[id].destroy(); delete charts[id]; }
+  }
   const labels = S.map(s => tsLabel(s.ts));
   const byRooms = key => [
     { label: "Все", data: S.map(s => partAll(s)[key] ?? null) },
     ...["1", "2", "3"].map(n => ({ label: `${n}-комн.`, data: S.map(s => partRooms(s, n)[key] ?? null) })),
   ];
+  const box = $("#dropsBox");
+  if (box) {
+    box.innerHTML = dropsBlock();
+    box.querySelectorAll("[data-card]").forEach(a => a.onclick = () => goToCard(a.dataset.card));
+  }
+  if (empty) return;
   lineChart("chRooms", labels, byRooms("median_price"), v => `${mln(v)} млн`);
   if (DASH_ZONE) {
     lineChart("chPpm", labels, byRooms("median_ppm"), v => fmt(v));
@@ -262,11 +277,6 @@ function drawDashCharts() {
     { label: "снятые", data: S.map(s => partEvents(s).removed || 0) },
     { label: "смена цены", data: S.map(s => (partEvents(s).price_down || 0) + (partEvents(s).price_up || 0)) },
   ], v => fmt(v));
-  const box = $("#dropsBox");
-  if (box) {
-    box.innerHTML = dropsBlock();
-    box.querySelectorAll("[data-card]").forEach(a => a.onclick = () => goToCard(a.dataset.card));
-  }
 }
 
 // Подешевели за период графиков: цена на начало периода (или при появлении) → сейчас, по каждому сайту объекта
