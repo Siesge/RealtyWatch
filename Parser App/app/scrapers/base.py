@@ -55,6 +55,10 @@ class Scraper:
     def is_blocked(self, html, url):
         return False
 
+    def is_ready(self, html, url):
+        """На странице нужное содержимое (а не промежуточная заглушка после капчи)."""
+        return True
+
     def is_ip_banned(self, html, url):
         """Страница «ограничение по IP за частые запросы» (отличается от капчи)."""
         return False
@@ -101,7 +105,7 @@ class Scraper:
             b = self.cfg.get("browser", {})
             self.browser = Browser(self.name, self.is_blocked, self.log, self.stop,
                                    window=b.get("window", "hidden"), captcha_wait_min=b.get("captcha_wait_min", 10),
-                                   is_ip_banned=self.is_ip_banned)
+                                   is_ip_banned=self.is_ip_banned, is_ready=self.is_ready)
         return self.browser
 
     def fetch(self, via_http, via_browser):

@@ -67,6 +67,10 @@ class Avito(Scraper):
         # «Доступ ограничен: проблема с IP» — «с него идёт очень много запросов»
         return "проблема с IP" in (html or "")[:30000]
 
+    def is_ready(self, html, url):
+        # выдача, страница объявления или каталог (куда ведёт ссылка на удалённое объявление)
+        return any(m in html for m in ('data-marker="item"', 'data-marker="page-title/count"', 'data-marker="item-view/'))
+
     def is_blocked(self, html, url):
         head = (html or "")[:6000]
         return "Доступ ограничен" in head or "firewall-container" in (html or "")[:50000] or "/blocked" in url

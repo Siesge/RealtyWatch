@@ -84,10 +84,18 @@ class Browser:
             visible — обычное окно, headless — без окна (быстрее, но сайты чаще распознают бота).
     При капче скрытое окно выводится на экран, пока её не пройдёт человек."""
 
-    def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10, is_ip_banned=None):
+    # После капчи сайт сам переходит на нужную страницу — ждём его, не перезагружая (перезагрузка = новая капча)
+    REDIRECT_WAIT_S = 45     # сколько ждать собственного перехода сайта после «Проверка пройдена»
+    UNKNOWN_PAGE_WAIT_S = 20  # капчи уже нет, но и нужной страницы ещё нет — сколько ждать, прежде чем взять что есть
+    COOLDOWN_AFTER_CAPTCHA = (25.0, 45.0)  # пауза перед следующим запросом после капчи
+
+    def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10, is_ip_banned=None, is_ready=None):
         self.site = site
         self.is_blocked = is_blocked
         self.is_ip_banned = is_ip_banned or (lambda html, url: False)
+        # is_ready(html, url): на странице уже нужное содержимое (выдача, объявление), а не промежуточная заглушка
+        self.is_ready = is_ready or (lambda html, url: True)
+        self._cooldown = False
         self.log = log
         self.stop = stop
         self.window = window
@@ -144,6 +152,10 @@ class Browser:
 
     def goto(self, url, settle=(2.5, 5.0)):
         self.start()
+        if self._cooldown:
+            # сразу после капчи сайт следит особенно внимательно — не торопимся со следующей страницей
+            self._cooldown = False
+            pause(self.COOLDOWN_AFTER_CAPTCHA, self.stop)
         self._nav(url)
         pause(settle, self.stop)
         self._humanize()
@@ -163,38 +175,62 @@ class Browser:
                 raise Blocked("капча в режиме без окна — переключите «Окно браузера» на «скрытое» или «видимое»")
             if self.window == "hidden":
                 self._place_window(80, 60)
-            self.log(f"⚠ НУЖНА РУЧНАЯ ПРОВЕРКА: пройдите капчу в окне браузера ({self.captcha_wait // 60} мин)")
-            end = time.time() + self.captcha_wait
-            last_retry = time.time()
-            while time.time() < end:
-                pause((3, 3), self.stop)
-                try:
-                    html = self.page.content()
-                except Exception:
-                    continue
-                # «Проверка пройдена, перенаправление...» — сайт снял ограничение, но сам не переходит
-                passed = "Проверка пройдена" in html and "captcha" not in html.lower()
-                if self.is_blocked(html, self.page.url) and (passed and time.time() - last_retry > 10):
-                    self.log("сайт пишет «проверка пройдена» — открываю страницу заново")
-                    last_retry = time.time()
-                    try:
-                        self._nav(url)
-                        pause(settle, self.stop)
-                        html = self.page.content()
-                    except Exception:
-                        continue
-                if not self.is_blocked(html, self.page.url):
-                    self.log("проверка пройдена")
-                    if self.window == "hidden":
-                        self._place_window(OFFSCREEN, OFFSCREEN)
-                    if self.page.url.rstrip("/") != url.rstrip("/"):
-                        self._nav(url)
-                        pause(settle, self.stop)
-                        html = self.page.content()
-                    break
-            else:
-                raise Blocked("капча не пройдена вовремя")
+            self.log(f"⚠ НУЖНА РУЧНАЯ ПРОВЕРКА: пройдите капчу в окне браузера ({self.captcha_wait // 60} мин). "
+                     "После ввода окно само перейдёт на страницу — его не нужно обновлять")
+            html = self._wait_captcha(url, settle)
+            self._cooldown = True
+            if self.window == "hidden":
+                self._place_window(OFFSCREEN, OFFSCREEN)
         return html
+
+    def _wait_captcha(self, url, settle):
+        """Ждёт, пока человек пройдёт капчу и сайт САМ откроет нужную страницу.
+        Пока на экране капча — страницу не трогаем (только читаем). После «Проверка пройдена» сайт переходит
+        сам через несколько секунд: ждём до REDIRECT_WAIT_S, и только если он так и не перешёл — открываем
+        страницу один раз. Любая лишняя перезагрузка на этом этапе приводит к новой капче."""
+        end = time.time() + self.captcha_wait
+        passed_at = unknown_at = None
+        renavs = 0
+        while time.time() < end:
+            pause((2, 2), self.stop)
+            try:
+                html, now_url = self.page.content(), self.page.url
+            except Exception:
+                continue  # страница как раз переходит — читаем на следующем шаге
+            if "Проверка пройдена" in html or "перенаправление" in html.lower():
+                passed_at = passed_at or time.time()
+                if time.time() - passed_at > self.REDIRECT_WAIT_S and renavs < 1:
+                    self.log("сайт не перешёл сам после «Проверка пройдена» — открываю страницу один раз")
+                    renavs += 1
+                    passed_at = None
+                    self._safe_nav(url, settle)
+                continue
+            if self.is_blocked(html, now_url):
+                passed_at = unknown_at = None
+                continue  # капча на экране — человек её вводит, не мешаем
+            if self.is_ready(html, now_url):
+                self.log("проверка пройдена — страница открылась")
+                return html
+            # Капчи нет, но и нужной страницы нет (главная, другая страница сайта) — ждём ещё немного
+            unknown_at = unknown_at or time.time()
+            if time.time() - unknown_at > self.UNKNOWN_PAGE_WAIT_S:
+                if renavs < 1:
+                    self.log("проверка пройдена, но сайт открыл другую страницу — открываю нужную")
+                    renavs += 1
+                    unknown_at = None
+                    self._safe_nav(url, settle)
+                    continue
+                return html  # пусть парсер сам разберётся, что это за страница
+        raise Blocked("капча не пройдена вовремя")
+
+    def _safe_nav(self, url, settle):
+        try:
+            self._nav(url)
+            pause(settle, self.stop)
+        except Stopped:
+            raise
+        except Exception:
+            pass
 
     def evaluate(self, js):
         return self.page.evaluate(js)
