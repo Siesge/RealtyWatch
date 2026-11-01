@@ -6,6 +6,7 @@ import time
 
 from curl_cffi import requests as cffi
 
+from . import alerts
 from .paths import PROFILES
 
 
@@ -169,6 +170,20 @@ class Browser:
         if self.trace:
             self.trace(*a, **k)
 
+    def scroll_through(self, max_steps=40, step_pause=(0.4, 0.9)):
+        """Плавно прокручивает страницу до конца: сайты дорисовывают карточки по мере прокрутки."""
+        try:
+            for _ in range(max_steps):
+                self.page.mouse.wheel(0, random.randint(600, 900))
+                pause(step_pause, self.stop)
+                if self.page.evaluate("() => window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 80"):
+                    break
+            pause((0.8, 1.5), self.stop)
+        except Stopped:
+            raise
+        except Exception:
+            pass
+
     def goto(self, url, settle=(2.5, 5.0)):
         self.start()
         if self._cooldown:
@@ -182,8 +197,8 @@ class Browser:
         html = self.page.content()
         self._trace("browser", "GET", url, self.last_status, round((time.time() - t0) * 1000), len(html),
                     "" if self.page.url == url else f"→ {self.page.url}")
-        if self.is_blocked(html, self.page.url):
-            # Иногда это «мягкая» проверка, которая проходит сама после перезагрузки
+        if self.is_blocked(html, self.page.url) and self.last_status not in (403, 429):
+            # Иногда это «мягкая» проверка, которая проходит сама после перезагрузки (на 403/429 — нет: только капча)
             self.log("проверка безопасности — пробую перезагрузить")
             pause((8, 14), self.stop)
             self._nav(url)
@@ -216,6 +231,8 @@ class Browser:
         end = time.time() + self.captcha_wait
         passed_at = unknown_at = None
         renavs = 0
+        alerts.captcha()  # звук, чтобы человек заметил окно с капчей (если звук не выключен)
+        beeped = time.time()
         while time.time() < end:
             pause((2, 2), self.stop)
             try:
@@ -232,6 +249,9 @@ class Browser:
                 continue
             if self.is_blocked(html, now_url):
                 passed_at = unknown_at = None
+                if time.time() - beeped > alerts.REPEAT_S:  # капча всё ещё ждёт — напомнить
+                    alerts.captcha()
+                    beeped = time.time()
                 continue  # капча на экране — человек её вводит, не мешаем
             if self.is_ready(html, now_url):
                 self.log("проверка пройдена — страница открылась")

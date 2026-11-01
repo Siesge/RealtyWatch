@@ -1,5 +1,8 @@
-"""Общая подготовка тестов: всё во временной папке — база, настройки, журналы, расписание.
-Реальная база, настройки и logs/app.log не затрагиваются. Данные синтетические."""
+"""Общая подготовка тестов: всё во временной папке — база, настройки, журналы, расписание, профили.
+Реальная база, настройки, профили сайтов и logs/app.log не затрагиваются. Данные синтетические.
+Тесты никогда не обращаются к настоящим сайтам: HTTP разрешён только к 127.0.0.1, браузер с реальным
+профилем не запускается (тест капчи использует свой браузер без окна и локальный сайт-имитацию)."""
+import json
 import logging
 import random
 import shutil
@@ -11,19 +14,41 @@ from pathlib import Path
 # Журнал тестов не пишется в logs/app.log: обработчик ставится до импорта runner (setup_logging его не трогает)
 logging.getLogger().addHandler(logging.NullHandler())
 
-from app import db, images, runlog, settings  # noqa: E402
+from app import alerts, db, images, net, runlog, settings, transfer  # noqa: E402
 from app import runner  # noqa: E402
 
 TMP_ROOT = Path(tempfile.mkdtemp(prefix="rw-tests-"))
+_REQUEST = net.Http.request
+
+
+def _local_only(self, method, url, **kw):
+    if not url.startswith("http://127.0.0.1"):
+        raise AssertionError(f"тест обратился к настоящему сайту: {url} — подмените загрузку страницы")
+    return _REQUEST(self, method, url, **kw)
+
+
+def _no_real_browser(self):
+    raise AssertionError("тест запустил браузер с настоящим профилем — подмените загрузку страницы")
+
+
+net.Http.request = _local_only
+net.Browser.start = _no_real_browser
 
 
 def isolate(test):
-    """Свежая база и настройки на каждый тест."""
+    """Свежая база, настройки, фото, резервные копии, журналы и профили — во временной папке на каждый тест.
+    Настоящие database/, data/, logs/ и profiles/ тесты не видят: очистка базы в тестах удаляет только временные файлы."""
     d = Path(tempfile.mkdtemp(dir=TMP_ROOT))
     db.DB_FILE = d / "realty.db"
     db.reset()
     settings.SETTINGS_FILE = d / "settings.json"
+    net.PROFILES = d / "profiles"
     runlog.RUNS_DIR, runlog.SNAP_DIR = d / "runs", d / "snapshots"
+    images.IMAGES = transfer.IMAGES = d / "images"
+    transfer.BACKUPS, transfer.DB_DIR = d / "backups", d
+    alerts.FILE = d / "sound.json"
+    for p in (db.DB_FILE, settings.SETTINGS_FILE, images.IMAGES, transfer.BACKUPS, alerts.FILE, runlog.RUNS_DIR):
+        assert TMP_ROOT in Path(p).parents, f"тест работает вне временной папки: {p}"
     images.repair = lambda *a, **k: None
     runner.pause = lambda *a, **k: None
     test.addCleanup(shutil.rmtree, d, ignore_errors=True)
@@ -61,12 +86,27 @@ def yandex_offer(r):
             "apartment": {"renovation": "EURO"}, "description": r["description"], "shareUrl": r["url"]}
 
 
-def avito_page(rows, count):
-    cards = "".join(
-        f'<div data-marker="item" data-item-id="{r["source_id"]}"><a data-marker="item-title" href="/yalta/kvartiry/x_{r["source_id"]}">'
-        f'{r["title"]}</a><meta itemprop="price" content="{r["price"]}"><p>{r["description"]}</p></div>' for r in rows)
+def avito_card(r):
+    return (f'<div data-marker="item" data-item-id="{r["source_id"]}"><a data-marker="item-title" href="/yalta/kvartiry/x_{r["source_id"]}">'
+            f'{r["title"]}</a><meta itemprop="price" content="{r["price"]}"><p>{r["description"]}</p>'
+            f'<span data-marker="item-address">{r["address"]}</span></div>')
+
+
+def avito_page(rows, count, ld=False, drawn=None, carousel=()):
+    """Страница выдачи Авито. ld — данные для поисковиков со всеми объявлениями страницы; drawn — сколько
+    карточек браузер успел дорисовать (None — все); carousel — карточки рекомендаций вне результатов поиска."""
+    shown = rows if drawn is None else rows[:drawn]
+    cards = "".join(avito_card(r) for r in shown)
+    if carousel:
+        cards += '<div data-marker="itemsCarousel/carousel">' + "".join(avito_card(r) for r in carousel) + "</div>"
     head = f'<span data-marker="page-title/count">{count}</span>' if count is not None else ""
-    return f"<html><body>{head}{cards}</body></html>"
+    if ld:
+        offers = [{"@type": "Offer", "price": r["price"], "priceCurrency": "RUB", "name": r["title"],
+                   "url": f"https://www.avito.ru/yalta/kvartiry/x_{r['source_id']}", "image": f"https://img.test/{r['source_id']}.jpg"}
+                  for r in rows]
+        head += ('<script type="application/ld+json">' + json.dumps({"@context": "https://schema.org", "@graph": [
+            {"@type": "Product", "name": "Квартиры", "offers": {"@type": "AggregateOffer", "offers": offers}}]}, ensure_ascii=False) + "</script>")
+    return f'<html><body>{head}<div data-marker="catalog-serp">{cards}</div></body></html>'
 
 
 def run(source, cls):

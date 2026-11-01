@@ -6,7 +6,7 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import db, dedupe, geo, history, images, paths, rules, runlog, settings, transfer
+from . import alerts, db, dedupe, geo, history, images, paths, purge, rules, runlog, settings, transfer
 from .paths import EXPORTS, WEB
 from .runner import manager
 from .scrapers import SCRAPERS
@@ -99,17 +99,25 @@ def schedule_set(body: dict = Body(...)):
 
 
 @app.get("/api/changes")
-def changes(days: int = 7, baseline: int = 0):
+def changes(days: int = 7, baseline: int = 0, hours: float = 0, last: int = 0):
     con = db.connect()
-    rows = history.changes(con, days, bool(baseline))
+    rows = history.changes(con, days, bool(baseline), hours=hours or None, last=bool(last))
+    con.close()
+    return rows
+
+
+@app.get("/api/last_update")
+def last_update():
+    con = db.connect()
+    rows = history.last_update(con)
     con.close()
     return rows
 
 
 @app.get("/api/dashboard")
-def dashboard():
+def dashboard(days: int = 0):
     con = db.connect()
-    d = history.dashboard(con)
+    d = history.dashboard(con, days or None)
     con.close()
     return d
 
@@ -160,6 +168,50 @@ def db_import(body: dict = Body(...)):
     return res
 
 
+@app.post("/api/db/purge")
+def db_purge(body: dict = Body(...)):
+    """Очистка за период {from, to} (даты ГГГГ-ММ-ДД, пустая — без границы); dry_run — только посчитать."""
+    if manager.any_running():
+        raise HTTPException(409, "Сначала дождитесь окончания или остановите сбор данных")
+    try:
+        if body.get("dry_run"):
+            con = db.connect()
+            res = purge.preview(con, body.get("from") or None, body.get("to") or None)
+            con.close()
+            return res
+        res = purge.purge(body.get("from") or None, body.get("to") or None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    manager.log("db", f"очистка за период {body.get('from') or 'с начала'} — {body.get('to') or 'по сейчас'}: "
+                      f"удалено объявлений {res['listings']}, проверок рынка {res['snapshots']}, событий {res['events']}, "
+                      f"прогонов {res['runs']}; возвращено в продажу {res['unremoved']}. Резервная копия: {res['backup']}")
+    return res
+
+
+@app.post("/api/db/clear")
+def db_clear(body: dict = Body(...)):
+    if body.get("confirm") != "ОЧИСТИТЬ":
+        raise HTTPException(400, "нужно подтверждение")
+    if manager.any_running():
+        raise HTTPException(409, "Сначала дождитесь окончания или остановите сбор данных")
+    res = purge.clear_all()
+    manager.log("db", f"база очищена полностью ({res['listings']} объявлений). Резервная копия: {res['backup']}")
+    return res
+
+
+@app.get("/api/sound")
+def sound_get():
+    return {"muted": alerts.muted()}
+
+
+@app.post("/api/sound")
+def sound_set(body: dict = Body(...)):
+    on = alerts.set_muted(bool(body.get("muted")))
+    if not on:
+        alerts.chime()  # звук включён — короткий сигнал для проверки
+    return {"muted": on}
+
+
 @app.get("/api/settings")
 def get_settings():
     return settings.load()
@@ -177,8 +229,43 @@ def set_settings(cfg: dict = Body(...)):
 
 @app.post("/api/reclassify")
 def reclassify():
-    """Пересчитать зону и отсев для всей базы по текущим настройкам (без обращения к сайтам)."""
+    """Пересчитать зону и отсев для всей базы по текущим настройкам (без обращения к сайтам).
+    История снимков рынка пересобирается под новые зону и правила."""
+    return _reclassify(settings.load())
+
+
+@app.post("/api/zone")
+def set_zone(body: dict = Body(...)):
+    """Новый круг (зона A) с карты: сохранить, пересчитать зоны всех объявлений и историю рынка."""
+    if manager.any_running():
+        raise HTTPException(409, "Идёт сбор данных — круг можно изменить после его окончания")
+    try:
+        lat, lon = (float(x) for x in body["center"])
+        radius = float(body["radius_m"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "нужны центр [широта, долгота] и радиус в метрах")
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180) or not (50 <= radius <= 50_000):
+        raise HTTPException(400, "центр или радиус вне допустимых значений (радиус 50 м – 50 км)")
     cfg = settings.load()
+    old = dict(cfg["zone"])
+    cfg["zone"].update(center=[round(lat, 6), round(lon, 6)], radius_m=round(radius), polygon=None)
+    settings.save(cfg)
+    con = db.connect()
+    before = {(r["source"], r["source_id"]): r["zone"] for r in con.execute("SELECT source, source_id, zone FROM listings")}
+    con.close()
+    res = _reclassify(cfg)
+    con = db.connect()
+    after = {(r["source"], r["source_id"]): r["zone"] for r in con.execute("SELECT source, source_id, zone FROM listings")}
+    con.close()
+    res["moved_in"] = sum(1 for k, z in after.items() if z == "A" and before.get(k) != "A")
+    res["moved_out"] = sum(1 for k, z in after.items() if z != "A" and before.get(k) == "A")
+    manager.log("db", f"круг изменён: центр {old['center'][0]:.5f}, {old['center'][1]:.5f} → {lat:.5f}, {lon:.5f}, "
+                      f"радиус {old['radius_m']} → {round(radius)} м; в круг вошло {res['moved_in']}, вышло {res['moved_out']} объявлений; "
+                      f"история рынка пересчитана ({res['snapshots']} проверок)")
+    return res
+
+
+def _reclassify(cfg):
     con = db.connect()
     n = 0
     for r in con.execute("SELECT * FROM listings").fetchall():
@@ -192,8 +279,9 @@ def reclassify():
         n += 1
     con.commit()
     objects = dedupe.rebuild(con)
+    snapshots = history.rebuild_snapshots(con)
     con.close()
-    return {"updated": n, "objects": objects}
+    return {"updated": n, "objects": objects, "snapshots": snapshots}
 
 
 @app.post("/api/run")

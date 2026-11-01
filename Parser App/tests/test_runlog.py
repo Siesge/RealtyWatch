@@ -84,8 +84,11 @@ class DelayEasing(Case):
         rows = listings("avito", 40)
 
         class A(Avito):
-            def _get_html(self, url):
+            def _get_search_html(self, url):
                 return avito_page(rows, len(rows))
+
+            def enrich(self, item):
+                return item
         for _ in range(3):
             run("avito", A)
         self.assertEqual(settings.load()["sites"]["avito"]["delay"], [9, 15])

@@ -82,73 +82,120 @@ const signed = (v, d = 1) => v == null ? "" : `${v > 0 ? "+" : v < 0 ? "−" : "
 // ---------- дашборд ----------
 // Период, за который графики показывают проверки рынка (число дней или «всё время»)
 const DASH_PERIODS = [["7", "Неделя"], ["30", "Месяц"], ["182", "Полгода"], ["365", "Год"], ["all", "Всё время"]];
-let DASH_PERIOD = store.get("rw.dashPeriod", "all"), DASH_S = [];
+let DASH_PERIOD = store.get("rw.dashPeriod", "all"), DASH_S = [], DASH_D = null;
+// Только внутри круга (зона A): все блоки пересчитываются по квартирам в круге
+let DASH_ZONE = store.get("rw.dashZone", "0") === "1";
+
+// Что показывает каждый блок и как его читать (подсказка на заголовке блока)
+const DASH_TIP = {
+  rooms: z => `Как меняется типичная цена квартиры ${z ? "в красном круге (зона A)" : "в Ялте (зоны A и B)"}.
+Каждая точка — одна проверка рынка после сбора. Линия — медиана: половина подходящих квартир дешевле, половина дороже; отдельно для 1-, 2-, 3-комнатных и для всех вместе.
+Рост линии — квартиры дорожают. Резкий скачок одной точки обычно значит, что в выборку пришло или из неё ушло несколько дорогих или дешёвых квартир, — смотрите на общий наклон, а не на отдельную точку.`,
+  ppm: z => z ? `Медианная цена квадратного метра в красном круге: для всех квартир и отдельно по комнатности.
+Цена м² сравнивает квартиры разной площади честнее, чем цена целиком. Обычно у малогабаритных квартир м² дороже.`
+    : `Медианная цена квадратного метра: по всей Ялте (A+B), в красном круге (A) и в остальной Ялте (B).
+Расстояние между линиями A и B — надбавка за расположение в круге. Цена м² сравнивает квартиры разной площади честнее, чем цена целиком.`,
+  events: z => `Что произошло на рынке ${z ? "в круге " : ""}между соседними проверками:
+• новые — появились новые объявления;
+• снятые — сайт подтвердил, что объявление снято (статус на странице или страница удалена);
+• смена цены — продавец изменил цену (чаще снижает).
+Много новых — предложение растёт; много снятых — квартиры продаются или уходят с рынка; много смен цены — продавцы торгуются. Первичная загрузка сайта не считается.`,
+  count: z => z ? `Сколько подходящих квартир в продаже в красном круге в момент каждой проверки: всего и по комнатности.
+Дубли с разных сайтов считаются одной квартирой. Падение — предложение сокращается, рост — новых больше, чем уходит.`
+    : `Сколько подходящих квартир в продаже в момент каждой проверки: по всей Ялте (A+B) и в красном круге (A).
+Дубли с разных сайтов считаются одной квартирой. Падение — предложение сокращается (квартиры продаются), рост — новых больше, чем уходит.`,
+  drops: z => `Квартиры ${z ? "в круге " : ""}, которые сильнее всего подешевели за выбранный период графиков (если объявление появилось позже начала периода — с момента появления).
+Снижение цены — признак продавца, готового торговаться: здесь стоит звонить первыми. «на рынке» — сколько дней квартира в базе. Клик — карточка в подборке.`,
+  slice: z => `Текущие медианы по подходящим квартирам ${z ? "в красном круге" : "Ялты (A+B)"} для каждой комнатности: сколько квартир в продаже, типичная цена, цена м² и площадь.${z ? "" : "\nПоследние две колонки — цена м² в круге (A) и в остальной Ялте (B) для этой комнатности."}
+Строка «Все» — по всем комнатностям вместе.`,
+  sources: z => `Сколько объявлений собрано с каждого сайта${z ? " в красном круге" : ""}: активных, подходящих под параметры поиска, сколько объектов ${z ? "в круге" : "Ялты"} есть на этом сайте, сколько снято за всё время, и как прошёл последний сбор.
+Одна квартира может быть на нескольких сайтах, поэтому сумма по сайтам больше числа объектов.`,
+  deals: z => `Квартиры ${z ? "в круге " : ""}с ценой м² ниже медианы для такой же комнатности в той же зоне (сравнение минимум с тремя похожими).
+«к рынку» — на сколько процентов дешевле. Сильно дешевле рынка бывает из-за состояния, этажа, вида или ошибки в объявлении — проверьте карточку. Клик — карточка в подборке.`,
+  likes: z => `Квартиры, отмеченные ♥${z ? " (только в круге)" : ""}: сколько ещё в продаже и сколько снято, как изменилась цена с момента появления в базе и насколько цена м² отличается от рынка той же комнатности и зоны.`,
+};
+
+const dcHead = (title, meta, tip, tbl) => `<div class="dc-head" title="${esc(tip)}"><h3>${title}<i class="info" aria-hidden="true">i</i></h3>
+  <span class="meta">${meta}${tbl ? ` <button class="link sm" data-tbl="${tbl}" title="Показать значения таблицей">таблица</button>` : ""}</span></div>`;
+const chartCard = (id, cls, title, meta, tip) => `<div class="panel dash-card ${cls}">${dcHead(title, meta, tip, id)}
+  <div class="chart-box"><canvas id="${id}"></canvas></div><div class="chart-tbl hidden" id="${id}-tbl"></div></div>`;
+
+// Срез снимка рынка в текущем режиме: вся Ялта (A+B) или только круг (A)
+const part = s => DASH_ZONE ? (s && s.a) || {} : { all: s && s.city, rooms: s && s.rooms, sources: s && s.sources, multi: s && s.multi };
+const partAll = s => part(s).all || {};
+const partRooms = (s, n) => (part(s).rooms || {})[n] || {};
+const partEvents = s => (DASH_ZONE ? s.events_a : s.events) || {};
 
 async function renderDashboard() {
   const el = $("#view-dashboard");
-  let d;
-  try { d = await api("/api/dashboard"); } catch (e) { el.innerHTML = `<div class="empty"><b>Не удалось загрузить сводку</b>${esc(e.message)}</div>`; return; }
+  try { DASH_D = await api(`/api/dashboard?days=${DASH_PERIOD === "all" ? 0 : DASH_PERIOD}`); } catch (e) { el.innerHTML = `<div class="empty"><b>Не удалось загрузить сводку</b>${esc(e.message)}</div>`; return; }
   if (view !== "dashboard") return;
-  const S = d.snapshots, last = S[S.length - 1], prev = S[S.length - 2];
-  const city = last ? last.city : {}, pcity = prev ? prev.city : {};
-  const e24 = d.events_24h, e7 = d.events_7d;
+  paintDashboard();
+}
+
+function paintDashboard() {
+  const el = $("#view-dashboard"), d = DASH_D, Z = DASH_ZONE;
+  const S = d.snapshots, R = d.recent || S, last = R[R.length - 1], prev = R[R.length - 2];
+  const cur = partAll(last), pcur = partAll(prev);
+  const e24 = Z ? d.events_24h_a : d.events_24h, e7 = Z ? d.events_7d_a : d.events_7d;
+  const where = Z ? "в круге" : "в Ялте";
   const kpi = (val, label, tip, delta, cls = "") => `<div class="kpi ${cls}" title="${esc(tip)}"><b>${val}</b><span>${label}</span>${delta ? `<em class="${delta.startsWith("−") ? "neg" : "pos"}">${delta}</em>` : ""}</div>`;
   const delta = (a, b) => (a != null && b ? signed(pct(a, b)) : "");
   const srcRows = ["cian", "avito", "yandex"].map(s => {
     const x = d.sources[s] || {}, r = d.last_runs[s] || {};
     return `<tr title="${esc(`${SRC[s]}: последний сбор ${r.started ? tsLabel(r.started) : "—"} — ${r.message || "ещё не было"}`)}">
-      <td><i class="sdot ${s}"></i> ${SRC[s]}</td><td class="num">${x.active ?? 0}</td><td class="num">${x.passing ?? 0}</td>
-      <td class="num">${last && last.sources ? last.sources[s] : "—"}</td><td class="num">${x.removed ?? 0}</td>
-      <td><span class="st-badge ${r.status || ""}">${STATE[r.status] || r.status || "—"}</span> <small>${r.finished ? tsLabel(r.finished) : ""}</small></td></tr>`;
+      <td><i class="sdot ${s}"></i> ${SRC[s]}</td><td class="num">${(Z ? x.active_a : x.active) ?? 0}</td><td class="num">${(Z ? x.passing_a : x.passing) ?? 0}</td>
+      <td class="num">${(part(last).sources || {})[s] ?? "—"}</td><td class="num">${(Z ? x.removed_a : x.removed) ?? 0}</td>
+      <td class="last-run"><span class="st-badge ${r.status || ""}" title="${esc(STATE_TIP[r.status] || "")}">${STATE[r.status] || r.status || "—"}</span><small>${r.finished ? tsLabel(r.finished) : ""}</small></td></tr>`;
   }).join("");
   const rz = (z, k) => (last && last.zones && last.zones[z]) ? last.zones[z][k] : null;
-  const rr = (n, k) => (last && last.rooms && last.rooms[n]) ? last.rooms[n][k] : null;
+  const rr = (n, k) => partRooms(last, n)[k];
+  const scope = Z ? "только красный круг (зона A)" : "Ялта (зоны A+B)";
   el.innerHTML = `
     <div class="dash-grid">
       <div class="kpis wide">
-        ${kpi(city.count ?? "—", "объектов в Ялте", "Квартир в зонах A и B, подходящих под параметры поиска (дубли с разных сайтов объединены). Изменение — к предыдущей проверке", delta(city.count, pcity.count))}
-        ${kpi(mln(city.median_price), "медиана цены, млн ₽", "Медианная цена: половина квартир дешевле, половина дороже. Изменение — к предыдущей проверке", delta(city.median_price, pcity.median_price))}
-        ${kpi(fmt(city.median_ppm), "медиана, ₽/м²", "Медианная цена квадратного метра общей площади", delta(city.median_ppm, pcity.median_ppm), "gold")}
-        ${kpi(`+${e24.new}`, "новых за сутки", `Новых объявлений за последние 24 часа (за 7 дней: ${e7.new}). Первичная загрузка сайта не считается`)}
-        ${kpi(e7.removed, "снято за неделю", "Объявлений, снятых с продажи за 7 дней (снятие подтверждено на странице объявления: статус «снято/закрыто» или страница не найдена)")}
-        ${kpi(`↓${e7.price_down} ↑${e7.price_up}`, "цены за неделю", "Сколько объявлений подешевело (↓) и подорожало (↑) за 7 дней")}
-        ${kpi(last ? last.multi : "—", "на 2+ сайтах", "Объектов в Ялте, найденных сразу на нескольких сайтах")}
+        ${kpi(cur.count ?? "—", `объектов ${where}`, `Квартир ${Z ? "в красном круге" : "в зонах A и B"}, подходящих под параметры поиска (дубли с разных сайтов объединены). Изменение — к предыдущей проверке`, delta(cur.count, pcur.count))}
+        ${kpi(mln(cur.median_price), "медиана цены, млн ₽", "Медианная цена: половина квартир дешевле, половина дороже. Изменение — к предыдущей проверке", delta(cur.median_price, pcur.median_price))}
+        ${kpi(fmt(cur.median_ppm), "медиана, ₽/м²", "Медианная цена квадратного метра общей площади. Изменение — к предыдущей проверке", delta(cur.median_ppm, pcur.median_ppm), "gold")}
+        ${kpi(`+${e24.new}`, "новых за сутки", `Новых объявлений ${Z ? "в круге " : ""}за последние 24 часа (за 7 дней: ${e7.new}). Первичная загрузка сайта не считается`)}
+        ${kpi(e7.removed, "снято за неделю", `Объявлений ${Z ? "в круге " : ""}, снятых с продажи за 7 дней (снятие подтверждено на странице объявления: статус «снято/закрыто» или страница не найдена)`)}
+        ${kpi(`↓${e7.price_down} ↑${e7.price_up}`, "цены за неделю", `Сколько объявлений ${Z ? "в круге " : ""}подешевело (↓) и подорожало (↑) за 7 дней`)}
+        ${kpi(part(last).multi ?? "—", "на 2+ сайтах", `Объектов ${Z ? "в круге" : "в Ялте"}, найденных сразу на нескольких сайтах`)}
       </div>
 
-      <div class="dash-period" title="Какой отрезок истории показывают графики и их таблицы. Показатели вверху и таблицы ниже — всегда на текущий момент">
-        <span class="lbl">Период графиков</span>
+      <div class="dash-period">
+        <span class="lbl" title="Какой отрезок истории показывают графики, их таблицы и блок «Подешевели». Показатели вверху и таблицы ниже — всегда на текущий момент">Период графиков</span>
         <div class="seg small">${DASH_PERIODS.map(([v, l]) => `<label><input type="radio" name="dashPeriod" value="${v}" ${v === DASH_PERIOD ? "checked" : ""}><span>${l}</span></label>`).join("")}</div>
         <span class="meta" id="dashPeriodNote"></span>
+        <label class="zone-only ${Z ? "on" : ""}" title="Пересчитать весь дашборд только по квартирам внутри красного круга (зона A): показатели, графики, срез, источники, самые выгодные, подешевевшие и избранное. Выключено — вся Ялта (зоны A и B)">
+          <input type="checkbox" id="dashZone" ${Z ? "checked" : ""}><span class="sw-mini"></span><span>Только внутри круга</span></label>
       </div>
 
-      <div class="panel dash-card span2"><div class="dc-head"><h3>Медианная цена по комнатности</h3><span class="meta">Ялта (зоны A+B), каждая точка — одна проверка рынка <button class="link sm" data-tbl="chRooms" title="Показать значения таблицей">таблица</button></span></div>
-        <div class="chart-box"><canvas id="chRooms"></canvas></div><div class="chart-tbl hidden" id="chRooms-tbl"></div></div>
-      <div class="panel dash-card"><div class="dc-head"><h3>Цена м² по зонам</h3><span class="meta">медиана, ₽/м² <button class="link sm" data-tbl="chPpm" title="Показать значения таблицей">таблица</button></span></div>
-        <div class="chart-box"><canvas id="chPpm"></canvas></div><div class="chart-tbl hidden" id="chPpm-tbl"></div></div>
-      <div class="panel dash-card"><div class="dc-head"><h3>Движение рынка</h3><span class="meta">событий между проверками <button class="link sm" data-tbl="chEvents" title="Показать значения таблицей">таблица</button></span></div>
-        <div class="chart-box"><canvas id="chEvents"></canvas></div><div class="chart-tbl hidden" id="chEvents-tbl"></div></div>
-      <div class="panel dash-card"><div class="dc-head"><h3>Предложение</h3><span class="meta">объектов в продаже <button class="link sm" data-tbl="chCount" title="Показать значения таблицей">таблица</button></span></div>
-        <div class="chart-box"><canvas id="chCount"></canvas></div><div class="chart-tbl hidden" id="chCount-tbl"></div></div>
+      ${chartCard("chRooms", "span2", "Медианная цена по комнатности", `${scope}, каждая точка — одна проверка рынка`, DASH_TIP.rooms(Z))}
+      ${chartCard("chPpm", "", Z ? "Цена м² в круге" : "Цена м² по зонам", Z ? "медиана по комнатности, ₽/м²" : "медиана, ₽/м²", DASH_TIP.ppm(Z))}
+      ${chartCard("chEvents", "", "Движение рынка", "событий между проверками", DASH_TIP.events(Z))}
+      ${chartCard("chCount", "", Z ? "Предложение в круге" : "Предложение", "объектов в продаже", DASH_TIP.count(Z))}
+      <div class="panel dash-card drops-card">${dcHead("Подешевели", "сильнее всего за период", DASH_TIP.drops(Z))}<div id="dropsBox"></div></div>
 
-      <div class="panel dash-card span2"><div class="dc-head"><h3>Срез рынка сейчас</h3><span class="meta">медианы по подходящим объектам; «все» — зоны A+B</span></div>
+      <div class="panel dash-card span2">${dcHead("Срез рынка сейчас", `медианы по подходящим объектам; ${Z ? "только круг" : "«все» — зоны A+B"}`, DASH_TIP.slice(Z))}
         <table class="grid compact"><thead><tr><th title="Число комнат">Комнаты</th><th class="num" title="Объектов в продаже">Объектов</th>
           <th class="num" title="Медианная цена">Цена, млн</th><th class="num" title="Медианная цена за м²">₽/м²</th><th class="num" title="Медианная общая площадь">м²</th>
-          <th class="num" title="Медиана ₽/м² в красном круге (зона A)">₽/м² круг</th><th class="num" title="Медиана ₽/м² в остальной Ялте (зона B)">₽/м² Ялта</th></tr></thead><tbody>
+          ${Z ? "" : `<th class="num" title="Медиана ₽/м² в красном круге (зона A)">₽/м² круг</th><th class="num" title="Медиана ₽/м² в остальной Ялте (зона B)">₽/м² Ялта</th>`}</tr></thead><tbody>
           ${["1", "2", "3"].map(n => `<tr><td>${n}-комнатные</td><td class="num">${rr(n, "count") ?? "—"}</td><td class="num">${mln(rr(n, "median_price"))}</td>
             <td class="num">${fmt(rr(n, "median_ppm"))}</td><td class="num">${rr(n, "median_area") ?? "—"}</td>
-            <td class="num">${fmt(roomZonePpm(n, "A"))}</td><td class="num">${fmt(roomZonePpm(n, "B"))}</td></tr>`).join("")}
-          <tr class="total"><td>Все</td><td class="num">${city.count ?? "—"}</td><td class="num">${mln(city.median_price)}</td><td class="num">${fmt(city.median_ppm)}</td>
-            <td class="num">${city.median_area ?? "—"}</td><td class="num">${fmt(rz("A", "median_ppm"))}</td><td class="num">${fmt(rz("B", "median_ppm"))}</td></tr>
+            ${Z ? "" : `<td class="num">${fmt(roomZonePpm(n, "A"))}</td><td class="num">${fmt(roomZonePpm(n, "B"))}</td>`}</tr>`).join("")}
+          <tr class="total"><td>Все</td><td class="num">${cur.count ?? "—"}</td><td class="num">${mln(cur.median_price)}</td><td class="num">${fmt(cur.median_ppm)}</td>
+            <td class="num">${cur.median_area ?? "—"}</td>${Z ? "" : `<td class="num">${fmt(rz("A", "median_ppm"))}</td><td class="num">${fmt(rz("B", "median_ppm"))}</td>`}</tr>
         </tbody></table></div>
-      <div class="panel dash-card"><div class="dc-head"><h3>Источники</h3><span class="meta">объявлений по сайтам</span></div>
+      <div class="panel dash-card">${dcHead("Источники", `объявлений по сайтам${Z ? " в круге" : ""}`, DASH_TIP.sources(Z))}
         <table class="grid compact"><thead><tr><th>Сайт</th><th class="num" title="Активных объявлений">Активно</th><th class="num" title="Подходят под параметры поиска">Подходят</th>
-          <th class="num" title="Объектов в Ялте, у которых есть объявление на этом сайте">В Ялте</th><th class="num" title="Снято с продажи за всё время">Снято</th><th>Последний сбор</th></tr></thead>
+          <th class="num" title="${Z ? "Объектов в круге" : "Объектов в Ялте"}, у которых есть объявление на этом сайте">${Z ? "В круге" : "В Ялте"}</th><th class="num" title="Снято с продажи за всё время">Снято</th><th>Последний сбор</th></tr></thead>
           <tbody>${srcRows}</tbody></table></div>
 
-      <div class="panel dash-card span3"><div class="dc-head"><h3>Самые выгодные сейчас</h3><span class="meta">цена м² ниже медианы для той же комнатности и зоны</span></div>
+      <div class="panel dash-card span3">${dcHead("Самые выгодные сейчас", `цена м² ниже медианы для той же комнатности и зоны${Z ? ", только круг" : ""}`, DASH_TIP.deals(Z))}
         ${dealsTable()}</div>
 
-      <div class="panel dash-card span3 likes-card"><div class="dc-head"><h3>♥ Избранное</h3><span class="meta">отмеченные квартиры: цена, динамика, сравнение с рынком</span></div>
+      <div class="panel dash-card span3 likes-card">${dcHead("♥ Избранное", `отмеченные квартиры: цена, динамика, сравнение с рынком${Z ? " — только в круге" : ""}`, DASH_TIP.likes(Z))}
         ${likesBlock()}</div>
     </div>`;
   el.querySelectorAll("[data-open]").forEach(a => a.onclick = () => openObject(a.dataset.open));
@@ -158,44 +205,103 @@ async function renderDashboard() {
     b.textContent = on ? "таблица" : "график";
     $(`#${b.dataset.tbl}`).parentNode.classList.toggle("hidden", !on);
   });
-  el.querySelectorAll("input[name=dashPeriod]").forEach(r => r.onchange = () => {
+  el.querySelectorAll("input[name=dashPeriod]").forEach(r => r.onchange = async () => {
     DASH_PERIOD = r.value;
     store.set("rw.dashPeriod", r.value);
-    drawDashCharts();
+    const y = $(".main").scrollTop;
+    await renderDashboard();  // сервер отдаёт проверки только за период (не больше 500 точек)
+    $(".main").scrollTop = y;
   });
+  $("#dashZone").onchange = () => {
+    DASH_ZONE = $("#dashZone").checked;
+    store.set("rw.dashZone", DASH_ZONE ? "1" : "0");
+    const y = $(".main").scrollTop;
+    paintDashboard();
+    $(".main").scrollTop = y;
+  };
   DASH_S = S;
   drawDashCharts();
 }
 
+function periodStart() {
+  return DASH_PERIOD === "all" ? 0 : Date.now() - +DASH_PERIOD * 864e5;
+}
+
 function drawDashCharts() {
-  const from = DASH_PERIOD === "all" ? 0 : Date.now() - +DASH_PERIOD * 864e5;
+  const from = periodStart();
   const S = DASH_S.filter(s => new Date(s.ts).getTime() >= from);
   const name = (DASH_PERIODS.find(p => p[0] === DASH_PERIOD) || [, ""])[1].toLowerCase();
   const note = $("#dashPeriodNote");
-  if (note) note.textContent = !DASH_S.length ? "проверок ещё не было"
-    : S.length ? `${S.length} ${plural(S.length, "проверка", "проверки", "проверок")} · с ${tsLabel(S[0].ts)}`
-    : `за ${DASH_PERIOD === "7" ? "неделю" : DASH_PERIOD === "30" ? "месяц" : name} проверок не было — последняя ${tsLabel(DASH_S[DASH_S.length - 1].ts)}`;
+  const recent = (DASH_D && DASH_D.recent) || [];
+  const checks = (DASH_D && DASH_D.checks) || S.length;
+  if (note) note.textContent = S.length ? `${checks} ${plural(checks, "проверка", "проверки", "проверок")}${checks > S.length ? ` (на графике ${S.length} точек)` : ""} · с ${tsLabel(S[0].ts)}`
+    : recent.length ? `за ${DASH_PERIOD === "7" ? "неделю" : DASH_PERIOD === "30" ? "месяц" : name} проверок не было — последняя ${tsLabel(recent[recent.length - 1].ts)}`
+    : "проверок ещё не было";
   const labels = S.map(s => tsLabel(s.ts));
-  lineChart("chRooms", labels, [
-    { label: "Все", data: S.map(s => s.city.median_price) },
-    { label: "1-комн.", data: S.map(s => s.rooms["1"].median_price) },
-    { label: "2-комн.", data: S.map(s => s.rooms["2"].median_price) },
-    { label: "3-комн.", data: S.map(s => s.rooms["3"].median_price) },
-  ], v => `${mln(v)} млн`);
-  lineChart("chPpm", labels, [
-    { label: "Ялта A+B", data: S.map(s => s.city.median_ppm) },
-    { label: "Круг (A)", data: S.map(s => s.zones.A.median_ppm) },
-    { label: "Ялта (B)", data: S.map(s => s.zones.B.median_ppm) },
-  ], v => fmt(v));
+  const byRooms = key => [
+    { label: "Все", data: S.map(s => partAll(s)[key] ?? null) },
+    ...["1", "2", "3"].map(n => ({ label: `${n}-комн.`, data: S.map(s => partRooms(s, n)[key] ?? null) })),
+  ];
+  lineChart("chRooms", labels, byRooms("median_price"), v => `${mln(v)} млн`);
+  if (DASH_ZONE) {
+    lineChart("chPpm", labels, byRooms("median_ppm"), v => fmt(v));
+    lineChart("chCount", labels, byRooms("count").map((x, i) => i ? x : { ...x, label: "Круг (A)" }), v => fmt(v));
+  } else {
+    lineChart("chPpm", labels, [
+      { label: "Ялта A+B", data: S.map(s => s.city.median_ppm) },
+      { label: "Круг (A)", data: S.map(s => s.zones.A.median_ppm) },
+      { label: "Ялта (B)", data: S.map(s => s.zones.B.median_ppm) },
+    ], v => fmt(v));
+    lineChart("chCount", labels, [
+      { label: "Ялта A+B", data: S.map(s => s.city.count) },
+      { label: "Круг (A)", data: S.map(s => s.zones.A.count) },
+    ], v => fmt(v));
+  }
   barChart("chEvents", labels, [
-    { label: "новые", data: S.map(s => (s.events || {}).new || 0) },
-    { label: "снятые", data: S.map(s => (s.events || {}).removed || 0) },
-    { label: "смена цены", data: S.map(s => ((s.events || {}).price_down || 0) + ((s.events || {}).price_up || 0)) },
+    { label: "новые", data: S.map(s => partEvents(s).new || 0) },
+    { label: "снятые", data: S.map(s => partEvents(s).removed || 0) },
+    { label: "смена цены", data: S.map(s => (partEvents(s).price_down || 0) + (partEvents(s).price_up || 0)) },
   ], v => fmt(v));
-  lineChart("chCount", labels, [
-    { label: "Ялта A+B", data: S.map(s => s.city.count) },
-    { label: "Круг (A)", data: S.map(s => s.zones.A.count) },
-  ], v => fmt(v));
+  const box = $("#dropsBox");
+  if (box) {
+    box.innerHTML = dropsBlock();
+    box.querySelectorAll("[data-card]").forEach(a => a.onclick = () => goToCard(a.dataset.card));
+  }
+}
+
+// Подешевели за период графиков: цена на начало периода (или при появлении) → сейчас, по каждому сайту объекта
+function dropsBlock() {
+  const from = periodStart(), now = Date.now();
+  const rows = [];
+  for (const o of scopeObjs()) {
+    let best = null;
+    for (const i of o.items) {
+      if (!i.active || !i.price) continue;
+      const h = (i.history || []).filter(x => x[1]);
+      if (!h.length) continue;
+      const before = h.filter(x => new Date(x[0]).getTime() <= from);
+      const p0 = before.length ? before[before.length - 1][1] : h[0][1];
+      const d = pct(i.price, p0);
+      if (d < 0 && (!best || d < best.d)) best = { d, p0, p1: i.price, src: i.source };
+    }
+    if (best) rows.push({ o, ...best });
+  }
+  rows.sort((a, b) => a.d - b.d);
+  if (!rows.length) return `<div class="empty small"><b>Снижений цены пока нет</b>За выбранный период ни одна подходящая квартира${DASH_ZONE ? " в круге" : ""} не подешевела. Как только продавцы начнут снижать цены, самые сильные снижения появятся здесь — с этими продавцами проще торговаться.</div>`;
+  const days = o => Math.max(0, Math.round((now - new Date(o.first_seen).getTime()) / 864e5));
+  return `<div class="drops">${rows.slice(0, 8).map(({ o, d, p0, p1, src }) => `<button class="drop" data-card="${esc(o.id)}" title="${esc(`${o.address || ""}\n${SRC[src]}: ${fmt(p0)} → ${fmt(p1)} ₽ (${signed(d)}). Клик — карточка в подборке`)}">
+      <span class="d-main"><b>${o.rooms === 0 ? "студия" : `${o.rooms}-к`}, ${o.area} м²</b> <span class="meta">${esc(shortAddr(o.address))}</span></span>
+      <span class="d-price">${mln(p0)} → <b>${mln(p1)}</b> млн</span>
+      <span class="d-pct">${signed(d)}</span>
+      <span class="d-age">${days(o)} дн.</span></button>`).join("")}
+    ${rows.length > 8 ? `<div class="meta d-more">ещё ${rows.length - 8} ${plural(rows.length - 8, "квартира", "квартиры", "квартир")} подешевели</div>` : ""}</div>`;
+}
+
+const shortAddr = a => (a || "").replace(/^(Россия,\s*)?(Республика Крым,\s*)?(городской округ Ялта,\s*)?(Ялта,\s*)?/i, "").slice(0, 40);
+
+// Квартиры, по которым считается дашборд: вся Ялта (A+B) или только круг (A)
+function scopeObjs() {
+  return cityObjs().filter(o => !DASH_ZONE || o.zone === "A");
 }
 
 function cityObjs() {
@@ -212,7 +318,7 @@ function marketPpm(o) {
 }
 
 function dealsTable() {
-  const rows = cityObjs().map(o => ({ o, m: marketPpm(o) })).filter(x => x.m).map(x => ({ ...x, d: pct(x.o.price_m2, x.m) }))
+  const rows = scopeObjs().map(o => ({ o, m: marketPpm(o) })).filter(x => x.m).map(x => ({ ...x, d: pct(x.o.price_m2, x.m) }))
     .filter(x => x.d < 0).sort((a, b) => a.d - b.d).slice(0, 10);
   if (!rows.length) return `<div class="empty small">Пока недостаточно данных</div>`;
   return `<table class="grid compact clickable"><thead><tr><th></th><th>Квартира</th><th>Адрес</th><th>Зона</th><th class="num">Цена</th><th class="num">₽/м²</th>
@@ -225,8 +331,8 @@ function dealsTable() {
 }
 
 function likesBlock() {
-  const L = OBJS.filter(o => o.liked);
-  if (!L.length) return `<div class="empty small"><b>Пока пусто</b>Отмечайте квартиры сердечком на карточке — здесь появится их сводка</div>`;
+  const L = OBJS.filter(o => o.liked && (!DASH_ZONE || o.zone === "A"));
+  if (!L.length) return `<div class="empty small"><b>${DASH_ZONE && OBJS.some(o => o.liked) ? "В круге избранных нет" : "Пока пусто"}</b>${DASH_ZONE && OBJS.some(o => o.liked) ? "Отмеченные квартиры находятся вне красного круга — выключите «Только внутри круга», чтобы их увидеть" : "Отмечайте квартиры сердечком на карточке — здесь появится их сводка"}</div>`;
   const rows = L.map(o => {
     const firsts = o.items.map(i => (i.history || [])[0]).filter(Boolean).map(h => h[1]);
     const start = firsts.length ? Math.min(...firsts) : o.price;
@@ -255,10 +361,26 @@ function likesBlock() {
 }
 
 // ---------- изменения ----------
-let CH_DAYS = +store.get("rw.chDays", "7");
+// Период экрана «Изменения»: последнее обновление (последний сбор каждого сайта), часы или дни
+const CH_PERIODS = [
+  ["last", "последнее обновление", "Что нашёл последний законченный сбор каждого сайта"],
+  ["6h", "6 часов", "Изменения за последние 6 часов"], ["1", "сутки", "Изменения за последние 24 часа"],
+  ["3", "3 дня", "Изменения за 3 дня"], ["7", "неделя", "Изменения за 7 дней"], ["30", "месяц", "Изменения за 30 дней"],
+];
+let CH_PERIOD = store.get("rw.chPeriod", "last");
+if (!CH_PERIODS.some(p => p[0] === CH_PERIOD)) CH_PERIOD = "last";
+const chQuery = p => p === "last" ? "last=1" : p.endsWith("h") ? `hours=${parseFloat(p)}` : `days=${p}`;
+
+// Открыть экран, в т.ч. из уведомления Windows: "changes:last" — «Изменения» за последнее обновление
+function openView(v) {
+  const [name, arg] = String(v).split(":");
+  if (name === "changes" && arg) { CH_PERIOD = arg; store.set("rw.chPeriod", arg); }
+  setView(name);
+}
+
 async function renderChanges() {
   const el = $("#view-changes");
-  const ev = await api(`/api/changes?days=${CH_DAYS}`);
+  const [ev, lastRuns] = await Promise.all([api(`/api/changes?${chQuery(CH_PERIOD)}`), CH_PERIOD === "last" ? api("/api/last_update") : null]);
   if (view !== "changes") return;
   const kinds = JSON.parse(store.get("rw.chKinds", '["new","down","up","removed","returned"]'));
   const onlyPass = store.get("rw.chPass", "1") === "1";
@@ -275,14 +397,17 @@ async function renderChanges() {
   if (onlyPass) tiles = tiles.filter(t => t.o && !t.o.excluded);
   const cnt = k => ev.filter(e => kindOf(e) === k).length;
   el.innerHTML = `<div class="ch-bar panel">
-      <div class="seg small" title="За какой период показывать изменения">${[1, 3, 7, 30].map(dd => `<label><input type="radio" name="chDays" value="${dd}" ${dd === CH_DAYS ? "checked" : ""}><span>${dd === 1 ? "сутки" : dd + " дн."}</span></label>`).join("")}</div>
+      <div class="seg small">${CH_PERIODS.map(([v, l, tip]) => `<label title="${tip}"><input type="radio" name="chPeriod" value="${v}" ${v === CH_PERIOD ? "checked" : ""}><span>${l}</span></label>`).join("")}</div>
       <div class="seg small">${Object.entries(KIND).map(([k, v]) => `<label title="${v.tip}"><input type="checkbox" name="chKind" value="${k}" ${kinds.includes(k) ? "checked" : ""}><span><i class="kdot ${v.cls}"></i>${v.label} <em>${cnt(k)}</em></span></label>`).join("")}</div>
       <label class="check" title="Показывать только квартиры, подходящие под параметры поиска"><input type="checkbox" id="chPass" ${onlyPass ? "checked" : ""}><span>только подходящие</span></label>
       <span class="meta">${tiles.length} ${plural(tiles.length, "объект", "объекта", "объектов")} с изменениями</span>
+      ${lastRuns ? `<div class="ch-last" title="Последний законченный сбор каждого сайта: изменения выше найдены именно им">${lastRuns.length
+        ? "Последнее обновление: " + lastRuns.map(r => `<span><i class="sdot ${r.source}"></i>${SRC[r.source]} ${dtt(r.finished)}${r.status !== "done" ? ` <em class="st-badge ${r.status}">${STATE[r.status] || r.status}</em>` : ""}</span>`).join("")
+        : "Сборов ещё не было"}</div>` : ""}
     </div>
     ${tiles.length ? `<div class="ch-grid">${tiles.map(changeTile).join("")}</div>` :
-      `<div class="empty"><b>Изменений нет</b>За выбранный период по выбранным типам ничего не менялось. Первичная загрузка сайта изменениями не считается.</div>`}`;
-  el.querySelectorAll("input[name=chDays]").forEach(r => r.onchange = () => { CH_DAYS = +r.value; store.set("rw.chDays", r.value); renderChanges(); });
+      `<div class="empty"><b>Изменений нет</b>${CH_PERIOD === "last" ? "Последнее обновление ничего не изменило" : "За выбранный период"} по выбранным типам. Первичная загрузка сайта изменениями не считается.</div>`}`;
+  el.querySelectorAll("input[name=chPeriod]").forEach(r => r.onchange = () => { CH_PERIOD = r.value; store.set("rw.chPeriod", r.value); renderChanges(); });
   el.querySelectorAll("input[name=chKind]").forEach(c => c.onchange = () => {
     store.set("rw.chKinds", JSON.stringify([...el.querySelectorAll("input[name=chKind]:checked")].map(x => x.value))); renderChanges();
   });
@@ -337,6 +462,27 @@ async function updateChangesBadge() {
 function markChangesSeen() {
   store.set("rw.chSeen", new Date(Date.now() + 60000).toISOString().slice(0, 19));
   $("#chBadge").classList.add("hidden");
+}
+
+// ---------- звук: колокольчик у кнопки «Запустить» ----------
+const SOUND_TIP = {
+  on: "Звук включён: когда сайт попросит пройти капчу, программа подаст сигнал и будет повторять его каждые 30 секунд, пока капча на экране; уведомления Windows — со звуком.\nНажмите, чтобы выключить все звуки (например, на ночь)",
+  off: "Без звука: ни сигналов капчи, ни звука уведомлений Windows — чтобы не мешать спать. Капча по-прежнему появляется в окне браузера.\nНажмите, чтобы включить звук",
+};
+async function initSound() {
+  const b = $("#btnSound");
+  const paint = m => {
+    b.classList.toggle("muted", m);
+    b.innerHTML = m ? ICON.bellOff : ICON.bell;
+    b.title = m ? SOUND_TIP.off : SOUND_TIP.on;
+    b.dataset.muted = m ? "1" : "0";
+  };
+  try { paint((await api("/api/sound")).muted); } catch (e) { paint(false); }
+  b.onclick = async () => {
+    const r = await post("/api/sound", { muted: b.dataset.muted !== "1" });
+    paint(r.muted);
+    toast("ok", r.muted ? "Звук выключен" : "Звук включён", r.muted ? "Сигналов капчи и звука уведомлений не будет" : "При капче прозвучит сигнал");
+  };
 }
 
 // ---------- окно объекта: история цен ----------
@@ -409,7 +555,11 @@ function closeModal() {
 }
 $("#modalX").onclick = closeModal;
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if (!$("#modal").classList.contains("hidden")) closeModal();
+  else if (ZE) endZoneEdit();  // Esc — отменить изменение круга
+});
 $("#modalBody").addEventListener("click", e => {
   const h = e.target.closest(".heart");
   if (h) toggleLike(h.closest("[data-id]")?.dataset.id, h);

@@ -176,7 +176,7 @@ def _notify_hook(tray):
             return
         manager.log("db", f"🔔 изменения на рынке ({names}): {text}")
         if tray:
-            tray.notify(f"RealtyWatch: изменения на рынке — {names}", text + "\nНажмите, чтобы посмотреть", view="changes")
+            tray.notify(f"RealtyWatch: изменения на рынке — {names}", text + "\nНажмите, чтобы посмотреть", view="changes:last")
 
     return hook
 

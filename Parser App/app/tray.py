@@ -2,6 +2,7 @@
 import threading
 
 NIN_BALLOONUSERCLICK = 0x0405  # клик по всплывающему уведомлению
+NIIF_NOSOUND = 0x10            # уведомление без звука
 
 
 class Tray:
@@ -21,6 +22,13 @@ class Tray:
                 else:
                     super()._on_notify(wparam, lparam)
 
+            def _notify(self, message, title=None):
+                # «Без звука»: уведомление Windows показывается беззвучно (NIIF_NOSOUND)
+                from pystray._util import win32
+                from . import alerts
+                self._message(win32.NIM_MODIFY, win32.NIF_INFO, szInfo=message, szInfoTitle=title or self.title or "",
+                              dwInfoFlags=NIIF_NOSOUND if alerts.muted() else 0)
+
         item = pystray.MenuItem
         menu = pystray.Menu(
             item("Открыть RealtyWatch", lambda icon, it: self.show(), default=True),
@@ -37,7 +45,7 @@ class Tray:
             self.window.show()
             self.window.restore()
             if view:
-                self.window.evaluate_js(f"window.setView && setView({view!r})")
+                self.window.evaluate_js(f"window.openView && openView({view!r})")
         except Exception:
             pass
 

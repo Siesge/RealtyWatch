@@ -45,9 +45,13 @@ def stats():
     con.close()
     img_files = [p for p in IMAGES.rglob("*") if p.is_file() and p.suffix != ".part"]
     db_size = sum(p.stat().st_size for p in DB_DIR.glob("realty.db*"))
+    backups = sorted(BACKUPS.glob("*.zip"), key=lambda p: p.stat().st_mtime) if BACKUPS.exists() else []
+    last = backups[-1] if backups else None
     return {"listings": r["n"], "objects": r["objects"], "passing": r["passing"] or 0, "likes": r["likes"],
             "images": len(img_files), "size_mb": round((db_size + sum(p.stat().st_size for p in img_files)) / 2**20, 1),
-            "folder": str(DB_DIR)}
+            "folder": str(DB_DIR), "backups": len(backups),
+            "last_backup": {"name": last.name, "ts": datetime.fromtimestamp(last.stat().st_mtime).isoformat(timespec="seconds"),
+                            "mb": round(last.stat().st_size / 2**20, 1)} if last else None}
 
 
 def export_zip(dest, with_images=True):
@@ -71,10 +75,14 @@ def export_zip(dest, with_images=True):
     return str(dest)
 
 
-def _backup():
+def backup(reason, with_images=False):
+    """Резервная копия базы в database/backups перед опасной операцией (импорт, очистка)."""
     BACKUPS.mkdir(parents=True, exist_ok=True)
-    dest = BACKUPS / f"перед_импортом_{_stamp()}.zip"
-    return export_zip(dest, with_images=False)  # фото при импорте не удаляются — копируем только базу
+    return export_zip(BACKUPS / f"{reason}_{_stamp()}.zip", with_images=with_images)
+
+
+def _backup():
+    return backup("перед_импортом")  # фото при импорте не удаляются — копируем только базу
 
 
 def _check(z):

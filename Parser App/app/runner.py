@@ -269,6 +269,10 @@ class RunManager:
     def _process(self, con, scraper, cfg, item, counts, run_id=None, baseline=0):
         f = cfg["filters"]
         existing = db.get(con, item["source"], item["source_id"])
+        # Поля, которых нет в этом источнике данных (например, у Авито без карточки), берутся из базы
+        for k in item.pop("_keep", ()):
+            if existing and item.get(k) in (None, "") and existing.get(k) not in (None, ""):
+                item[k] = existing[k]
         # Данные со страницы объявления уже есть в базе — берём их, не запрашивая повторно
         if existing and existing.get("details_fetched"):
             for k in scraper.detail_fields:

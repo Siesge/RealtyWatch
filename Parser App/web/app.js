@@ -25,6 +25,9 @@ const ICON = {
   down: '<svg viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></svg>',
   up: '<svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></svg>',
   folder: '<svg viewBox="0 0 24 24"><path d="M3.5 6.5a1.5 1.5 0 0 1 1.5-1.5h4.5l2 2.5H19a1.5 1.5 0 0 1 1.5 1.5v8.5A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5z"/></svg>',
+  trash: '<svg viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V5.2c0-.7.5-1.2 1.2-1.2h2.6c.7 0 1.2.5 1.2 1.2V7M6.5 7l.8 11.6c.1 1 .9 1.9 2 1.9h5.4c1.1 0 1.9-.9 2-1.9L17.5 7M10 11v6M14 11v6"/></svg>',
+  bell: '<svg viewBox="0 0 24 24"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15zM10 20.5a2.2 2.2 0 0 0 4 0"/></svg>',
+  bellOff: '<svg viewBox="0 0 24 24"><path d="M6 16.5V11a6 6 0 0 1 9.4-4.9M18 11v5.5l1.5 2h-15M10 20.5a2.2 2.2 0 0 0 4 0M4 4l16 16"/></svg>',
   list: '<svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
   chart: '<svg viewBox="0 0 24 24"><path d="M4 19h16M6 15l4-4 3 3 5-6"/></svg>',
   img: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 5-4.5 4 3.5 3-2.5 4 3.5"/></svg>',
@@ -364,7 +367,9 @@ function makeMap(el) {
   const m = L.map(el, { zoomControl: true, attributionControl: true }).setView([44.49, 34.155], 13);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(m);
   legend().addTo(m);
-  return { map: m, layer: L.layerGroup().addTo(m), zone: null, markers: {} };
+  const M = { map: m, layer: L.layerGroup().addTo(m), zone: null, markers: {} };
+  lockControl(M).addTo(m);
+  return M;
 }
 
 // Цвет точки — набор сайтов объекта (среди выбранных в фильтре): один сайт — его цвет, два — смешанный, три — светлое золото
@@ -404,10 +409,7 @@ function legend() {
 
 function drawMap(M, rows) {
   setTimeout(() => M.map.invalidateSize(), 60);
-  if (M.zone) M.zone.remove();
-  const z = SETTINGS.zone, gold = getComputedStyle(document.documentElement).getPropertyValue("--gold").trim() || "#B4873B";
-  const style = { color: gold, weight: 2.5, dashArray: "7 6", fillColor: gold, fillOpacity: .10 };
-  M.zone = (z.polygon ? L.polygon(z.polygon, style) : L.circle(z.center, { radius: z.radius_m, ...style })).addTo(M.map);
+  if (!(ZE && ZE.M === M)) drawZone(M);  // во время изменения круга его рисует редактор
   M.layer.clearLayers();
   M.markers = {};
   rows.filter(o => o.lat != null).forEach(o => {
@@ -422,6 +424,180 @@ function drawMap(M, rows) {
 }
 
 function renderMap(rows) { if (!MAIN) MAIN = makeMap("map"); drawMap(MAIN, rows); }
+
+// ---------- круг (зона A) на карте: замок, перенос центра кликом, радиус — за край круга ----------
+const LOCK_ICON = {
+  closed: '<svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.2"/><path d="M8 10.5V7.8a4 4 0 0 1 8 0v2.7"/></svg>',
+  open: '<svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.2"/><path d="M8 10.5V7.8a4 4 0 0 1 7.6-1.7"/></svg>',
+};
+const LOCK_TIP = {
+  closed: "Круг (зона A) закреплён.\nНажмите на замок, чтобы изменить круг: клик по карте переносит центр, край круга тянется мышью. Точки на карте в это время не нажимаются",
+  open: "Изменение круга: клик по карте — перенести центр, потяните край круга или белую ручку — изменить радиус.\nНажмите на замок, чтобы закрепить и сохранить круг",
+};
+let ZE = null;  // идёт изменение круга: { M, center, radius, orig, layers, resizing, suppress }
+
+const zoneColor = () => getComputedStyle(document.documentElement).getPropertyValue("--gold").trim() || "#B4873B";
+
+function drawZone(M) {
+  if (M.zone) M.zone.remove();
+  const z = SETTINGS.zone, gold = zoneColor();
+  const style = { color: gold, weight: 2.5, dashArray: "7 6", fillColor: gold, fillOpacity: .10 };
+  M.zone = (z.polygon ? L.polygon(z.polygon, style) : L.circle(z.center, { radius: z.radius_m, ...style })).addTo(M.map);
+}
+
+function lockControl(M) {
+  const c = L.control({ position: "topright" });
+  c.onAdd = () => {
+    const box = L.DomUtil.create("div", "zone-ctl");
+    box.innerHTML = `<div class="leaflet-bar"><a href="#" role="button" class="zone-lock" title="${esc(LOCK_TIP.closed)}">${LOCK_ICON.closed}</a></div>
+      <div class="zone-edit hidden"></div>`;
+    L.DomEvent.disableClickPropagation(box);
+    L.DomEvent.disableScrollPropagation(box);
+    box.querySelector(".zone-lock").addEventListener("click", e => { e.preventDefault(); toggleZoneEdit(M); });
+    M.lockBox = box;
+    return box;
+  };
+  return c;
+}
+
+// Точка на окружности к востоку от центра — там стоит ручка радиуса
+function eastOf(c, r) {
+  return L.latLng(c.lat, c.lng + r / (111320 * Math.cos(c.lat * Math.PI / 180)));
+}
+
+function toggleZoneEdit(M) {
+  if (ZE && ZE.M === M) return finishZoneEdit();
+  if (ZE) endZoneEdit();
+  if (Object.values(lastStates).includes("running"))
+    return toast("warn", "Идёт сбор данных", "Круг можно изменить после окончания сбора: зоны пересчитываются по всей базе");
+  if (SETTINGS.zone.polygon) return toast("warn", "Зона задана многоугольником", "Изменить на карте можно только круг");
+  const z = SETTINGS.zone, gold = zoneColor(), map = M.map;
+  const center = L.latLng(z.center);
+  ZE = { M, center, radius: z.radius_m, orig: { center, radius: z.radius_m }, resizing: false, suppress: false };
+  map.closePopup();
+  if (M.zone) M.zone.remove();
+  const circle = L.circle(center, { radius: ZE.radius, interactive: false, color: gold, weight: 3, fillColor: gold, fillOpacity: .16 }).addTo(map);
+  const dot = L.circleMarker(center, { radius: 5, interactive: false, color: "#fff", weight: 2, fillColor: gold, fillOpacity: 1 }).addTo(map);
+  const handle = L.marker(eastOf(center, ZE.radius), {
+    draggable: true, keyboard: false, title: "Потяните, чтобы изменить радиус",
+    icon: L.divIcon({ className: "zone-handle", iconSize: [18, 18], iconAnchor: [9, 9] }),
+  }).addTo(map);
+  ZE.layers = { circle, dot, handle };
+  handle.on("drag", () => setZoneRadius(ZE.center.distanceTo(handle.getLatLng()), false));
+  handle.on("dragend", () => { ZE.suppress = true; setZoneRadius(ZE.radius, true); });
+  // край круга: рядом с окружностью курсор меняется, и её можно тянуть
+  ZE.onMove = e => {
+    const near = edgeDistance(e.containerPoint) < 9;
+    if (ZE.resizing) setZoneRadius(ZE.center.distanceTo(e.latlng), true);
+    map.getContainer().classList.toggle("zone-near-edge", near || ZE.resizing);
+  };
+  ZE.onDown = e => {
+    if (edgeDistance(e.containerPoint) >= 9) return;
+    ZE.resizing = true;
+    map.dragging.disable();
+  };
+  ZE.onUp = () => {
+    if (!ZE || !ZE.resizing) return;
+    ZE.resizing = false;
+    ZE.suppress = true;
+    map.dragging.enable();
+  };
+  ZE.onClick = e => {
+    if (ZE.suppress) { ZE.suppress = false; return; }
+    ZE.center = e.latlng;
+    circle.setLatLng(e.latlng);
+    dot.setLatLng(e.latlng);
+    setZoneRadius(ZE.radius, true);
+  };
+  map.on("mousemove", ZE.onMove).on("mousedown", ZE.onDown).on("mouseup", ZE.onUp).on("click", ZE.onClick);
+  map.doubleClickZoom.disable();  // двойной клик не должен приближать карту, пока клик переносит круг
+  document.addEventListener("mouseup", ZE.onUp);
+  map.getContainer().classList.add("zone-editing");
+  const lock = M.lockBox.querySelector(".zone-lock");
+  lock.innerHTML = LOCK_ICON.open;
+  lock.title = LOCK_TIP.open;
+  lock.classList.add("open");
+  M.lockBox.querySelector(".zone-edit").classList.remove("hidden");
+  setZoneRadius(ZE.radius, true);
+}
+
+// Расстояние в пикселях от точки экрана до окружности круга
+function edgeDistance(pt) {
+  const map = ZE.M.map, c = map.latLngToContainerPoint(ZE.center), e = map.latLngToContainerPoint(eastOf(ZE.center, ZE.radius));
+  return Math.abs(pt.distanceTo(c) - c.distanceTo(e));
+}
+
+function setZoneRadius(r, moveHandle) {
+  ZE.radius = Math.max(50, Math.min(50000, r));
+  ZE.layers.circle.setRadius(ZE.radius);
+  if (moveHandle) ZE.layers.handle.setLatLng(eastOf(ZE.center, ZE.radius));
+  const moved = ZE.orig.center.distanceTo(ZE.center);
+  ZE.M.lockBox.querySelector(".zone-edit").innerHTML = `
+    <div class="ze-row"><span>Радиус</span><b>${fmt(Math.round(ZE.radius))} м</b></div>
+    <div class="ze-row"><span>Центр</span><b>${ZE.center.lat.toFixed(5)}, ${ZE.center.lng.toFixed(5)}</b></div>
+    ${moved >= 1 || Math.round(ZE.radius) !== ZE.orig.radius ? `<div class="ze-diff">было: ${fmt(ZE.orig.radius)} м${moved >= 1 ? `, центр сдвинут на ${fmt(Math.round(moved))} м` : ""}</div>` : ""}
+    <div class="ze-hint">Клик по карте — перенести центр. Тяните край круга или белую ручку — радиус.</div>
+    <div class="ze-acts"><button class="btn-sec sm" data-ze="cancel" title="Вернуть круг как был и закрыть замок">Отменить</button>
+      <button class="btn-pri sm" data-ze="save" title="Закрыть замок и сохранить круг">${ICON.ok}Готово</button></div>`;
+  ZE.M.lockBox.querySelector('[data-ze="cancel"]').onclick = () => { endZoneEdit(); };
+  ZE.M.lockBox.querySelector('[data-ze="save"]').onclick = () => finishZoneEdit();
+}
+
+function endZoneEdit() {
+  if (!ZE) return;
+  const { M, layers } = ZE, map = M.map;
+  Object.values(layers).forEach(l => l.remove());
+  map.off("mousemove", ZE.onMove).off("mousedown", ZE.onDown).off("mouseup", ZE.onUp).off("click", ZE.onClick);
+  document.removeEventListener("mouseup", ZE.onUp);
+  map.dragging.enable();
+  map.doubleClickZoom.enable();
+  map.getContainer().classList.remove("zone-editing", "zone-near-edge");
+  const lock = M.lockBox.querySelector(".zone-lock");
+  lock.innerHTML = LOCK_ICON.closed;
+  lock.title = LOCK_TIP.closed;
+  lock.classList.remove("open");
+  M.lockBox.querySelector(".zone-edit").classList.add("hidden");
+  ZE = null;
+  drawZone(M);
+}
+
+function finishZoneEdit() {
+  const { center, radius, orig } = ZE;
+  const moved = orig.center.distanceTo(center), r = Math.round(radius);
+  if (moved < 1 && r === orig.radius) return endZoneEdit();  // ничего не изменилось
+  // какие квартиры (с координатами) войдут в круг и выйдут из него
+  const inside = (o, c, rad) => L.latLng(o.lat, o.lon).distanceTo(c) <= rad;
+  const objs = OBJS.filter(o => o.active && o.lat != null);
+  const inN = objs.filter(o => !inside(o, orig.center, orig.radius) && inside(o, center, r)).length;
+  const outN = objs.filter(o => inside(o, orig.center, orig.radius) && !inside(o, center, r)).length;
+  const nowIn = objs.filter(o => inside(o, center, r)).length;
+  $("#modalBody").innerHTML = `<div class="confirm">
+      <h3>Сохранить новый круг?</h3>
+      <p>${moved >= 1 ? `Центр сдвинут на <b>${fmt(Math.round(moved))} м</b>. ` : ""}Радиус ${fmt(orig.radius)} → <b>${fmt(r)} м</b>.</p>
+      <p>В круг войдут <b class="good">${inN}</b> ${plural(inN, "квартира", "квартиры", "квартир")}, выйдут <b class="bad">${outN}</b>; всего в круге будет ${nowIn} (по квартирам в продаже с координатами).</p>
+      <p class="meta">Зоны всех объявлений, подборка, карта, дашборд и история графиков пересчитаются под новый круг. Это займёт несколько секунд.</p>
+      <div class="confirm-acts"><button class="btn-sec" data-c="back">Продолжить изменять</button><button class="btn-sec" data-c="revert">Вернуть как было</button>
+        <button class="btn-pri" data-c="save">${ICON.ok}Сохранить круг</button></div></div>`;
+  $("#modal").classList.remove("hidden");
+  $('#modalBody [data-c="back"]').onclick = closeModal;
+  $('#modalBody [data-c="revert"]').onclick = () => { closeModal(); endZoneEdit(); };
+  $('#modalBody [data-c="save"]').onclick = async () => {
+    const btn = $('#modalBody [data-c="save"]');
+    btn.disabled = true;
+    btn.textContent = "Пересчитываю…";
+    try {
+      const res = await post("/api/zone", { center: [center.lat, center.lng], radius_m: r });
+      closeModal();
+      await loadSettings();
+      endZoneEdit();
+      await loadData();
+      toast("ok", "Круг сохранён", `В круг вошло ${res.moved_in}, вышло ${res.moved_out} объявлений. История рынка пересчитана (${res.snapshots} ${plural(res.snapshots, "проверка", "проверки", "проверок")})`);
+    } catch (e) {
+      closeModal();
+      toast("warn", "Круг не сохранён", e.message);
+    }
+  };
+}
 
 function highlight(id, fly) {
   if (!SIDE || !sideOn()) return;
@@ -535,7 +711,7 @@ async function renderSettings() {
   const modeHint = "<b>авто</b> — сначала быстрый HTTP-запрос с отпечатком Chrome; если сайт блокирует, сам переходит на скрытый браузер. " +
     "<b>только HTTP</b> — быстрее, но при блокировке сбор остановится. <b>только браузер</b> — медленнее, но надёжнее на строгих сайтах.";
   $("#view-settings").innerHTML = `<div class="settings">
-    <div class="s-card"><h3>Параметры поиска</h3><p class="hint">Передаются сайтам при сборе и используются для отсева. После сохранения вся база пересчитывается сразу; новые границы поиска на сайтах — при следующем сборе.</p>
+    <div class="s-card s-params"><h3>Параметры поиска</h3><p class="hint">Передаются сайтам при сборе и используются для отсева. После сохранения вся база пересчитывается сразу; новые границы поиска на сайтах — при следующем сборе.</p>
       ${field("Комнаты", `<input type="text" id="sRooms" value="${f.rooms.join(", ")}">`, "Через запятую. Студия — 0. Объявления с другим числом комнат отсеиваются с причиной «комнат: N».")}
       ${field("Площадь от, м²", `<input type="number" id="sArea" value="${f.area_min}">`, "Минимальная общая площадь. Меньшие — отсев «площадь».")}
       ${field("Цена от, ₽", `<input type="number" id="sPmin" value="${f.price_min}">`, "Нижняя граница цены. Передаётся сайтам; Яндекс иногда подмешивает «похожие» дешевле — они отсеиваются.")}
@@ -549,12 +725,12 @@ async function renderSettings() {
       ${field("Исключать доли", sw("sShare", f.exclude_share), "Категория «доля» на ЦИАН, заголовок «Доля…» на Авито, в тексте «доля», «1/2 доли», «долевая собственность».")}
       ${field("Исключать аукционы и торги", sw("sAuc", f.exclude_auction), "В тексте «аукцион», «торги», «банкротство», «конкурсный управляющий». «Торг уместен» не считается.")}
     </div>
-    <div class="s-card"><h3>Геозона «Красный круг»</h3><p class="hint">Зона A на карточках и карте. Калибровка по GeoZone_v1.jpg: Ливадийский дворец, Белая дача, «Атлантида» (точность ~50–70 м). Проверить — на вкладке «Карта» (золотой пунктир).</p>
+    <div class="s-card s-geo"><h3>Геозона «Красный круг»</h3><p class="hint">Зона A на карточках и карте. Калибровка по GeoZone_v1.jpg: Ливадийский дворец, Белая дача, «Атлантида» (точность ~50–70 м). Удобнее менять на карте: замок в правом верхнем углу карты.</p>
       ${field("Центр — широта", `<input type="number" step="0.000001" id="zLat" value="${z.center[0]}">`, "Градусы северной широты центра круга.")}
       ${field("Центр — долгота", `<input type="number" step="0.000001" id="zLon" value="${z.center[1]}">`, "Градусы восточной долготы центра круга.")}
       ${field("Радиус, м", `<input type="number" id="zR" value="${z.radius_m}">`, "Объекты ближе этого расстояния к центру относятся к зоне A, остальные в городе — к B, в посёлках — к C.")}
     </div>
-    <div class="s-card"><h3>Сбор данных</h3><p class="hint">Как программа забирает объявления. Если сайт покажет капчу, окно браузера появится само — пройдите её, сбор продолжится.</p>
+    <div class="s-card s-collect"><h3>Сбор данных</h3><p class="hint">Как программа забирает объявления. Если сайт покажет капчу, окно браузера появится само — пройдите её, сбор продолжится.</p>
       ${field("ЦИАН", modeSel("cian"), modeHint)}
       ${field("Авито", modeSel("avito"), "Авито отдаёт страницы объявлений только браузеру, поэтому он самый медленный.")}
       ${field("Яндекс", modeSel("yandex"), "Яндекс обычно стабильно отвечает на быстрые HTTP-запросы.")}
@@ -568,10 +744,11 @@ async function renderSettings() {
           .map(([v, t]) => `<option value="${v}" ${(b.window || "hidden") === v ? "selected" : ""}>${t}</option>`).join("")}</select>`,
         "<b>скрытое</b> — полноценное окно за пределами экрана, появляется только для капчи. <b>видимое</b> — можно наблюдать за сбором. <b>headless</b> — без окна; сайты распознают такой режим легче.")}
     </div>
-    <div class="s-card" id="dbCard"><h3>База данных</h3><p class="hint">Объявления, фото, избранное, история цен и настройки поиска — в папке database. Перенос на другое устройство: «Экспорт» здесь → «Импорт» там.</p>
+    <div class="s-card s-db" id="dbCard"><h3>База данных</h3><p class="hint">Объявления, фото, избранное, история цен и настройки поиска — в папке database. Перенос на другое устройство: «Экспорт» здесь → «Импорт» там.</p>
       <div class="db-stats" id="dbStats"></div>
       <div class="db-path" id="dbPath" title="Папка базы — её можно копировать целиком"></div>
-      <div class="btn-row">
+      <div class="db-backups" id="dbBackups" title="Резервные копии лежат в database\\backups: перед импортом и очисткой база сохраняется туда автоматически. Восстановить — «Импорт…» с режимом «заменить полностью»"></div>
+      <div class="db-actions"><div class="btn-row">
         <button class="btn-sec" id="btnExport" title="Сохранить всю базу (объявления, фото, избранное, историю, настройки поиска) в один .zip">${ICON.down}Экспорт…</button>
         <button class="btn-sec" id="btnImport" title="Загрузить базу из .zip. Перед импортом текущая база сохраняется в database\\backups">${ICON.up}Импорт…</button>
         <select id="impMode" title="«Объединить» — добавить новое и обновить более свежим; «заменить» — полностью заменить текущую базу"><option value="merge">объединить с текущей</option><option value="replace">заменить полностью</option></select>
@@ -580,7 +757,17 @@ async function renderSettings() {
         <button class="btn-sec" id="btnImages" title="Скачать фото, которые не загрузились (повторяется и само — после сбора и при запуске)">${ICON.img}Догрузить фото</button>
         <button class="btn-sec" id="btnRecheck" title="Открыть на сайтах все объявления, помеченные снятыми, и вернуть те, что на самом деле активны. Авито проверяется через браузер — это дольше">${ICON.ok}Перепроверить снятые</button>
         ${desktop() ? `<button class="btn-sec" id="btnFolder" title="Открыть папку database в Проводнике">${ICON.folder}Открыть папку</button>` : ""}
-      </div>
+      </div></div>
+    </div>
+    <div class="s-card s-purge"><h3>Очистка данных</h3><p class="hint">Если сбор прошёл неудачно — сайт отдал не ту выдачу или парсер ошибся, — данные этих дней можно убрать из статистики. Перед любой очисткой база сохраняется в database\\backups.</p>
+      ${field("Период", `<span class="pair dates"><input type="date" id="pFrom" title="С какого дня (включительно). Пусто — с самого начала"><i>—</i><input type="date" id="pTo" title="По какой день (включительно). Пусто — по сегодня"></span>`,
+        "Обе даты включительно. Пустое «с» — с самого начала, пустое «по» — по сегодняшний день.")}
+      <div class="purge-presets"><span>Быстро:</span>${[["today", "сегодня"], ["yesterday", "вчера"], ["3", "3 дня"], ["7", "неделя"], ["from-start", "всё до вчера"]]
+        .map(([v, l]) => `<button class="chip" data-pp="${v}">${l}</button>`).join("")}</div>
+      <div class="purge-prev" id="purgePrev" title="Удаляются: проверки рынка (точки графиков), изменения, прогоны и записи цен за период; объявления, которые видели только в эти дни, — целиком. Снятые в эти дни возвращаются в продажу и проверятся заново при следующем сборе">Выберите период — здесь появится, что будет удалено.</div>
+      <div class="btn-row"><button class="btn-sec danger" id="btnPurge" disabled title="Удалить данные выбранного периода (с резервной копией)">${ICON.trash}Удалить данные за период…</button></div>
+      <div class="purge-all"><span>Полностью: все объявления, история, изменения, избранное и фото. Настройки поиска и круг останутся.</span>
+        <button class="btn-sec danger" id="btnClearAll" title="Очистить всю базу (с резервной копией в database\\backups)">${ICON.trash}Очистить всю базу…</button></div>
     </div>
     <div class="s-actions"><button class="btn-primary" id="btnSave" title="Сохранить настройки и сразу пересчитать зоны, отсев и объединение дублей">Сохранить и пересчитать</button><span class="meta">Зоны, отсев и объединение пересчитаются сразу, параметры поиска — при следующем сборе.</span></div>
   </div>`;
@@ -593,7 +780,75 @@ async function renderSettings() {
     catch (e) { toast("warn", "Не получилось", e.message); }
   };
   if ($("#btnFolder")) $("#btnFolder").onclick = () => desktop().open_db_folder();
+  initPurge();
   renderDbInfo();
+}
+
+// ---------- очистка данных ----------
+function initPurge() {
+  const from = $("#pFrom"), to = $("#pTo"), prev = $("#purgePrev"), btn = $("#btnPurge");
+  const iso = d => new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
+  const day = n => { const d = new Date(); d.setDate(d.getDate() - n); return iso(d); };
+  let seq = 0;
+  const refresh = async () => {
+    const my = ++seq;
+    if (!from.value && !to.value) { prev.textContent = "Выберите период — здесь появится, что будет удалено."; btn.disabled = true; return; }
+    try {
+      const r = await post("/api/db/purge", { from: from.value, to: to.value, dry_run: true });
+      if (my !== seq) return;
+      const total = r.runs + r.snapshots + r.events + r.prices + r.listings + r.unremoved;
+      prev.innerHTML = total ? `За ${from.value ? dt(from.value) : "всё время"}${to.value ? " — " + dt(to.value) : " — сегодня"} будет удалено:
+        <span>прогонов <b>${r.runs}</b></span><span>проверок рынка <b>${r.snapshots}</b></span><span>изменений <b>${r.events}</b></span>
+        <span>записей цен <b>${r.prices}</b></span><span>объявлений целиком <b>${r.listings}</b></span>${r.unremoved ? `<span>вернётся в продажу <b>${r.unremoved}</b></span>` : ""}`
+        : "За этот период данных нет.";
+      btn.disabled = !total;
+    } catch (e) { prev.textContent = e.message; btn.disabled = true; }
+  };
+  from.onchange = to.onchange = refresh;
+  $$("#view-settings [data-pp]").forEach(b => b.onclick = () => {
+    const v = b.dataset.pp;
+    if (v === "today") { from.value = to.value = day(0); }
+    else if (v === "yesterday") { from.value = to.value = day(1); }
+    else if (v === "from-start") { from.value = ""; to.value = day(1); }
+    else { from.value = day(+v - 1); to.value = ""; }
+    refresh();
+  });
+  btn.onclick = () => confirmBox("Удалить данные за период?",
+    `${prev.innerHTML}<p class="meta">Графики, изменения и прогоны этих дней исчезнут, история пересчитается. Резервная копия базы сохранится в database\\backups.</p>`,
+    "Удалить", async () => {
+      const r = await post("/api/db/purge", { from: from.value, to: to.value });
+      toast("ok", "Данные за период удалены", `Объявлений: ${r.listings}, проверок рынка: ${r.snapshots}, изменений: ${r.events}. Резервная копия: ${r.backup}`);
+      await loadData();
+      renderSettings();
+    });
+  $("#btnClearAll").onclick = () => confirmBox("Очистить всю базу?",
+    `<p>Будут удалены <b>все</b> объявления, история цен, изменения, проверки рынка, прогоны, избранное и фото. Настройки поиска и круг останутся.</p>
+     <p class="meta">Резервная копия базы с фото сохранится в database\\backups.</p>
+     <label class="confirm-type">Для подтверждения введите слово <b>ОЧИСТИТЬ</b><input type="text" id="clearWord" autocomplete="off"></label>`,
+    "Очистить всё", async () => {
+      const r = await post("/api/db/clear", { confirm: "ОЧИСТИТЬ" });
+      toast("ok", "База очищена", `Удалено объявлений: ${r.listings}. Резервная копия: ${r.backup}`);
+      await loadData();
+      renderSettings();
+    }, () => $("#clearWord").value.trim().toUpperCase() === "ОЧИСТИТЬ", "#clearWord");
+}
+
+// Окно подтверждения опасного действия; ok — асинхронное действие, ready — можно ли нажать (ввод подтверждения)
+function confirmBox(title, html, okLabel, ok, ready, watch) {
+  $("#modalBody").innerHTML = `<div class="confirm"><h3>${title}</h3><div class="confirm-text">${html}</div>
+    <div class="confirm-acts"><button class="btn-sec" data-c="no">Отмена</button><button class="btn-pri danger" data-c="yes">${okLabel}</button></div></div>`;
+  $("#modal").classList.remove("hidden");
+  const yes = $('#modalBody [data-c="yes"]');
+  const upd = () => { yes.disabled = ready ? !ready() : false; };
+  if (watch) $(watch).addEventListener("input", upd);
+  upd();
+  $('#modalBody [data-c="no"]').onclick = closeModal;
+  yes.onclick = async () => {
+    yes.disabled = true;
+    yes.textContent = "Выполняю…";
+    try { await ok(); closeModal(); }
+    catch (e) { closeModal(); toast("warn", "Не получилось", e.message); }
+  };
 }
 
 async function renderDbInfo() {
@@ -606,6 +861,10 @@ async function renderDbInfo() {
     <div title="Активных объявлений, подходящих под параметры поиска"><b>${d.passing}</b><span>прошли отсев</span></div>
     <div title="Объём базы с фото"><b>${d.size_mb} МБ</b><span>размер</span></div>`;
   $("#dbPath").textContent = d.folder;
+  const lb = d.last_backup;
+  $("#dbBackups").innerHTML = lb
+    ? `Резервных копий: <b>${d.backups}</b> · последняя ${dtt(lb.ts)} — ${esc(lb.name.replace(/_\d{4}-\d{2}-\d{2}_\d{4}\.zip$/, "").replace(/_/g, " "))}, ${lb.mb} МБ`
+    : "Резервных копий пока нет — они создаются автоматически перед импортом и очисткой";
 }
 
 async function doExport() {
@@ -743,6 +1002,7 @@ async function poll() {
 
 // ---------- навигация и события ----------
 function setView(v) {
+  if (ZE && v !== view) { endZoneEdit(); toast("warn", "Изменение круга отменено", "Круг остался прежним"); }
   view = v;
   if (v !== "cards") PICK = null;
   $$(".nav button").forEach(b => b.classList.toggle("active", b.dataset.view === v));
@@ -842,6 +1102,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setView("dashboard");
   await loadData();
   initAuto();
+  initSound();
   updateChangesBadge();
   poll();
 });

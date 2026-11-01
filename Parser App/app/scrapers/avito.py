@@ -1,5 +1,11 @@
 """Авито: разбор HTML выдачи + страницы объявлений (координаты, ремонт, полное описание).
-Страницы объявлений запрашиваются только для новых подходящих объявлений и кэшируются в базе."""
+Страницы объявлений запрашиваются только для новых подходящих объявлений и кэшируются в базе.
+
+Список объявлений страницы выдачи берётся из данных для поисковиков (schema.org, <script type="application/ld+json">):
+сервер отдаёт их целиком — все 50 объявлений страницы. Карточки на самой странице браузер дорисовывает по мере
+прокрутки, и без прокрутки их было 12–50 из 50 (терялась треть выдачи). Карточки страницы дополняют данные
+(адрес, описание, фото); карусель рекомендаций в результаты поиска не входит и не собирается."""
+import json
 import math
 import re
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -20,6 +26,10 @@ RENOVATION = {
 # Состояние страницы объявления: closedItem=true — объявление закрыто (снято с публикации, продано, истёк срок)
 _CLOSED = re.compile(r'closedItem\\?"\s*:\s*(true|false)')
 
+_LD_ID = re.compile(r"_(\d+)/?$")
+# Карточки вне результатов поиска: карусели рекомендаций («Вам может понравиться» и т.п.)
+_SERP_CARDS = '//*[@data-marker="item"][not(ancestor::*[contains(@data-marker, "arousel")])]'
+
 _TITLE = re.compile(r"(?:(\d+)-к\.|(студия)|(своб\. планировка))[^,]*,\s*([\d\s,\.]+)\s*м²(?:,\s*(\d+)/(\d+)\s*эт)?", re.I)
 
 
@@ -36,6 +46,23 @@ def _photo_from_list(it):
     for src in it.xpath(".//img/@src | .//img/@data-src"):
         if src.startswith("http"):
             return src
+    return None
+
+
+def ld_offers(doc):
+    """Объявления страницы выдачи из данных для поисковиков (schema.org Product → offers) или None."""
+    for s in doc.xpath('//script[@type="application/ld+json"]'):
+        try:
+            j = json.loads(s.text or "")
+        except ValueError:
+            continue
+        nodes = (j.get("@graph") or [j]) if isinstance(j, dict) else (j if isinstance(j, list) else [])
+        for node in nodes:
+            offers = node.get("offers") if isinstance(node, dict) else None
+            if isinstance(offers, dict):
+                offers = offers.get("offers")
+            if isinstance(offers, list) and offers and isinstance(offers[0], dict) and "url" in offers[0]:
+                return offers
     return None
 
 
@@ -89,43 +116,62 @@ class Avito(Scraper):
     def _get_html(self, url):
         return self.fetch(lambda: self.http.get(url).text, lambda b: b.goto(url))
 
+    def _get_search_html(self, url):
+        def via_browser(b):
+            b.goto(url)
+            b.scroll_through()  # карточки дорисовываются по мере прокрутки — листаем до конца
+            return b.page.content()
+        return self.fetch(lambda: self.http.get(url).text, via_browser)
+
     def _load_page(self, page):
-        doc = lxml.html.fromstring(self._get_html(self._page_url(page)))
+        """Страница выдачи: (заявлено сайтом, [(номер, данные для поисковиков или None, карточка или None)])."""
+        doc = lxml.html.fromstring(self._get_search_html(self._page_url(page)))
         count = to_int(_txt(next(iter(doc.xpath('//*[@data-marker="page-title/count"]')), None)))
-        return count, doc.xpath('//*[@data-marker="item"]')
+        cards = {it.get("data-item-id"): it for it in doc.xpath(_SERP_CARDS) if it.get("data-item-id")}
+        offers = ld_offers(doc)
+        if offers is None:  # данных для поисковиков нет (сменилась вёрстка) — только карточки страницы
+            return count, [(sid, None, card) for sid, card in cards.items()], len(cards)
+        out = []
+        for o in offers:
+            m = _LD_ID.search(urlsplit(o.get("url") or "").path)
+            if m:
+                out.append((m.group(1), o, cards.get(m.group(1))))
+        return count, out, sum(1 for _, _, c in out if c is not None)
 
     def listings(self):
         page, pages, limit = 1, 1, self.site.get("max_pages", 40)
         seen, declared = set(), None
         prefix = self._region_prefix()
         while page <= pages and page <= limit:
-            count, items = self._load_page(page)
-            # Страница без счётчика и без карточек — не выдача (после капчи сайт открывает другую страницу).
-            # Карточки, которые все уже были на прошлых страницах, — сайт вернул не ту страницу.
+            count, entries, drawn = self._load_page(page)
+            # Страница без счётчика и без объявлений — не выдача (после капчи сайт открывает другую страницу).
+            # Объявления, которые все уже были на прошлых страницах, — сайт вернул не ту страницу.
             # Это сбой, а не конец списка: повторяем, а затем прерываем прогон без снятия объявлений.
-            stale = items and all(it.get("data-item-id") in seen for it in items)
-            if count is None and not items or (not items and page < pages) or (stale and page < pages):
-                what = "без списка объявлений" if not items else "с объявлениями прошлых страниц"
+            stale = entries and all(sid in seen for sid, _, _ in entries)
+            if count is None and not entries or (not entries and page < pages) or (stale and page < pages):
+                what = "без списка объявлений" if not entries else "с объявлениями прошлых страниц"
                 self.log(f"страница {page}/{pages} пришла {what} — повторяю")
                 self.snapshot_last(f"страница {page} {what}")
                 self.wait()
-                count, items = self._load_page(page)
-                stale = items and all(it.get("data-item-id") in seen for it in items)
-                if count is None and not items or (not items and page < pages) or (stale and page < pages):
+                count, entries, drawn = self._load_page(page)
+                stale = entries and all(sid in seen for sid, _, _ in entries)
+                if count is None and not entries or (not entries and page < pages) or (stale and page < pages):
                     self.snapshot_last(f"страница {page} {what} повторно")
                     raise IOError(f"страница {page} выдачи пришла {what} дважды — прогон неполный, снятие объявлений не выполняется")
             if count:
                 pages, declared = math.ceil(count / 50), count
             batch = []
-            for it in items:
-                item = self._from_list(it, prefix)
+            for sid, offer, card in entries:
+                item = (self._from_list(card, prefix) if card is not None else None) or (self._from_ld(offer, prefix) if offer else None)
+                if item and offer and not item.get("price"):
+                    item["price"] = to_int(offer.get("price"))
                 if item and item["source_id"] not in seen:
                     batch.append(item)
-                seen.add(it.get("data-item-id"))
+                seen.add(sid)
             self.progress(page=page, pages=min(pages, limit), total=count)
-            self.log(f"страница {page}/{pages}: {len(items)} карточек, новых в прогоне {len(batch)}")
+            self.log(f"страница {page}/{pages}: {len(entries)} объявлений (карточек на странице {drawn}), новых в прогоне {len(batch)}")
             yield from batch
-            if not items:  # пустая только последняя страница (пустая в середине — ошибка выше)
+            if not entries:  # пустая только последняя страница (пустая в середине — ошибка выше)
                 page = pages + 1
                 break
             page += 1
@@ -207,6 +253,40 @@ class Avito(Scraper):
             "photo": img,
             "fetch_mode": self.last_mode,
             "raw": {"apartments": t["is_apartments"]},
+        }
+
+    def _from_ld(self, offer, prefix):
+        """Объявление из данных для поисковиков, когда карточку браузер не дорисовал: название, цена, фото.
+        Адрес и описание берутся из базы, если объявление уже было, иначе — со страницы объявления (enrich)."""
+        path = urlsplit(offer.get("url") or "").path
+        m = _LD_ID.search(path)
+        if not m or not path.startswith(prefix):
+            return None
+        title = rules.fix_homoglyphs((offer.get("name") or "").replace("\xa0", " "))
+        t = parse_title(title)
+        price, area = to_int(offer.get("price")), t.get("area")
+        img = offer.get("image")
+        return {
+            "source": self.name,
+            "source_id": m.group(1),
+            "url": BASE + path,
+            "title": title,
+            "price": price,
+            "price_m2": round(price / area) if price and area else None,
+            "rooms": t.get("rooms"),
+            "area": area,
+            "floor": t.get("floor"),
+            "floors": t.get("floors"),
+            "address": None,
+            "is_share": t["is_share"],
+            "is_apartments_studio": t["is_apartments"] and t.get("rooms") == 0,
+            "renovation": None,
+            "description": None,
+            "photo": img if isinstance(img, str) and img.startswith("http") else None,
+            "fetch_mode": self.last_mode,
+            "raw": {"apartments": t["is_apartments"], "from": "schema.org"},
+            # чего нет в данных для поисковиков — оставить из базы
+            "_keep": ("address", "description", "renovation", "renovation_raw", "photo"),
         }
 
     def enrich(self, item):

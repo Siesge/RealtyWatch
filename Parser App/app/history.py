@@ -40,24 +40,38 @@ def _stats(objs):
             "median_ppm": _med(ppm), "mean_ppm": _mean(ppm), "median_area": _med([o["area"] for o in objs if o["area"]])}
 
 
-def compute(rows, events=None):
-    """Сводка по подходящим (не отсеянным) активным объявлениям; «Ялта» — зоны A и B."""
+def _part(objs):
+    """Срез по набору объектов: всё вместе, по комнатности, по сайтам, на нескольких сайтах."""
+    return {"all": _stats(objs),
+            "rooms": {str(k): _stats([o for o in objs if o["rooms"] == k]) for k in ROOMS},
+            "sources": {s: sum(1 for o in objs if s in o["sources"]) for s in ("cian", "avito", "yandex")},
+            "multi": sum(1 for o in objs if len(o["sources"]) > 1)}
+
+
+def compute(rows, events=None, events_a=None):
+    """Сводка по подходящим (не отсеянным) активным объявлениям; «Ялта» — зоны A и B.
+    a — то же только внутри круга (зона A): для режима дашборда «только внутри круга»."""
     objs = _objects(rows)
     city = [o for o in objs if o["zone"] in ("A", "B")]
-    data = {"city": _stats(city), "all": _stats(objs),
+    part = _part(city)
+    data = {"city": part["all"], "all": _stats(objs),
             "zones": {z: _stats([o for o in objs if o["zone"] == z]) for z in ZONES},
-            "rooms": {str(k): _stats([o for o in city if o["rooms"] == k]) for k in ROOMS},
-            "sources": {s: sum(1 for o in city if s in o["sources"]) for s in ("cian", "avito", "yandex")},
-            "multi": sum(1 for o in city if len(o["sources"]) > 1)}
+            "rooms": part["rooms"], "sources": part["sources"], "multi": part["multi"],
+            "a": _part([o for o in objs if o["zone"] == "A"])}
     if events is not None:
         data["events"] = events
+    if events_a is not None:
+        data["events_a"] = events_a
     return data
 
 
-def _event_counts(con, since, until):
-    q = "SELECT kind, old_value, new_value FROM events WHERE baseline=0 AND ts>? AND ts<=?"
+def _event_counts(con, since, until, zone=None):
+    q = "SELECT e.kind, e.old_value, e.new_value FROM events e"
+    if zone:
+        q += " JOIN listings l ON l.source=e.source AND l.source_id=e.source_id AND l.zone=?"
+    q += " WHERE e.baseline=0 AND e.ts>? AND e.ts<=?"
     c = {"new": 0, "removed": 0, "returned": 0, "price_down": 0, "price_up": 0}
-    for r in con.execute(q, (since or "", until)):
+    for r in con.execute(q, ((zone,) if zone else ()) + (since or "", until)):
         if r["kind"] == "price":
             c["price_down" if (r["new_value"] or 0) < (r["old_value"] or 0) else "price_up"] += 1
         elif r["kind"] in c:
@@ -70,7 +84,8 @@ def snapshot(con, run_id=None):
     rows = [dict(r) for r in con.execute(
         "SELECT source, source_id, object_id, price, area, rooms, zone FROM listings WHERE active=1 AND excluded IS NULL")]
     prev = con.execute("SELECT ts FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
-    data = compute(rows, _event_counts(con, prev["ts"] if prev else None, ts))
+    since = prev["ts"] if prev else None
+    data = compute(rows, _event_counts(con, since, ts), _event_counts(con, since, ts, zone="A"))
     con.execute("INSERT INTO snapshots(ts, run_id, data) VALUES(?,?,?)", (ts, run_id, json.dumps(data, ensure_ascii=False)))
     con.commit()
     return data
@@ -113,25 +128,49 @@ def backfill(con):
         # точка на каждую «пачку» завершённых прогонов: цены — по истории на тот момент
         ends = sorted({r["finished"][:15] + "9:59" for r in con.execute(
             "SELECT finished FROM runs WHERE status IN ('done','stopped') AND finished IS NOT NULL")})
-        rows = [dict(r) for r in con.execute(
-            "SELECT source, source_id, object_id, area, rooms, zone, first_seen, removed_at, excluded FROM listings")]
-        hist = defaultdict(list)
-        for h in con.execute("SELECT source, source_id, ts, price FROM price_history ORDER BY ts"):
-            hist[(h["source"], h["source_id"])].append((h["ts"], h["price"]))
-        prev = None
-        for t in ends:
-            live = []
-            for r in rows:
-                if r["excluded"] or r["first_seen"] > t or (r["removed_at"] and r["removed_at"] <= t):
-                    continue
-                ph = [p for ts, p in hist[(r["source"], r["source_id"])] if ts <= t]
-                if ph:
-                    live.append(dict(r, price=ph[-1]))
-            if live:
-                data = compute(live, _event_counts(con, prev, t))
-                con.execute("INSERT INTO snapshots(ts, run_id, data) VALUES(?,?,?)", (t, None, json.dumps(data, ensure_ascii=False)))
-                prev = t
-        con.commit()
+        _write_snapshots(con, [(t, None) for t in ends])
+    else:
+        last = con.execute("SELECT data FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        if '"a":' not in last["data"]:  # снимки до появления среза «внутри круга» — пересобрать
+            rebuild_snapshots(con)
+
+
+def _write_snapshots(con, points):
+    """Восстанавливает снимки рынка на моменты points [(ts, run_id)] по данным базы: какие объявления были
+    в продаже на тот момент (появились раньше, сняты позже) и по какой цене (история цен).
+    Зоны, отсев и объединение дублей — текущие, поэтому история согласована с нынешними правилами и кругом."""
+    rows = [dict(r) for r in con.execute(
+        "SELECT source, source_id, object_id, area, rooms, zone, first_seen, removed_at, excluded FROM listings")]
+    hist = defaultdict(list)
+    for h in con.execute("SELECT source, source_id, ts, price FROM price_history ORDER BY ts"):
+        hist[(h["source"], h["source_id"])].append((h["ts"], h["price"]))
+    rows = [r for r in rows if not r["excluded"]]
+    keys = [(r["source"], r["source_id"]) for r in rows]
+    pos = [0] * len(rows)   # точки идут по времени: указатель в истории цен каждого объявления только растёт
+    prev = None
+    for t, run_id in sorted(points):
+        live = []
+        for i, r in enumerate(rows):
+            h = hist[keys[i]]
+            while pos[i] < len(h) and h[pos[i]][0] <= t:
+                pos[i] += 1
+            if not pos[i] or r["first_seen"] > t or (r["removed_at"] and r["removed_at"] <= t):
+                continue
+            live.append(dict(r, price=h[pos[i] - 1][1]))
+        if live:
+            data = compute(live, _event_counts(con, prev, t), _event_counts(con, prev, t, zone="A"))
+            con.execute("INSERT INTO snapshots(ts, run_id, data) VALUES(?,?,?)", (t, run_id, json.dumps(data, ensure_ascii=False)))
+            prev = t
+    con.commit()
+
+
+def rebuild_snapshots(con):
+    """Пересобирает всю историю снимков на те же моменты времени: после перемещения круга (зоны пересчитаны),
+    очистки данных за период или для старых снимков без среза «внутри круга». Возвращает число снимков."""
+    points = [(r["ts"], r["run_id"]) for r in con.execute("SELECT ts, run_id FROM snapshots ORDER BY ts")]
+    con.execute("DELETE FROM snapshots")
+    _write_snapshots(con, points)
+    return con.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
 
 
 def recheck_removed(scrapers, cfg, log=lambda m: None):
@@ -172,12 +211,31 @@ def recheck_removed(scrapers, cfg, log=lambda m: None):
     return {"returned": back, "confirmed": confirmed}
 
 
-def changes(con, days=7, include_baseline=False):
+def last_update(con):
+    """Последнее обновление: последний законченный сбор каждого сайта."""
+    return [dict(r) for r in con.execute(
+        """SELECT id, source, status, started, finished FROM runs WHERE id IN (
+               SELECT MAX(id) FROM runs WHERE finished IS NOT NULL AND status != 'running' GROUP BY source)
+           ORDER BY source""")]
+
+
+def changes(con, days=7, include_baseline=False, hours=None, last=False):
+    """События рынка за период: последние `days` дней, последние `hours` часов или (last=True)
+    найденные последним законченным сбором каждого сайта."""
     q = """SELECT e.*, l.object_id, l.title, l.url, l.address, l.zone, l.rooms, l.area, l.floor, l.floors, l.price AS price_now,
                   l.active, l.removed_reason, l.excluded, l.photo
-           FROM events e JOIN listings l ON l.source=e.source AND l.source_id=e.source_id
-           WHERE e.ts >= replace(datetime('now', 'localtime', ?), ' ', 'T')""" +("" if include_baseline else " AND e.baseline=0") + " ORDER BY e.ts DESC"
-    return [dict(r) for r in con.execute(q, (f"-{int(days)} days",))]
+           FROM events e JOIN listings l ON l.source=e.source AND l.source_id=e.source_id WHERE """
+    if last:
+        ids = [r["id"] for r in last_update(con)]
+        if not ids:
+            return []
+        q += f"e.run_id IN ({','.join('?' * len(ids))})"
+        args = ids
+    else:
+        q += "e.ts >= replace(datetime('now', 'localtime', ?), ' ', 'T')"
+        args = [f"-{float(hours)} hours" if hours else f"-{int(days)} days"]
+    q += ("" if include_baseline else " AND e.baseline=0") + " ORDER BY e.ts DESC"
+    return [dict(r) for r in con.execute(q, args)]
 
 
 # Средний срок экспозиции вторичной квартиры в РФ в 2025 г.: ~100 дней по крупным регионам (Домклик),
@@ -208,17 +266,51 @@ def expected_gone(gaps_days, tau):
     return sum(1 - math.exp(-max(g, 0) / tau) for g in gaps_days)
 
 
-def dashboard(con):
-    snaps = [{"ts": r["ts"], **json.loads(r["data"])} for r in con.execute("SELECT ts, data FROM snapshots ORDER BY ts")]
+MAX_POINTS = 500  # точек на графиках дашборда за период
+
+
+def _thin(snaps, limit=MAX_POINTS):
+    """Не больше limit точек: соседние проверки объединяются в одну (последнюю в группе),
+    события группы суммируются — график «Движение рынка» ничего не теряет."""
+    if len(snaps) <= limit:
+        return snaps
+    step = math.ceil(len(snaps) / limit)
+    out = []
+    for i in range(0, len(snaps), step):
+        group = snaps[i:i + step]
+        last = dict(group[-1])
+        for key in ("events", "events_a"):
+            if any(key in s for s in group):
+                total = defaultdict(int)
+                for s in group:
+                    for k, v in (s.get(key) or {}).items():
+                        total[k] += v or 0
+                last[key] = dict(total)
+        out.append(last)
+    return out
+
+
+def dashboard(con, days=None):
+    """Сводка для дашборда; days — период графиков (None — всё время), не больше MAX_POINTS точек."""
+    q, args = "SELECT ts, data FROM snapshots", ()
+    if days:
+        q, args = q + " WHERE ts >= ?", (_ago(con, days),)
+    raw = [{"ts": r["ts"], **json.loads(r["data"])} for r in con.execute(q + " ORDER BY ts", args)]
+    snaps = _thin(raw)
     runs = {}
     for r in con.execute("SELECT * FROM runs ORDER BY id"):
         runs[r["source"]] = dict(r)
     per_source = {r["source"]: dict(r) for r in con.execute(
         """SELECT source, COUNT(*) total, SUM(active) active, SUM(active=1 AND excluded IS NULL) passing,
-                  SUM(active=0) removed, MIN(first_seen) since FROM listings GROUP BY source""")}
-    return {"snapshots": snaps, "last_runs": runs, "sources": per_source,
-            "events_24h": changes_summary(con, _ago(con, 1)),
-            "events_7d": changes_summary(con, _ago(con, 7))}
+                  SUM(active=0) removed, MIN(first_seen) since,
+                  SUM(zone='A' AND active=1) active_a, SUM(zone='A' AND active=1 AND excluded IS NULL) passing_a,
+                  SUM(zone='A' AND active=0) removed_a FROM listings GROUP BY source""")}
+    d1, d7 = _ago(con, 1), _ago(con, 7)
+    # две последние проверки целиком — для показателей «изменение к предыдущей проверке» и среза «сейчас»
+    recent = [{"ts": r["ts"], **json.loads(r["data"])} for r in con.execute("SELECT ts, data FROM snapshots ORDER BY ts DESC LIMIT 2")][::-1]
+    return {"snapshots": snaps, "checks": len(raw), "recent": recent, "last_runs": runs, "sources": per_source,
+            "events_24h": changes_summary(con, d1), "events_7d": changes_summary(con, d7),
+            "events_24h_a": _event_counts(con, d1, "9999", zone="A"), "events_7d_a": _event_counts(con, d7, "9999", zone="A")}
 
 
 def _ago(con, days):
