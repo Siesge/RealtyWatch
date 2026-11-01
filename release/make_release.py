@@ -18,6 +18,7 @@ FORBIDDEN = ("database/", "profiles/", "logs/", "runtime/", "browsers/", "data/"
 
 
 def main():
+    sys.stdout.reconfigure(errors="replace")  # консоль Windows может не знать кириллицу
     if subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--", "Parser App"], capture_output=True, text=True).stdout.strip():
         sys.exit("В папке Parser App есть незакоммиченные изменения — сначала закоммитьте их: архив собирается из коммита")
     commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
