@@ -1,10 +1,15 @@
 """Авито: разбор HTML выдачи + страницы объявлений (координаты, ремонт, полное описание).
 Страницы объявлений запрашиваются только для новых подходящих объявлений и кэшируются в базе.
 
-Список объявлений страницы выдачи берётся из данных для поисковиков (schema.org, <script type="application/ld+json">):
-сервер отдаёт их целиком — все 50 объявлений страницы. Карточки на самой странице браузер дорисовывает по мере
-прокрутки, и без прокрутки их было 12–50 из 50 (терялась треть выдачи). Карточки страницы дополняют данные
-(адрес, описание, фото); карусель рекомендаций в результаты поиска не входит и не собирается."""
+Авито блокирует быстрый HTTP-клиент, поэтому в режиме «авто» всё идёт через браузер, как у человека:
+выдача листается кнопкой «Следующая страница», объявления открываются в новой вкладке кликом по карточке.
+Пазл-капчу GeeTest программа проходит сама (app.captcha), другие виды — человек.
+
+Объявления страницы — карточки выдачи. Они берутся и из HTML, который прислал сервер, и со страницы после
+работы её скриптов: если скрипты уберут или не дорисуют часть карточек, объявления не потеряются. Данные для
+поисковиков (schema.org) в отфильтрованной выдаче Авито не отдаёт (только в общем каталоге) — используются,
+если появятся. Сервер иногда присылает на странице меньше 50 карточек; первая такая страница прогона
+сохраняется в logs/snapshots для разбора. Карусель рекомендаций в результаты поиска не входит."""
 import json
 import math
 import re
@@ -12,7 +17,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import lxml.html
 
-from .. import rules
+from .. import captcha, rules
 from ..net import Blocked, IpBanned
 from .base import Scraper, to_float, to_int
 
@@ -29,6 +34,11 @@ _CLOSED = re.compile(r'closedItem\\?"\s*:\s*(true|false)')
 _LD_ID = re.compile(r"_(\d+)/?$")
 # Карточки вне результатов поиска: карусели рекомендаций («Вам может понравиться» и т.п.)
 _SERP_CARDS = '//*[@data-marker="item"][not(ancestor::*[contains(@data-marker, "arousel")])]'
+PER_PAGE = 50
+# Открыта страница выдачи номер N (текущая страница в переключателе — не ссылка) или страница капчи
+_ON_PAGE_JS = """() => document.readyState !== 'loading' && !!document.querySelector('[data-marker="pagination-button/page(%d)"]:not(a)')"""
+_ARRIVED_JS = """() => document.readyState !== 'loading' && (!!document.querySelector('[data-marker="pagination-button/page(%d)"]:not(a)')
+  || !!document.querySelector('.js-firewall-form') || document.title.indexOf('Доступ ограничен') >= 0)"""
 
 _TITLE = re.compile(r"(?:(\d+)-к\.|(студия)|(своб\. планировка))[^,]*,\s*([\d\s,\.]+)\s*м²(?:,\s*(\d+)/(\d+)\s*эт)?", re.I)
 
@@ -87,12 +97,21 @@ class Avito(Scraper):
     label = "Авито"
     # Счётчик «N объявлений» у Авито включает соседние города и не совпадает с выдачей — по нему полноту не проверяем
     MIN_COVERAGE = None
+    AUTO_BROWSER = True
     detail_fields = ("lat", "lon", "address", "description", "renovation", "renovation_raw", "building_type",
                      "build_year", "floors", "living_area", "kitchen_area", "details_fetched", "published_at")
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._sparse_saved = False  # неполная страница выдачи уже сохранена в этом прогоне
+        self._last_html = (None, None)
+
+    def captcha_solver(self):
+        return captcha.AvitoCaptcha(enabled=self.cfg.get("browser", {}).get("auto_captcha", True))
+
     def is_ip_banned(self, html, url):
-        # «Доступ ограничен: проблема с IP» — «с него идёт очень много запросов»
-        return "проблема с IP" in (html or "")[:30000]
+        # «Доступ ограничен: проблема с IP» без формы проверки — нужна пауза. С формой — это капча, её можно пройти
+        return "проблема с IP" in (html or "")[:30000] and "js-firewall-form" not in (html or "")
 
     def is_ready(self, html, url):
         # выдача, страница объявления или каталог (куда ведёт ссылка на удалённое объявление)
@@ -113,37 +132,65 @@ class Avito(Scraper):
     def _region_prefix(self):
         return "/" + urlsplit(self.site["search_url"]).path.strip("/").split("/")[0] + "/"
 
-    def _get_html(self, url):
-        return self.fetch(lambda: self.http.get(url).text, lambda b: b.goto(url))
+    def _get_item_html(self, item):
+        """Страница объявления — в новой вкладке кликом по его карточке в выдаче, как человек;
+        если карточки на открытой странице нет — новая вкладка по адресу."""
+        sel = f'[data-marker="catalog-serp"] [data-item-id="{item["source_id"]}"] a[data-marker="item-title"]'
+        return self.fetch(lambda: self.http.get(item["url"]).text, lambda b: b.open_tab(sel, item["url"]))
 
-    def _get_search_html(self, url):
+    def _get_search_html(self, url, page=1):
+        """Страница выдачи: (HTML после загрузки и просмотра страницы, HTML из ответа сервера или None)."""
         def via_browser(b):
-            b.goto(url)
-            b.scroll_through()  # карточки дорисовываются по мере прокрутки — листаем до конца
-            return b.page.content()
-        return self.fetch(lambda: self.http.get(url).text, via_browser)
+            if page > 1 and b.page is not None and self._showing(b, page - 1):
+                # человек листает выдачу кнопкой «Следующая страница», а не набирает адрес
+                b.click_through('a[data-marker="pagination-button/nextPage"]', url, _ARRIVED_JS % page)
+            else:
+                b.goto(url)
+            raw = b.raw_html()
+            b.scroll_through()  # просмотреть выдачу до конца, как человек
+            return b.page.content(), raw
+        return self.fetch(lambda: (self.http.get(url).text, None), via_browser)
+
+    @staticmethod
+    def _showing(b, page):
+        try:
+            return bool(b.page.evaluate(_ON_PAGE_JS % page))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _cards(doc):
+        return {it.get("data-item-id"): it for it in doc.xpath(_SERP_CARDS) if it.get("data-item-id")} if doc is not None else {}
 
     def _load_page(self, page):
-        """Страница выдачи: (заявлено сайтом, [(номер, данные для поисковиков или None, карточка или None)])."""
-        doc = lxml.html.fromstring(self._get_search_html(self._page_url(page)))
-        count = to_int(_txt(next(iter(doc.xpath('//*[@data-marker="page-title/count"]')), None)))
-        cards = {it.get("data-item-id"): it for it in doc.xpath(_SERP_CARDS) if it.get("data-item-id")}
-        offers = ld_offers(doc)
-        if offers is None:  # данных для поисковиков нет (сменилась вёрстка) — только карточки страницы
-            return count, [(sid, None, card) for sid, card in cards.items()], len(cards)
-        out = []
-        for o in offers:
-            m = _LD_ID.search(urlsplit(o.get("url") or "").path)
-            if m:
-                out.append((m.group(1), o, cards.get(m.group(1))))
-        return count, out, sum(1 for _, _, c in out if c is not None)
+        """Страница выдачи: (заявлено сайтом, [(номер, данные для поисковиков или None, карточка или None)], сводка).
+        Карточки — со страницы после загрузки и из ответа сервера: что есть хоть где-то, то и берётся."""
+        res = self._get_search_html(self._page_url(page), page)
+        dom_html, raw_html = res if isinstance(res, tuple) else (res, None)
+        self._last_html = (dom_html, raw_html)
+        doc = lxml.html.fromstring(dom_html)
+        raw = lxml.html.fromstring(raw_html) if raw_html else None
+        count = None
+        for d in (doc, raw):
+            if d is not None and count is None:
+                count = to_int(_txt(next(iter(d.xpath('//*[@data-marker="page-title/count"]')), None)))
+        cards, raw_cards = self._cards(doc), self._cards(raw)
+        offers = {}
+        for d in (raw, doc):
+            for o in (ld_offers(d) if d is not None else None) or []:
+                m = _LD_ID.search(urlsplit(o.get("url") or "").path)
+                if m:
+                    offers.setdefault(m.group(1), o)
+        order = list(cards) + [sid for sid in raw_cards if sid not in cards] + [sid for sid in offers if sid not in cards and sid not in raw_cards]
+        entries = [(sid, offers.get(sid), cards.get(sid) if sid in cards else raw_cards.get(sid)) for sid in order]
+        return count, entries, {"dom": len(cards), "raw": len(raw_cards) if raw is not None else None}
 
     def listings(self):
         page, pages, limit = 1, 1, self.site.get("max_pages", 40)
         seen, declared = set(), None
         prefix = self._region_prefix()
         while page <= pages and page <= limit:
-            count, entries, drawn = self._load_page(page)
+            count, entries, got = self._load_page(page)
             # Страница без счётчика и без объявлений — не выдача (после капчи сайт открывает другую страницу).
             # Объявления, которые все уже были на прошлых страницах, — сайт вернул не ту страницу.
             # Это сбой, а не конец списка: повторяем, а затем прерываем прогон без снятия объявлений.
@@ -153,13 +200,20 @@ class Avito(Scraper):
                 self.log(f"страница {page}/{pages} пришла {what} — повторяю")
                 self.snapshot_last(f"страница {page} {what}")
                 self.wait()
-                count, entries, drawn = self._load_page(page)
+                count, entries, got = self._load_page(page)
                 stale = entries and all(sid in seen for sid, _, _ in entries)
                 if count is None and not entries or (not entries and page < pages) or (stale and page < pages):
                     self.snapshot_last(f"страница {page} {what} повторно")
                     raise IOError(f"страница {page} выдачи пришла {what} дважды — прогон неполный, снятие объявлений не выполняется")
             if count:
-                pages, declared = math.ceil(count / 50), count
+                pages, declared = math.ceil(count / PER_PAGE), count
+            if page < pages and len(entries) < PER_PAGE and not self._sparse_saved:
+                # Сервер прислал на странице меньше карточек, чем положено, — сохранить её, чтобы разобраться почему
+                self._sparse_saved = True
+                dom_html, raw_html = self._last_html
+                self.runlog.snapshot(dom_html, f"страница {page} — {len(entries)} из {PER_PAGE}, после загрузки")
+                if raw_html:
+                    self.runlog.snapshot(raw_html, f"страница {page} — {len(entries)} из {PER_PAGE}, ответ сервера")
             batch = []
             for sid, offer, card in entries:
                 item = (self._from_list(card, prefix) if card is not None else None) or (self._from_ld(offer, prefix) if offer else None)
@@ -169,7 +223,9 @@ class Avito(Scraper):
                     batch.append(item)
                 seen.add(sid)
             self.progress(page=page, pages=min(pages, limit), total=count)
-            self.log(f"страница {page}/{pages}: {len(entries)} объявлений (карточек на странице {drawn}), новых в прогоне {len(batch)}")
+            src = (f"в ответе сервера {got['raw']}, на странице {got['dom']}" if got["raw"] is not None
+                   else f"карточек на странице {got['dom']}")
+            self.log(f"страница {page}/{pages}: {len(entries)} объявлений ({src}), новых в прогоне {len(batch)}")
             yield from batch
             if not entries:  # пустая только последняя страница (пустая в середине — ошибка выше)
                 page = pages + 1
@@ -189,8 +245,8 @@ class Avito(Scraper):
             return r.text, str(r.url), r.status_code
 
         def via_browser(b):
-            html = b.goto(row["url"])
-            return html, b.page.url, b.last_status
+            html = b.open_tab(None, row["url"])  # новая вкладка: выдача в первой остаётся открытой
+            return html, b.last_url, b.last_status
 
         try:
             html, url, status = self._fetch_once(via_http, via_browser)
@@ -291,7 +347,7 @@ class Avito(Scraper):
 
     def enrich(self, item):
         """Страница объявления: координаты, параметры квартиры и дома, полное описание."""
-        html = self._get_html(item["url"])
+        html = self._get_item_html(item)
         doc = lxml.html.fromstring(html)
         m = doc.xpath("//*[@data-map-lat]")
         if m:

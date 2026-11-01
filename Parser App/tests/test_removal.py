@@ -26,7 +26,7 @@ def cian(rows, total=None, fail_page=None, verify=None, per_page=28):
 
 def avito(pages_fn, verify=None):
     class A(Avito):
-        def _get_search_html(self, url):
+        def _get_search_html(self, url, page=1):
             html = pages_fn(int(url.split("&p=")[1]) if "&p=" in url else 1)
             self.http.last_text = html
             return html

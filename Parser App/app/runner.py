@@ -117,14 +117,14 @@ class RunManager:
             self.runlogs[source] = rl
         scraper = SCRAPERS[source](cfg, lg, stop, pr)
         scraper.runlog = rl
-        rl.line(f"прогон №{run_id}, {SOURCE_LABEL.get(source, source)}, режим {scraper.mode}, пауза {scraper.delay[0]:g}–{scraper.delay[1]:g} с, "
+        rl.line(f"прогон №{run_id}, {SOURCE_LABEL.get(source, source)}, режим {scraper.mode_label}, пауза {scraper.delay[0]:g}–{scraper.delay[1]:g} с, "
                 f"фильтры {cfg['filters']['price_min'] / 1e6:g}–{cfg['filters']['price_max'] / 1e6:g} млн, от {cfg['filters']['area_min']} м²")
         counts = {"found": 0, "new": 0, "changed": 0, "excluded": 0, "details": 0}
         state, message, removed = "done", "", 0
         seen = set()  # номера объявлений, реально полученные в этом прогоне
         # когда каждое активное объявление видели в поиске до этого прогона — для допуска на массовое пропадание
         prev_seen = dict(con.execute("SELECT source_id, last_seen FROM listings WHERE source=? AND active=1", (source,)).fetchall())
-        lg(f"старт, режим {scraper.mode}")
+        lg(f"старт, режим {scraper.mode_label}")
         try:
             for item in scraper.listings():
                 self._process(con, scraper, cfg, item, counts, run_id, baseline)
@@ -155,7 +155,7 @@ class RunManager:
             pr(state=state, message=message, finished=db.now())
             lg(f"завершено: {STATE_LABEL.get(state, state)} — {message}")
             rl.line(f"итог: заявлено сайтом {scraper.declared if scraper.declared is not None else '—'}, собрано уникальных {len(seen)}, "
-                    f"запросов {rl.requests}, капч {scraper.captchas}, ограничений IP {scraper.bans}")
+                    f"запросов {rl.requests}, капч {scraper.captchas}{f' (пройдено автоматически {scraper.solved})' if scraper.solved else ''}, ограничений IP {scraper.bans}")
             if state in ("done", "partial"):
                 self._ease_delay(scraper, lg)
         if state != "stopped":

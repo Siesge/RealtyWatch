@@ -4,18 +4,22 @@
 профилем не запускается (тест капчи использует свой браузер без окна и локальный сайт-имитацию)."""
 import json
 import logging
+import os
 import random
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
 # Журнал тестов не пишется в logs/app.log: обработчик ставится до импорта runner (setup_logging его не трогает)
 logging.getLogger().addHandler(logging.NullHandler())
 
-from app import alerts, db, images, net, runlog, settings, transfer  # noqa: E402
+from app import alerts, db, human, images, net, paths, runlog, settings, transfer  # noqa: E402
 from app import runner  # noqa: E402
+
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(paths.BROWSERS))
 
 TMP_ROOT = Path(tempfile.mkdtemp(prefix="rw-tests-"))
 _REQUEST = net.Http.request
@@ -33,6 +37,47 @@ def _no_real_browser(self):
 
 net.Http.request = _local_only
 net.Browser.start = _no_real_browser
+
+
+class LocalBrowser(net.Browser):
+    """Настоящий Chromium без окна, со временным профилем — только для локального сайта-имитации:
+    любой запрос не к 127.0.0.1 обрывается, так что тест не может дойти до настоящего сайта."""
+
+    def start(self):
+        if self.ctx:
+            return
+        from patchright.sync_api import sync_playwright
+        self._profile = tempfile.mkdtemp(dir=TMP_ROOT)
+        self._pw = sync_playwright().start()
+        self.ctx = self._pw.chromium.launch_persistent_context(self._profile, headless=True, viewport={"width": 1280, "height": 900})
+        self.ctx.route("**/*", lambda route: route.continue_() if route.request.url.startswith("http://127.0.0.1") else route.abort())
+        self.ctx.on("response", self._on_response)
+        self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        self.mouse = human.Mouse(self.page, self.stop, net.Stopped)
+
+    def _place_window(self, *a):
+        pass
+
+    def close(self):
+        super().close()
+        shutil.rmtree(getattr(self, "_profile", ""), ignore_errors=True)
+
+
+def has_browser():
+    return paths.BROWSERS.exists() and any(paths.BROWSERS.glob("chromium-*"))
+
+
+def fast_timing(test):
+    """Паузы и движения мыши в сотни раз короче — тесты с браузером идут секунды, а не минуты."""
+    orig_pause, orig_scale = net.pause, human.TIME_SCALE
+
+    def quick(delay, stop=None):
+        if stop is not None and stop.is_set():
+            raise net.Stopped()
+        time.sleep(min(0.05, random.uniform(*delay) * 0.02))
+    net.pause, human.TIME_SCALE = quick, 0.03
+    test.addCleanup(setattr, net, "pause", orig_pause)
+    test.addCleanup(setattr, human, "TIME_SCALE", orig_scale)
 
 
 def isolate(test):

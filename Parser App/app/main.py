@@ -288,6 +288,9 @@ def main():
                     tray = Tray(window, str(paths.ROOT / "assets" / "icon.png"), TITLE,
                                 on_update=lambda: manager.start(sched.get()["sources"]))
                     manager.on_launch_done.append(_notify_hook(tray))
+                    # капча, которую программа не прошла сама, — уведомление Windows (окно браузера уже на экране)
+                    from . import alerts
+                    alerts.on_human_needed(lambda title, text: tray.notify(f"RealtyWatch — {title}", text))
                     window.events.minimized += tray.hide  # свернуть = убрать в трей
 
             window.events.shown += on_shown

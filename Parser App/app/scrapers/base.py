@@ -35,6 +35,9 @@ class Scraper:
     label = ""
     # Поля, которые приходят только со страницы объявления (их не затираем данными выдачи)
     detail_fields = ()
+    # Режим «авто» сразу через браузер, без попытки быстрого HTTP (сайт всё равно его блокирует,
+    # а отказ HTTP-клиенту с cookies браузера помечает и сессию браузера)
+    AUTO_BROWSER = False
 
     def __init__(self, cfg, log, stop, progress):
         self.cfg = cfg
@@ -48,7 +51,7 @@ class Scraper:
         self.http = Http(self.name, self.is_blocked)
         self.http.trace = self._trace
         self.browser = None
-        self.use_browser = self.mode == "browser"
+        self.use_browser = self.mode == "browser" or (self.mode == "auto" and self.AUTO_BROWSER)
         self.last_mode = None
         # True — выдача прочитана полностью и достоверно; только тогда отсутствующие объявления проверяются на снятие
         self.complete = False
@@ -83,6 +86,19 @@ class Scraper:
     @property
     def captchas(self):
         return self.browser.captchas if self.browser else 0
+
+    @property
+    def solved(self):
+        """Капч, пройденных автоматически."""
+        return self.browser.solved if self.browser else 0
+
+    @property
+    def mode_label(self):
+        return f"{self.mode} (через браузер)" if self.mode == "auto" and self.AUTO_BROWSER else self.mode
+
+    def captcha_solver(self):
+        """Автоматическое прохождение капчи этого сайта (app.captcha) или None — капчу проходит человек."""
+        return None
 
     def _trace(self, kind, method, url, status=None, ms=None, size=None, note="", body=None, reason=None):
         self.runlog.request(kind, method, url, status, ms, size, note)
@@ -136,8 +152,10 @@ class Scraper:
             b = self.cfg.get("browser", {})
             self.browser = Browser(self.name, self.is_blocked, self.log, self.stop,
                                    window=b.get("window", "hidden"), captcha_wait_min=b.get("captcha_wait_min", 10),
-                                   is_ip_banned=self.is_ip_banned, is_ready=self.is_ready)
+                                   is_ip_banned=self.is_ip_banned, is_ready=self.is_ready, label=self.label,
+                                   solver=self.captcha_solver())
             self.browser.trace = self._trace
+            self.browser.note = lambda msg: self.runlog.line(msg)
         return self.browser
 
     def fetch(self, via_http, via_browser):

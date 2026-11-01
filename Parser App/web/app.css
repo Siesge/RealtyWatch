@@ -334,6 +334,9 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
 .map-legend span { display: inline-flex; align-items: center; gap: 6px; }
 .map-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; border: 1.5px solid #fff; box-shadow: 0 0 0 1px var(--line-2); }
 .map-legend i.liked { background: var(--sunken); border: 2.5px solid #E0475B; box-shadow: none; width: 12px; height: 12px; }
+.map-legend i.all3 { background: #151515; border: 2.5px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, .55); width: 12px; height: 12px; }
+/* объект на всех трёх сайтах: чёрная точка в белом кольце, тёмный ореол отделяет кольцо от светлой карты */
+.leaflet-interactive.mk-all3 { filter: drop-shadow(0 0 1.2px rgba(0, 0, 0, .8)); }
 .map-legend i.dim { background: #3E7BFA; opacity: .35; }
 .map-legend i.zone { border-radius: 3px; border: 2px dashed var(--gold); background: var(--gold-soft); box-shadow: none; }
 .leaflet-bar a { background: var(--surface); color: var(--ink); border-color: var(--line); }
@@ -432,7 +435,11 @@ table.grid td.num.bad { color: var(--bad); }
 .toast {
   min-width: 300px; max-width: 420px; padding: 14px 16px; border-radius: 14px; background: var(--surface); color: var(--ink);
   border: 1px solid var(--line); box-shadow: var(--shadow-2); display: flex; gap: 12px; align-items: flex-start; animation: tin .3s ease;
+  cursor: pointer; transition: border-color .15s;
 }
+.toast:hover { border-color: var(--line-2); }
+.toast.out { animation: tout .18s ease forwards; pointer-events: none; }
+@keyframes tout { to { opacity: 0; transform: translateX(14px); } }
 .toast b { display: block; margin-bottom: 2px; }
 .toast p { margin: 0; color: var(--muted); font-size: 12.5px; }
 .toast .ic { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; flex: none; background: var(--accent-soft); color: var(--accent); }

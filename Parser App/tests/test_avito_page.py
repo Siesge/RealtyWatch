@@ -6,7 +6,7 @@ from tests.support import Case, avito_page, con, last_run, listings, run
 
 def avito(pages_fn):
     class A(Avito):
-        def _get_search_html(self, url):
+        def _get_search_html(self, url, page=1):
             return pages_fn(int(url.split("&p=")[1]) if "&p=" in url else 1)
 
         def enrich(self, item):

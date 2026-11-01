@@ -84,7 +84,7 @@ class DelayEasing(Case):
         rows = listings("avito", 40)
 
         class A(Avito):
-            def _get_search_html(self, url):
+            def _get_search_html(self, url, page=1):
                 return avito_page(rows, len(rows))
 
             def enrich(self, item):

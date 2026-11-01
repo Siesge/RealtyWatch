@@ -372,10 +372,12 @@ function makeMap(el) {
   return M;
 }
 
-// Цвет точки — набор сайтов объекта (среди выбранных в фильтре): один сайт — его цвет, два — смешанный, три — светлое золото
+// Цвет точки — набор сайтов объекта (среди выбранных в фильтре): один сайт — его цвет, два — смешанный,
+// все три — чёрная точка в белом кольце: её не спутать ни с одной цветной
+const ALL3 = "avito+cian+yandex";
 const MIX = {
   "cian": "#3E7BFA", "avito": "#1FAF6A", "yandex": "#F2552F",
-  "cian+yandex": "#9B5DE5", "avito+yandex": "#F2C230", "avito+cian": "#19B9C4", "avito+cian+yandex": "#F3DFA2",
+  "cian+yandex": "#9B5DE5", "avito+yandex": "#F2C230", "avito+cian": "#19B9C4", [ALL3]: "#151515",
 };
 const MIX_LABEL = {
   "cian": "только ЦИАН", "avito": "только Авито", "yandex": "только Яндекс", "cian+yandex": "ЦИАН + Яндекс",
@@ -389,6 +391,9 @@ function markerKey(o) {
 
 function markerStyle(o, on) {
   const k = markerKey(o), n = k.split("+").length;
+  if (k === ALL3)  // белое кольцо толще обычной обводки; тёмный ореол (класс mk-all3) отделяет его от светлой карты
+    return { radius: on ? 11 : 7.5, color: o.liked ? "#E0475B" : "#fff", weight: on ? 4.5 : 3.5,
+      fillColor: MIX[k], fillOpacity: o.excluded ? .4 : 1, className: "mk-all3" };
   return { radius: on ? 11 : n > 1 ? 8 : 6.5, color: on ? "#111" : o.liked ? "#E0475B" : "#fff", weight: on || o.liked ? 3 : 1.5,
     fillColor: MIX[k] || COLOR[o.p.source], fillOpacity: o.excluded ? .35 : .95 };
 }
@@ -397,7 +402,7 @@ function legend() {
   const c = L.control({ position: "bottomleft" });
   c.onAdd = () => {
     const d = L.DomUtil.create("div", "map-legend");
-    d.innerHTML = Object.keys(MIX).map(k => `<span title="${MIX_LABEL[k]}"><i style="background:${MIX[k]}"></i>${MIX_LABEL[k]}</span>`).join("") +
+    d.innerHTML = Object.keys(MIX).map(k => `<span title="${MIX_LABEL[k]}"><i ${k === ALL3 ? 'class="all3"' : `style="background:${MIX[k]}"`}></i>${MIX_LABEL[k]}</span>`).join("") +
       `<span title="Объект в избранном — отмечен сердечком (♥ в подписи точки)"><i class="liked"></i>♥ избранное</span>` +
       `<span title="Объявление не прошло отсев по параметрам поиска"><i class="dim"></i>отсеяно</span>` +
       `<span title="Зона A — красный круг с GeoZone_v1.jpg"><i class="zone"></i>красный круг</span>`;
@@ -730,9 +735,9 @@ async function renderSettings() {
       ${field("Центр — долгота", `<input type="number" step="0.000001" id="zLon" value="${z.center[1]}">`, "Градусы восточной долготы центра круга.")}
       ${field("Радиус, м", `<input type="number" id="zR" value="${z.radius_m}">`, "Объекты ближе этого расстояния к центру относятся к зоне A, остальные в городе — к B, в посёлках — к C.")}
     </div>
-    <div class="s-card s-collect"><h3>Сбор данных</h3><p class="hint">Как программа забирает объявления. Если сайт покажет капчу, окно браузера появится само — пройдите её, сбор продолжится.</p>
+    <div class="s-card s-collect"><h3>Сбор данных</h3><p class="hint">Как программа забирает объявления. Пазл-капчу Авито программа проходит сама; если сайт покажет другую капчу, окно браузера появится само и прозвучит сигнал — пройдите её, сбор продолжится.</p>
       ${field("ЦИАН", modeSel("cian"), modeHint)}
-      ${field("Авито", modeSel("avito"), "Авито отдаёт страницы объявлений только браузеру, поэтому он самый медленный.")}
+      ${field("Авито", modeSel("avito"), "Авито блокирует быстрые HTTP-запросы, поэтому в режиме <b>авто</b> он сразу работает через браузер: листает выдачу и открывает объявления, как человек. <b>Только HTTP</b> для Авито не сработает. Это самый медленный сайт.")}
       ${field("Яндекс", modeSel("yandex"), "Яндекс обычно стабильно отвечает на быстрые HTTP-запросы.")}
       ${field("Авито: страниц объявлений за прогон", `<input type="number" id="sAvDet" value="${s.avito.max_details}">`, "Сколько новых объявлений Авито открывать за один сбор (ради координат и вида ремонта). Остальные — в следующий раз. Больше — дольше и выше риск ограничения IP.")}
       ${field("Авито: пауза между запросами, с", `<span class="pair"><input type="number" step="1" min="1" id="sAvD0" value="${s.avito.delay[0]}"><i>—</i><input type="number" step="1" min="1" id="sAvD1" value="${s.avito.delay[1]}"></span>`,
@@ -743,6 +748,8 @@ async function renderSettings() {
         ${[["hidden", "скрытое"], ["visible", "видимое"], ["headless", "без окна (headless)"]]
           .map(([v, t]) => `<option value="${v}" ${(b.window || "hidden") === v ? "selected" : ""}>${t}</option>`).join("")}</select>`,
         "<b>скрытое</b> — полноценное окно за пределами экрана, появляется только для капчи. <b>видимое</b> — можно наблюдать за сбором. <b>headless</b> — без окна; сайты распознают такой режим легче.")}
+      ${field("Авито: проходить пазл-капчу автоматически", sw("sAutoCap", b.auto_captcha !== false),
+        "Пазл с ползунком (GeeTest) программа собирает сама: находит вырез на картинке и тянет ползунок мышью, как человек. Капчу другого вида (иконки, галочка, символы) или после неудачных попыток проходит человек: окно браузера появится само, прозвучит сигнал и придёт уведомление.")}
     </div>
     <div class="s-card s-db" id="dbCard"><h3>База данных</h3><p class="hint">Объявления, фото, избранное, история цен и настройки поиска — в папке database. Перенос на другое устройство: «Экспорт» здесь → «Импорт» там.</p>
       <div class="db-stats" id="dbStats"></div>
@@ -915,7 +922,7 @@ async function saveSettings() {
   s.avito.delay = [d0, d1];
   s.avito.delay_base = [d0, d1];  // заданная вручную — к ней пауза возвращается после чистых сборов
   s.avito.max_verify = Math.max(0, +$("#sAvVer").value || 0);
-  SETTINGS.browser = Object.assign(SETTINGS.browser || {}, { window: $("#sWin").value });
+  SETTINGS.browser = Object.assign(SETTINGS.browser || {}, { window: $("#sWin").value, auto_captcha: $("#sAutoCap").checked });
   SETTINGS = await post("/api/settings", SETTINGS);
   const r = await post("/api/reclassify");
   await loadData();
@@ -927,11 +934,18 @@ async function saveSettings() {
 function toast(kind, title, text, action) {
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
+  el.title = "Нажмите, чтобы закрыть";
   el.innerHTML = `<div class="ic">${kind === "warn" ? ICON.warn : ICON.ok}</div><div><b>${esc(title)}</b><p>${esc(text || "")}</p>
     ${action ? `<button class="toast-act">${esc(action.label)}</button>` : ""}</div>`;
-  if (action) el.querySelector(".toast-act").onclick = () => { action.fn(); el.remove(); };
+  const close = () => {
+    if (el.classList.contains("out")) return;
+    el.classList.add("out");
+    setTimeout(() => el.remove(), 180);
+  };
+  el.addEventListener("click", e => { if (!e.target.closest(".toast-act")) close(); });  // клик по уведомлению — закрыть
+  if (action) el.querySelector(".toast-act").onclick = () => { action.fn(); close(); };
   $("#toasts").appendChild(el);
-  setTimeout(() => el.remove(), kind === "warn" || action ? 15000 : 6000);
+  setTimeout(close, kind === "warn" || action ? 15000 : 6000);
 }
 
 // ---------- статус сбора и журнал ----------
@@ -968,7 +982,7 @@ async function poll() {
       const body = $("#jBody");
       s.journal.forEach(j => {
         const d = document.createElement("div");
-        const warn = j.msg.includes("⚠"), ban = j.msg.includes("⛔");
+        const warn = j.msg.includes("⚠"), ban = j.msg.includes("⛔"), human = j.msg.includes("НУЖНА РУЧНАЯ ПРОВЕРКА");
         d.className = "jl" + (warn || ban ? " warn" : "");
         if (ban) {
           toast("warn", `${SRC[j.src]}: ограничение по IP`, j.msg.replace(/^⛔\s*/, ""));
@@ -986,7 +1000,9 @@ async function poll() {
           updateChangesBadge();
         }
         if (j.msg.startsWith("сбор завершён")) loadData();
-        if (warn) { toast("warn", `${SRC[j.src]}: нужна проверка`, "Пройдите капчу в появившемся окне браузера — сбор продолжится сам."); $("#jDot").classList.remove("hidden"); }
+        // уведомление о капче — только когда нужен человек (пазл Авито программа проходит сама); прочие ⚠ — точка у журнала
+        if (human) toast("warn", `${SRC[j.src]}: нужна проверка`, "Пройдите капчу в появившемся окне браузера — сбор продолжится сам.");
+        if (warn) $("#jDot").classList.remove("hidden");
         if (j.msg.startsWith("завершено") || j.msg.startsWith("фото: загружено") || j.msg.startsWith("объединение")) {
           loadData();
           if (view === "settings") renderDbInfo();

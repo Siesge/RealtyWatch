@@ -6,7 +6,7 @@ import time
 
 from curl_cffi import requests as cffi
 
-from . import alerts
+from . import alerts, human
 from .paths import PROFILES
 
 
@@ -96,22 +96,33 @@ class Browser:
     """Chromium с постоянным профилем.
     window: hidden — полноценное окно за пределами экрана (по умолчанию: незаметно и без признаков headless),
             visible — обычное окно, headless — без окна (быстрее, но сайты чаще распознают бота).
-    При капче скрытое окно выводится на экран, пока её не пройдёт человек."""
+    Мышь и прокрутка — как у человека (app.human); переходы по возможности кликом по ссылке страницы,
+    страницы объявлений — в новой вкладке (open_tab), как их открывает человек.
+    При капче решатель (solver, см. app.captcha) сначала пробует пройти её сам. Не вышло или такой вид капчи
+    он не проходит — скрытое окно выводится на экран, звучит сигнал и приходит уведомление: капчу проходит человек."""
 
     # После капчи сайт сам переходит на нужную страницу — ждём его, не перезагружая (перезагрузка = новая капча)
     REDIRECT_WAIT_S = 45     # сколько ждать собственного перехода сайта после «Проверка пройдена»
     UNKNOWN_PAGE_WAIT_S = 20  # капчи уже нет, но и нужной страницы ещё нет — сколько ждать, прежде чем взять что есть
     COOLDOWN_AFTER_CAPTCHA = (25.0, 45.0)  # пауза перед следующим запросом после капчи
+    AUTO_ROUNDS = 3          # капч подряд, которые решатель проходит сам (сайт иногда просит пройти ещё раз)
+    AFTER_SOLVE_WAIT_S = 40  # сколько ждать, пока сайт откроет страницу после решённой капчи
+    PASSED_TEXT = "Проверка пройдена"
 
-    def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10, is_ip_banned=None, is_ready=None):
+    def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10, is_ip_banned=None,
+                 is_ready=None, label=None, solver=None):
         self.site = site
+        self.label = label or site
         self.is_blocked = is_blocked
         self.is_ip_banned = is_ip_banned or (lambda html, url: False)
         # is_ready(html, url): на странице уже нужное содержимое (выдача, объявление), а не промежуточная заглушка
         self.is_ready = is_ready or (lambda html, url: True)
+        self.solver = solver  # автоматическое прохождение капчи (app.captcha) или None
         self._cooldown = False
         self.trace = None   # см. Http.trace
+        self.note = lambda msg: None  # строка только в подробный журнал прогона
         self.captchas = 0   # капч за время жизни браузера (прогон)
+        self.solved = 0     # из них пройдено автоматически
         self.log = log
         self.stop = stop
         self.window = window
@@ -119,7 +130,10 @@ class Browser:
         self._pw = None
         self.ctx = None
         self.page = None
+        self.mouse = None
         self.last_status = None
+        self.last_url = None  # где оказалась последняя открытая страница (в том числе во вкладке, которую уже закрыли)
+        self._docs = {}     # вкладка → последний ответ сервера на загрузку её страницы
 
     def _nav(self, url):
         resp = self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -132,7 +146,8 @@ class Browser:
 
         self.log(f"запускаю браузер ({self.window})")
         self._pw = sync_playwright().start()
-        opts = dict(locale="ru-RU", timezone_id="Europe/Moscow", headless=self.window == "headless")
+        # песочница Chromium включена: без неё браузер пишет вверху «unsupported command-line flag: --no-sandbox»
+        opts = dict(locale="ru-RU", timezone_id="Europe/Moscow", headless=self.window == "headless", chromium_sandbox=True)
         if self.window == "headless":
             opts["viewport"] = {"width": 1440, "height": 900}
         else:
@@ -142,8 +157,35 @@ class Browser:
                                   # иначе Windows считает окно перекрытым и страница становится visibilityState=hidden
                                   "--disable-features=CalculateNativeWinOcclusion",
                                   "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding"])
-        self.ctx = self._pw.chromium.launch_persistent_context(str(PROFILES / self.site / "browser"), **opts)
+        profile = str(PROFILES / self.site / "browser")
+        try:
+            self.ctx = self._pw.chromium.launch_persistent_context(profile, **opts)
+        except Exception as e:
+            if "sandbox" not in str(e).lower():
+                raise
+            self.log("браузер не запустился с песочницей — запускаю без неё")
+            opts["chromium_sandbox"] = False
+            self.ctx = self._pw.chromium.launch_persistent_context(profile, **opts)
+        self.ctx.on("response", self._on_response)
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        self.mouse = human.Mouse(self.page, self.stop, Stopped)
+
+    def _on_response(self, resp):
+        try:
+            if resp.request.resource_type == "document" and resp.frame.parent_frame is None:
+                self._docs[resp.frame.page] = resp
+        except Exception:
+            pass
+
+    def raw_html(self):
+        """HTML, который прислал сервер на загрузку текущей страницы (до работы её скриптов), или None."""
+        r = self._docs.get(self.page)
+        if r is None or r.status != 200 or r.url.split("#")[0] != self.page.url.split("#")[0]:
+            return None
+        try:
+            return r.text()
+        except Exception:
+            return None
 
     def _place_window(self, left, top):
         try:
@@ -158,11 +200,15 @@ class Browser:
             self.log(f"не удалось переместить окно: {e}")
 
     def _humanize(self):
+        """Человек на только что открытой странице: ведёт мышью, немного листает."""
         try:
-            for _ in range(random.randint(2, 4)):
-                self.page.mouse.move(random.randint(200, 1100), random.randint(150, 700), steps=random.randint(8, 20))
-                self.page.mouse.wheel(0, random.randint(250, 700))
-                time.sleep(random.uniform(0.4, 1.1))
+            for _ in range(random.randint(1, 3)):
+                self.mouse.wander()
+                self.mouse.wait(random.uniform(0.2, 0.6))
+            self.mouse.wheel(random.randint(1, 4))
+            self.mouse.wait(random.uniform(0.4, 1.1))
+        except Stopped:
+            raise
         except Exception:
             pass
 
@@ -170,33 +216,134 @@ class Browser:
         if self.trace:
             self.trace(*a, **k)
 
-    def scroll_through(self, max_steps=40, step_pause=(0.4, 0.9)):
-        """Плавно прокручивает страницу до конца: сайты дорисовывают карточки по мере прокрутки."""
+    def scroll_through(self, max_bursts=80):
+        """Просматривает страницу до конца, как человек: серии прокрутки с паузами, иногда назад."""
         try:
-            for _ in range(max_steps):
-                self.page.mouse.wheel(0, random.randint(600, 900))
-                pause(step_pause, self.stop)
-                if self.page.evaluate("() => window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 80"):
-                    break
-            pause((0.8, 1.5), self.stop)
+            self.mouse.read_down(lambda: self.page.evaluate(
+                "() => window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 80"), max_bursts)
+            self.mouse.wait(random.uniform(0.8, 1.5))
         except Stopped:
             raise
         except Exception:
             pass
 
-    def goto(self, url, settle=(2.5, 5.0)):
+    def box(self, selector):
+        """Прямоугольник элемента в окне (для мыши) или None. Если элемент за краем окна — сначала
+        прокрутка к нему колёсиком, как это сделал бы человек."""
+        try:
+            el = self.page.query_selector(selector)
+            if el is None:
+                return None
+            for _ in range(30):
+                b = el.bounding_box()
+                if b is None:
+                    return None
+                vh = self.page.evaluate("() => window.innerHeight")
+                if b["y"] >= 70 and b["y"] + b["height"] <= vh - 40:
+                    return b
+                n = max(1, min(5, int(abs(b["y"] - vh * 0.45) / human.WHEEL_NOTCH)))
+                self.mouse.wheel(n if b["y"] > vh * 0.45 else -n)
+                self.mouse.wait(random.uniform(0.25, 0.7))
+            return el.bounding_box()
+        except Stopped:
+            raise
+        except Exception:
+            return None
+
+    def _before_request(self):
         self.start()
         if self._cooldown:
             # сразу после капчи сайт следит особенно внимательно — не торопимся со следующей страницей
             self._cooldown = False
             pause(self.COOLDOWN_AFTER_CAPTCHA, self.stop)
+
+    def goto(self, url, settle=(2.5, 5.0)):
+        self._before_request()
         t0 = time.time()
         self._nav(url)
+        return self._after_load(url, settle, t0)
+
+    def click_through(self, selector, url, arrived, settle=(2.5, 5.0), timeout=40):
+        """Переход, как у человека: курсор к ссылке selector и клик. arrived — условие на JS «открылась нужная
+        страница» (или страница капчи). Нет ссылки или переход не случился — обычная загрузка url."""
+        self._before_request()
+        b = self.box(selector)
+        if b is None:
+            return self.goto(url, settle)
+        t0 = time.time()
+        self._docs.pop(self.page, None)
+        self.mouse.click(b)
+        if not self._wait_js(arrived, timeout):
+            self.log("переход по ссылке не открыл нужную страницу — открываю её по адресу")
+            return self.goto(url, settle)
+        doc = self._docs.get(self.page)
+        self.last_status = doc.status if doc is not None else None
+        return self._after_load(url, settle, t0, "переход кликом по ссылке")
+
+    def open_tab(self, selector, url, settle=(2.5, 5.0)):
+        """Страница в новой вкладке, как у человека: клик по ссылке selector (объявления на Авито открываются
+        в новой вкладке), а если ссылки нет — новая вкладка по адресу url. Потом вкладка закрывается, и первая
+        вкладка (с выдачей) остаётся как была."""
+        self._before_request()
+        main, main_mouse = self.page, self.mouse
+        b = self.box(selector) if selector else None
+        t0, tab, note = time.time(), None, "новая вкладка"
+        if b is not None:
+            before = main.url
+            try:
+                with self.ctx.expect_page(timeout=15000) as info:
+                    self.mouse.click(b)
+                tab, note = info.value, "клик по карточке, новая вкладка"
+            except Stopped:
+                raise
+            except Exception:
+                if main.url != before:  # открылось в этой же вкладке
+                    doc = self._docs.get(main)
+                    self.last_status = doc.status if doc is not None else None
+                    return self._after_load(url, settle, t0, "клик по карточке")
+        opened = tab is not None
+        if tab is None:
+            tab = self.ctx.new_page()
+        self.page, self.mouse = tab, human.Mouse(tab, self.stop, Stopped)
+        try:
+            if opened:
+                tab.wait_for_load_state("domcontentloaded", timeout=60000)
+                doc = self._docs.get(tab)
+                self.last_status = doc.status if doc is not None else None
+            else:
+                self._nav(url)
+            return self._after_load(url, settle, t0, note)
+        finally:
+            self._docs.pop(tab, None)
+            try:
+                tab.close()
+            except Exception:
+                pass
+            self.page, self.mouse = main, main_mouse
+            try:
+                main.bring_to_front()
+            except Exception:
+                pass
+
+    def _wait_js(self, js, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if self.page.evaluate(js):
+                    return True
+            except Exception:
+                pass  # страница как раз меняется
+            pause((0.5, 0.5), self.stop)
+        return False
+
+    def _after_load(self, url, settle, t0, how=""):
+        """Общее для любой загрузки: дать странице догрузиться, проверить на капчу и ограничение IP."""
         pause(settle, self.stop)
         self._humanize()
         html = self.page.content()
+        moved = "" if self.page.url == url else f"→ {self.page.url}"
         self._trace("browser", "GET", url, self.last_status, round((time.time() - t0) * 1000), len(html),
-                    "" if self.page.url == url else f"→ {self.page.url}")
+                    " · ".join(x for x in (how, moved) if x))
         if self.is_blocked(html, self.page.url) and self.last_status not in (403, 429):
             # Иногда это «мягкая» проверка, которая проходит сама после перезагрузки (на 403/429 — нет: только капча)
             self.log("проверка безопасности — пробую перезагрузить")
@@ -204,23 +351,97 @@ class Browser:
             self._nav(url)
             pause(settle, self.stop)
             html = self.page.content()
-        if self.is_ip_banned(html, self.page.url) and "Проверка пройдена" not in html:
+        if self.is_ip_banned(html, self.page.url) and not self.check_passed():
             # Ограничение IP за частоту запросов: человек тут не поможет, нужна пауза (её делает парсер)
             self._trace("browser", "GET", url, self.last_status, None, len(html), "ограничение IP", html, "ограничение ip")
             raise IpBanned(self.page.url)
         if self.is_blocked(html, self.page.url):
-            self.captchas += 1
-            self._trace("browser", "GET", url, self.last_status, None, len(html), "капча", html, "капча")
-            if self.window == "headless":
-                raise Blocked("капча в режиме без окна — переключите «Окно браузера» на «скрытое» или «видимое»")
-            if self.window == "hidden":
-                self._place_window(80, 60)
-            self.log(f"⚠ НУЖНА РУЧНАЯ ПРОВЕРКА: пройдите капчу в окне браузера ({self.captcha_wait // 60} мин). "
-                     "После ввода окно само перейдёт на страницу — его не нужно обновлять")
-            html = self._wait_captcha(url, settle)
+            html = self._pass_captcha(url, settle, html)
             self._cooldown = True
-            if self.window == "hidden":
-                self._place_window(OFFSCREEN, OFFSCREEN)
+        self.last_url = self.page.url
+        return html
+
+    def check_passed(self):
+        """На экране «Проверка пройдена» — сайт сейчас сам откроет страницу. Проверяется только видимый текст:
+        в коде страницы Авито эта фраза заготовлена в скрипте всегда, даже пока капча не пройдена."""
+        try:
+            t = self.page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            return False
+        return self.PASSED_TEXT in t or "перенаправление" in t.lower()
+
+    def left_firewall(self):
+        """Страница капчи сменилась другой (капча пройдена)."""
+        try:
+            return not self.is_blocked(self.page.content(), self.page.url)
+        except Exception:
+            return False
+
+    def _pass_captcha(self, url, settle, html):
+        """На странице капча. Решатель проходит её сам (если сайт просит снова — до AUTO_ROUNDS раз подряд);
+        вид, который он не проходит, или неудача — человеку."""
+        what = ""
+        for _ in range(self.AUTO_ROUNDS if self.solver else 1):
+            self.captchas += 1
+            what = self.solver.describe(self.page) if self.solver else ""
+            self._trace("browser", "GET", url, self.last_status, None, len(html),
+                        "капча" + (f": {what}" if what else ""), html, "капча")
+            if not self.solver:
+                break
+            self.log(f"капча: {what}")
+            result, what = self.solver.solve(self)
+            if result != "solved":
+                self.log(f"капча «{what}» — " + ("такую программа сама не проходит" if result == "unsupported"
+                                                 else "пройти автоматически не удалось"))
+                break
+            self.solved += 1
+            self.log(f"капча «{what}» пройдена автоматически")
+            page_html = self._after_solve(url, settle)
+            if page_html is not None:
+                return page_html
+            html = self.page.content()
+            self.log("сайт снова показал капчу")
+        return self._ask_human(url, settle, what)
+
+    def _after_solve(self, url, settle):
+        """Решатель прошёл капчу: ждём, пока сайт сам откроет страницу. None — сайт снова показал капчу."""
+        end = time.time() + self.AFTER_SOLVE_WAIT_S
+        blocked_since = None
+        while time.time() < end:
+            pause((1, 1), self.stop)
+            try:
+                html, now_url = self.page.content(), self.page.url
+            except Exception:
+                continue
+            if self.check_passed():
+                blocked_since = None
+                continue
+            if self.is_blocked(html, now_url):
+                blocked_since = blocked_since or time.time()
+                if time.time() - blocked_since > 12:
+                    return None
+                continue
+            blocked_since = None
+            if self.is_ready(html, now_url):
+                self.log("проверка пройдена — страница открылась")
+                return html
+        self.log("сайт не открыл страницу после проверки — открываю её сам")
+        self._safe_nav(url, settle)
+        html = self.page.content()
+        return None if self.is_blocked(html, self.page.url) else html
+
+    def _ask_human(self, url, settle, what=""):
+        if self.window == "headless":
+            raise Blocked("капча в режиме без окна — переключите «Окно браузера» на «скрытое» или «видимое»")
+        if self.window == "hidden":
+            self._place_window(80, 60)
+        self.log(f"⚠ НУЖНА РУЧНАЯ ПРОВЕРКА: пройдите капчу в окне браузера ({self.captcha_wait // 60} мин). "
+                 "После ввода окно само перейдёт на страницу — его не нужно обновлять")
+        alerts.human_needed(f"{self.label}: нужна проверка",
+                            f"Пройдите капчу{f' ({what})' if what else ''} в окне браузера — сбор продолжится сам.")
+        html = self._wait_captcha(url, settle)
+        if self.window == "hidden":
+            self._place_window(OFFSCREEN, OFFSCREEN)
         return html
 
     def _wait_captcha(self, url, settle):
@@ -231,7 +452,6 @@ class Browser:
         end = time.time() + self.captcha_wait
         passed_at = unknown_at = None
         renavs = 0
-        alerts.captcha()  # звук, чтобы человек заметил окно с капчей (если звук не выключен)
         beeped = time.time()
         while time.time() < end:
             pause((2, 2), self.stop)
@@ -239,7 +459,7 @@ class Browser:
                 html, now_url = self.page.content(), self.page.url
             except Exception:
                 continue  # страница как раз переходит — читаем на следующем шаге
-            if "Проверка пройдена" in html or "перенаправление" in html.lower():
+            if self.check_passed():
                 passed_at = passed_at or time.time()
                 if time.time() - passed_at > self.REDIRECT_WAIT_S and renavs < 1:
                     self.log("сайт не перешёл сам после «Проверка пройдена» — открываю страницу один раз")
@@ -291,4 +511,4 @@ class Browser:
                 self._pw.stop()
         except Exception:
             pass
-        self.ctx = self._pw = self.page = None
+        self.ctx = self._pw = self.page = self.mouse = None
