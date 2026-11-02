@@ -1,0 +1,4 @@
+# Форк для macOS: переводы строк только LF. С CRLF скрипты на Mac не запускаются —
+# интерпретатор видит «/bin/bash^M» и говорит «bad interpreter».
+RealtyWatch_Mac/** text=auto eol=lf
+.github/workflows/*.yml text eol=lf

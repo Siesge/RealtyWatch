@@ -1,0 +1,51 @@
+# Проверка форка RealtyWatch_Mac на настоящем Mac (раннеры GitHub — железо Apple, Apple Silicon).
+# Эмулятор macOS на PC дал бы только Intel и программный рендеринг, здесь же всё по-настоящему:
+# доставка среды, тесты, сборка .app и запуск сервера.
+name: macOS
+
+on:
+  push:
+    paths: ["RealtyWatch_Mac/**", ".github/workflows/mac.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15          # Apple Silicon (M1); macos-26 — следующая версия системы
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: RealtyWatch_Mac
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Доставить среду (uv, Python, библиотеки, Chromium)
+        run: bash bin/bootstrap.sh
+
+      - name: Тесты
+        run: |
+          PY="$HOME/Library/Application Support/RealtyWatch/runtime/venv/bin/python"
+          "$PY" -m unittest discover -s tests -t . -v
+
+      - name: Собрать RealtyWatch.app
+        run: ./build_app.sh
+
+      - name: Приложение запускается и отвечает
+        run: |
+          PY="$HOME/Library/Application Support/RealtyWatch/runtime/venv/bin/python"
+          "$PY" -m app.main --server &
+          for i in $(seq 1 40); do
+            sleep 2
+            curl -fsS http://127.0.0.1:8765/api/settings > /dev/null && break
+          done
+          curl -fsS http://127.0.0.1:8765/api/settings | head -c 200
+          curl -fsS http://127.0.0.1:8765/ | grep -q RealtyWatch && echo "интерфейс отдаётся"
+          kill %1
+
+      - name: Журналы, если что-то пошло не так
+        if: failure()
+        run: cat "$HOME/Library/Application Support/RealtyWatch/logs/"*.log || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RealtyWatch-app
+          path: RealtyWatch_Mac/dist/RealtyWatch.app
