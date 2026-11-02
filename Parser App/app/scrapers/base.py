@@ -158,6 +158,7 @@ class Scraper:
                                    solver=self.captcha_solver(), blocked_js=self.BLOCKED_JS)
             self.browser.trace = self._trace
             self.browser.note = lambda msg: self.runlog.line(msg)
+            self.browser.keep = lambda body, reason, ext="html": self.runlog.snapshot(body, reason, ext)
         return self.browser
 
     def fetch(self, via_http, via_browser):

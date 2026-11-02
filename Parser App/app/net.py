@@ -124,6 +124,7 @@ class Browser:
         self._cooldown = False
         self.trace = None   # см. Http.trace
         self.note = lambda msg: None  # строка только в подробный журнал прогона
+        self.keep = lambda body, reason, ext="html": None  # сохранить страницу или картинку в logs/snapshots
         self.captchas = 0   # капч за время жизни браузера (прогон)
         self.solved = 0     # из них пройдено автоматически
         self.log = log

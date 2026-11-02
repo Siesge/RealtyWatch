@@ -70,17 +70,21 @@ class RunLog:
         self.line(" ".join(p for p in parts if p) + (f" — {note}" if note else ""))
 
     def snapshot(self, body, reason, ext="html"):
-        """Сохраняет страницу, на которой произошёл сбой. Возвращает имя файла."""
+        """Сохраняет страницу, на которой произошёл сбой (или картинку задания капчи). Возвращает имя файла."""
         if not body:
             return None
         SNAP_DIR.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^\w\-]+", "_", reason.lower())[:40].strip("_")
         name = f"{int(self.run_id):06d}_{self.source}_{datetime.now():%Y%m%d-%H%M%S}_{slug}.{ext}"
         try:
-            (SNAP_DIR / name).write_text(body[:SNAPSHOT_MAX_BYTES], encoding="utf-8")
+            if isinstance(body, bytes):
+                (SNAP_DIR / name).write_bytes(body[:SNAPSHOT_MAX_BYTES])
+            else:
+                (SNAP_DIR / name).write_text(body[:SNAPSHOT_MAX_BYTES], encoding="utf-8")
         except OSError:
             return None
-        self.line(f"📄 сохранена страница ({reason}): logs/snapshots/{name}")
+        what = "картинка" if isinstance(body, bytes) else "страница"
+        self.line(f"📄 сохранена {what} ({reason}): logs/snapshots/{name}")
         _prune(SNAP_DIR, "*.*", KEEP_SNAPSHOTS)
         return name
 

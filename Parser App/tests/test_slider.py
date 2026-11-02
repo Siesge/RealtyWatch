@@ -73,6 +73,14 @@ class GapFinder(unittest.TestCase):
             x, _ = captcha.find_gap(bg, piece)
             self.assertLessEqual(abs(x - gx), 2)
 
+    def test_finds_cutout_with_misleading_top(self):
+        """Верх кусочка подсказан неточно (рамка у элемента) или подсказок две — вырез всё равно находится."""
+        for seed in range(4):
+            bg, piece, gx, gy = make_puzzle(seed)
+            for top in (gy + 8, gy - 8, (gy, max(0, gy - 30))):
+                x, _ = captcha.find_gap(bg, piece, top=top)
+                self.assertLessEqual(abs(x - gx), 2, f"картинка {seed}, верх {top}: найдено x={x}, вырез x={gx}")
+
 
 # ---------- имитация Авито: страница «Доступ ограничен» и окно поверх выдачи, оба с окном GeeTest ----------
 # Как у настоящего GeeTest: задание приходит при загрузке страницы (до нажатия кнопки), у фона и кусочка одно
@@ -205,6 +213,7 @@ class SliderCaptcha(unittest.TestCase):
         alerts.human_needed = lambda title, text: self.asked.append(text)
         self.addCleanup(setattr, alerts, "human_needed", orig)
         self.log = []
+        self.kept = []  # что решатель сохранил в logs/snapshots
 
     def site(self, **kw):
         Site.state = dict({"type": "slide", "loads": 0, "verifies": 0, "clicks": 0, "fail_first": False, "auto_open": False,
@@ -214,6 +223,8 @@ class SliderCaptcha(unittest.TestCase):
         b = LocalBrowser("avito", lambda html, url: "js-firewall-form" in html, self.log.append, None,
                          captcha_wait_min=wait_min, is_ready=lambda html, url: 'data-marker="item"' in html,
                          label="Авито", solver=captcha.AvitoCaptcha(), blocked_js=captcha.OVERLAY_JS)
+        b.note = self.log.append  # подробный журнал прогона и снимки — их в приложении ведёт RunManager
+        b.keep = lambda body, reason, ext="html": self.kept.append((reason, ext, len(body)))
         self.addCleanup(b.close)
         return b
 
@@ -232,6 +243,10 @@ class SliderCaptcha(unittest.TestCase):
         self.assertTrue(any("пройдена автоматически" in m for m in self.log))
         self.assertEqual(Site.state["loads"], 2, "первое задание пришло при загрузке страницы, второе — после отказа")
         self.assertLessEqual(abs(Site.state["errors"][-1]), 4, f"кусочек не довели до выреза: {Site.state['errors']}")
+        note = next((m for m in self.log if m.startswith("пазл: ")), "")
+        self.assertRegex(note, r"вырез x=\d+ \(уверенность .+?\), довели с ошибкой -?[\d.]+ px")
+        self.assertEqual([(r, e) for r, e, _ in self.kept], [("пазл фон", "png"), ("пазл кусочек", "png")],
+                         "после отказа картинки задания сохраняются — по ним видно, где был вырез")
 
     def test_window_opened_by_site_is_not_reopened(self):
         self.site(auto_open=True)

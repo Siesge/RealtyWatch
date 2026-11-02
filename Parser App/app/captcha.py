@@ -116,6 +116,9 @@ def _tail(path):
 
 # ---------- где вырез под кусочек ----------
 
+SURE = 2.5  # уверенность, с которой вырез считается найденным (см. find_gap)
+
+
 def _edges(gray):
     """Сила перепадов яркости (оператор Собеля): |dx| + |dy|, обе стороны каждого перепада."""
     out = None
@@ -135,23 +138,24 @@ def _thin(points, limit):
 
 def find_gap(bg_bytes, piece_bytes, top=None):
     """Где на фоне вырез под кусочек пазла. Возвращает (x, уверенность): x — левый край кусочка в пикселях
-    картинки фона, уверенность — насколько лучший вариант выделяется среди остальных (≥ 2 — уверенно).
-    top — верх кусочка на фоне (по окну GeeTest), если известен; иначе ищется и по высоте.
-    Сравниваются контур кусочка с перепадами яркости фона и яркость внутри выреза с яркостью вокруг."""
+    картинки фона, уверенность — на сколько «сигм» лучший вариант выделяется среди остальных (≥ 2 — уверенно).
+    top — верх кусочка на фоне (по окну GeeTest, из задания); можно дать несколько вариантов — возьмётся
+    лучший, None — искать и по высоте. Складываются три признака: контур кусочка совпал с перепадами
+    яркости фона; внутри выреза яркость не такая, как вокруг; внутри выреза видна та же картинка, что на
+    кусочке, только затемнённая (это и есть вырез — признак самый надёжный, сравнивается по корреляции)."""
     bg = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
     piece = Image.open(io.BytesIO(piece_bytes)).convert("RGBA")
     W, H = bg.size
-    alpha = piece.getchannel("A")
-    bbox = alpha.point(lambda a: 255 if a >= 128 else 0).getbbox()
-    if not bbox:
+    w, h = piece.size
+    mask = piece.getchannel("A").point(lambda a: 255 if a >= 128 else 0)
+    if not mask.getbbox():
         raise ValueError("кусочек пазла пустой")
-    if piece.size[1] >= H * 0.9:  # кусочек во всю высоту фона — его верх уже на своём месте
-        top = 0
-    mask = alpha.point(lambda a: 255 if a >= 128 else 0)
+    tops = [t for t in (top if isinstance(top, (list, tuple, set)) else (top,)) if t is not None]
+    if h >= H * 0.9:  # кусочек во всю высоту фона — его верх уже на своём месте
+        tops = [0]
     inner = mask.filter(ImageFilter.MinFilter(7))
     outer = ImageChops.subtract(mask.filter(ImageFilter.MaxFilter(9)), mask)
     m, pin, pout = mask.load(), inner.load(), outer.load()
-    w, h = piece.size
     edge_pts, in_pts, out_pts = [], [], []
     for y in range(h):
         for x in range(w):
@@ -162,41 +166,69 @@ def find_gap(bg_bytes, piece_bytes, top=None):
                     in_pts.append((x, y))
             elif pout[x, y]:
                 out_pts.append((x, y))
-    edge_pts, in_pts, out_pts = _thin(edge_pts, 240), _thin(in_pts, 120), _thin(out_pts, 120)
+    edge_pts, in_pts, out_pts = _thin(edge_pts, 200), _thin(in_pts, 100), _thin(out_pts, 100)
+    pl = piece.convert("L").load()
+    pv = [pl[px, py] for px, py in in_pts]
+    n = len(pv)
+    mp = sum(pv) / n if n else 0.0
+    sp = _sd(sum(v * v for v in pv) / n - mp * mp) if n else 1.0
     gray = bg.convert("L")
     E, L = _edges(gray).load(), gray.load()
     x_max = W - w
-    spread = 1  # верх кусочка по окну GeeTest известен с точностью до пикселя
-    if top is None:  # грубо по высоте, потом точно
-        ys = range(0, max(1, H - h + 1), 3)
-        coarse = _thin(edge_pts, 120)
-        _, top = max(((sum(E[x + px, y + py] for px, py in coarse), y) for y in ys for x in range(0, x_max + 1, 2)))
-        spread = 2
-    top = int(round(top))
-    ys = [y for y in range(top - spread, top + spread + 1) if 0 <= y <= H - h] or [max(0, min(H - h, top))]
-    best = None
-    for y in ys:
-        e_sc, c_sc = [], []
-        for x in range(0, x_max + 1):
-            e_sc.append(sum(E[x + px, y + py] for px, py in edge_pts) / len(edge_pts))
-            if in_pts and out_pts:
-                li = sum(L[x + px, y + py] for px, py in in_pts) / len(in_pts)
-                lo = sum(L[x + px, y + py] for px, py in out_pts if 0 <= x + px < W and 0 <= y + py < H) / len(out_pts)
-                c_sc.append(abs(li - lo))
-            else:
-                c_sc.append(0.0)
-        score = [a + b for a, b in zip(_z(e_sc), [0.6 * v for v in _z(c_sc)])]
-        i = max(range(len(score)), key=score.__getitem__)
-        if best is None or score[i] > best[0]:
-            others = [s for k, s in enumerate(score) if abs(k - i) > w / 2]
-            best = (score[i], i, score[i] - max(others) if others else 9.0)
+
+    def coarse_top():
+        """Грубо: на какой высоте контур кусочка лучше всего ложится на перепады яркости фона."""
+        pts = _thin(edge_pts, 120)
+        _, y0 = max(((sum(E[x + px, y + py] for px, py in pts), y)
+                     for y in range(0, max(1, H - h + 1), 3) for x in range(0, x_max + 1, 2)))
+        return y0
+
+    def band(ts):
+        out = sorted({y for t in ts for y in range(int(round(t)) - 2, int(round(t)) + 3) if 0 <= y <= H - h})
+        return out or [max(0, min(H - h, int(round(ts[0]))))]
+
+    def scan(ys):
+        best = None
+        for y in ys:
+            e_sc, c_sc, r_sc = [], [], []
+            for x in range(x_max + 1):
+                e_sc.append(sum(E[x + px, y + py] for px, py in edge_pts) / len(edge_pts))
+                sb = sbb = spb = 0.0
+                for (px, py), p in zip(in_pts, pv):
+                    v = L[x + px, y + py]
+                    sb, sbb, spb = sb + v, sbb + v * v, spb + p * v
+                mb = sb / n if n else 0.0
+                r_sc.append((spb / n - mp * mb) / (sp * _sd(sbb / n - mb * mb)) if n else 0.0)
+                if n and out_pts:
+                    lo = sum(L[min(W - 1, max(0, x + px)), min(H - 1, max(0, y + py))] for px, py in out_pts) / len(out_pts)
+                    c_sc.append(abs(mb - lo))
+                else:
+                    c_sc.append(0.0)
+            score = [a + 0.6 * b + c for a, b, c in zip(_z(e_sc), _z(c_sc), _z(r_sc))]
+            i = max(range(len(score)), key=score.__getitem__)
+            if best is None or score[i] > best[0]:
+                others = [s for k, s in enumerate(score) if abs(k - i) > w / 2]
+                mu = sum(score) / len(score)
+                sd = _sd(sum(s * s for s in score) / len(score) - mu * mu)
+                best = (score[i], i, (score[i] - max(others)) / sd if others else 9.0)
+        return best
+
+    best = scan(band(tops or [coarse_top()]))
+    if tops and best[2] < SURE and H - h > 4:  # на вырез похоже слабо: верх подсказан неточно — ищем по всей высоте
+        wide = scan(band([coarse_top()]))
+        if wide[2] > best[2] + 1.0:  # подсказке верим, пока находка по всей высоте не заметно убедительнее
+            best = wide
     return best[1], round(best[2], 2)
+
+
+def _sd(var):
+    return max(0.0, var) ** 0.5 or 1.0
 
 
 def _z(v):
     n = len(v)
     mu = sum(v) / n
-    sd = (sum((a - mu) ** 2 for a in v) / n) ** 0.5 or 1.0
+    sd = _sd(sum((a - mu) ** 2 for a in v) / n)
     return [(a - mu) / sd for a in v]
 
 
@@ -326,7 +358,7 @@ class AvitoCaptcha:
                 return ("solved" if ok else "failed"), what
             if gt != "slide":
                 return "unsupported", what
-            res = self._slide(b, rec, task)
+            res = self._slide(b, rec, task, keep=attempt == 1)
             if res == "success" or b.left_firewall():
                 return "solved", what
             b.log(f"пазл не принят ({attempt} из {self.TRIES}){'' if res == 'fail' else ': ' + res}")
@@ -335,8 +367,9 @@ class AvitoCaptcha:
             b.mouse.wait(random.uniform(0.8, 2.0))  # GeeTest показывает «не удалось» и меняет картинку
         return "failed", what
 
-    def _slide(self, b, rec, task):
-        """Одна попытка собрать пазл: 'success' | 'fail' | причина, почему попытки не было."""
+    def _slide(self, b, rec, task, keep=False):
+        """Одна попытка собрать пазл: 'success' | 'fail' | причина, почему попытки не было.
+        keep — сохранить картинки задания, если пазл не приняли (чтобы потом разобраться, где был вырез)."""
         bg, piece = rec.body(task.get("bg")), rec.body(task.get("slice"))
         if not bg or not piece:
             return "картинки задания не получены"
@@ -357,15 +390,33 @@ class AvitoCaptcha:
             b.page.wait_for_timeout(200)
         if not el or not el.get("bg") or not el.get("btn") or not el.get("slice"):
             return "не найдено окно с пазлом"
-        bw, bh = Image.open(io.BytesIO(bg)).size
+        (bw, bh), pw = Image.open(io.BytesIO(bg)).size, Image.open(io.BytesIO(piece)).size[0]
         sx, sy = el["bg"]["width"] / bw, el["bg"]["height"] / bh
-        top = (el["slice"]["y"] - el["bg"]["y"]) / sy if sy else task.get("ypos")
-        gap, conf = find_gap(bg, piece, top=top if top is not None and top >= 0 else task.get("ypos"))
+        # верх кусочка на фоне: по окну GeeTest и из самого задания — find_gap возьмёт тот, что подойдёт лучше
+        shown = (el["slice"]["y"] - el["bg"]["y"]) / sy if sy else None
+        tops = [t for t in (shown, task.get("ypos")) if isinstance(t, (int, float)) and t >= 0]
+        gap, conf = find_gap(bg, piece, top=tops or None)
         target = el["bg"]["x"] + gap * sx
         b.mouse.wait(random.uniform(0.6, 1.6))  # человек сначала смотрит на картинку
         b.mouse.drag(el["btn"], target - el["slice"]["x"],
                      position=lambda: b.page.evaluate(_SLICE_X_JS, names["slice"]), target=target)
+        off = self._off(b, names, target, sx)
         verdict = rec.wait_json("/verify", 10)
         result = (verdict or {}).get("result")
-        b.note(f"пазл: вырез x={gap} (уверенность {conf}), GeeTest ответил: {result or 'нет ответа'}")
+        b.note(f"пазл: картинка {bw}×{bh} в окне {round(el['bg']['width'])} px (×{round(sx, 2)}), кусочек {pw} px, "
+               f"верх {'—' if shown is None else round(shown)} (в задании {task.get('ypos', '—')}), "
+               f"вырез x={gap} (уверенность {conf}{'' if conf >= SURE else ', мало'}), "
+               f"довели с ошибкой {'—' if off is None else off} px, GeeTest ответил: {result or 'нет ответа'}")
+        if keep and result != "success":  # разобраться потом, где на картинке был вырез
+            b.keep(bg, "пазл фон", "png")
+            b.keep(piece, "пазл кусочек", "png")
         return "success" if result == "success" else "fail" if result == "fail" or verdict is None else str(result)
+
+    @staticmethod
+    def _off(b, names, target, sx):
+        """На сколько пикселей картинки кусочек не доехал до выреза (сколько видно на экране)."""
+        try:
+            cur = b.page.evaluate(_SLICE_X_JS, names["slice"])
+            return round((cur - target) / sx, 1) if cur is not None and sx else None
+        except Exception:
+            return None

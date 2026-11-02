@@ -5,7 +5,8 @@
 уменьшается с размером цели (закон Фиттса). Ползунок тянется с быстрым началом и медленным концом, с лёгким
 дрожанием по вертикали; в конце рука «доводит» его по тому, что видит. Прокрутка — неровными сериями
 щелчков колёсика с паузами, будто человек просматривает выдачу, изредка немного назад.
-События уходят по одному, 60–120 в секунду, — как от настоящей мыши."""
+События уходят по одному, 40–70 в секунду, — как от настоящей мыши. Чаще не выходит: одно событие
+Windows отдаёт браузеру за 15–30 мс, и если просить больше, движение просто растягивается во времени."""
 import math
 import random
 import time
@@ -88,7 +89,7 @@ class Mouse:
             self._emit(x, y)
             return
         dur = (0.1 + 0.12 * math.log2(dist / max(size, 4.0) + 1)) * random.uniform(0.85, 1.2)
-        steps = max(6, int(dur / random.uniform(0.008, 0.016)))
+        steps = max(6, int(dur / random.uniform(0.014, 0.024)))
         dur *= TIME_SCALE
         nx, ny = -(y - y0) / dist, (x - x0) / dist  # поперёк пути — туда изгибается дуга
         bend = random.uniform(-0.2, 0.2) * min(dist, 400)
@@ -138,9 +139,9 @@ class Mouse:
                 return
 
     def drag(self, box, dx, position=None, target=None):
-        """Тянет ползунок box вправо на dx пикселей и отпускает. position() — где сейчас то, что двигает
-        ползунок (кусочек пазла), target — где оно должно оказаться: в конце рука доводит по тому, что видит.
-        Возвращает, на сколько сдвинута ручка."""
+        """Тянет ползунок box вправо на dx пикселей и отпускает — одним уверенным движением за полсекунды-секунду,
+        как человек. position() — где сейчас то, что двигает ползунок (кусочек пазла), target — где оно должно
+        оказаться: в конце рука доводит его по тому, что видит. Возвращает, на сколько сдвинута ручка."""
         x, y = point_in({"x": box["x"] + box["width"] * 0.25, "y": box["y"] + box["height"] * 0.2,
                          "width": box["width"] * 0.5, "height": box["height"] * 0.6})
         self.move_to(x, y, min(box["width"], box["height"]))
@@ -151,8 +152,8 @@ class Mouse:
         sx, sy = self.x, self.y
         over = random.uniform(2.0, 6.0) if random.random() < 0.6 else 0.0
         total = dx + over
-        dur = random.uniform(0.45, 0.75) + abs(total) / random.uniform(350, 550)
-        steps = max(18, int(dur / random.uniform(0.010, 0.016)))
+        dur = random.uniform(0.3, 0.5) + abs(total) / random.uniform(500, 850)
+        steps = max(14, int(dur / random.uniform(0.018, 0.028)))
         dur *= TIME_SCALE
         yoff, yvel, paused = 0.0, random.uniform(-0.05, 0.05), False
         t0 = time.monotonic()
@@ -160,8 +161,8 @@ class Mouse:
             t = i / steps
             yvel = 0.85 * yvel + random.gauss(0, 0.06)
             yoff = max(-3.0, min(3.0, yoff + yvel))
-            # быстрое начало, долгое плавное торможение к цели
-            self._emit(sx + total * _ease(t ** 0.75) + random.uniform(-0.3, 0.3), sy + yoff)
+            # быстрое начало, плавное торможение к цели
+            self._emit(sx + total * _ease(t ** 0.8) + random.uniform(-0.3, 0.3), sy + yoff)
             if not paused and 0.35 < t < 0.7 and random.random() < 0.04:
                 paused, t0 = True, t0 + random.uniform(0.04, 0.12) * TIME_SCALE  # рука на миг замедлилась
             self._until(t0 + dur * t)
@@ -170,10 +171,9 @@ class Mouse:
             self.wait(random.uniform(0.06, 0.18))
             moved = self._nudge(sx, sy + yoff, moved, -over)
         if position and target is not None and start is not None:
-            for _ in range(2):
-                self.wait(random.uniform(0.08, 0.2))
-                cur = position()
-                if cur is None or abs(target - cur) <= 1.0:
+            for _ in range(3):
+                cur = self._settled(position)
+                if cur is None or abs(target - cur) <= 0.6:
                     break
                 ratio = (cur - start) / moved if abs(moved) > 5 else 1.0  # кусочек может ехать не 1:1 с ручкой
                 moved = self._nudge(sx, sy + yoff, moved, (target - cur) / max(0.5, min(1.5, ratio or 1.0)))
@@ -181,9 +181,20 @@ class Mouse:
         self.page.mouse.up()
         return moved
 
+    def _settled(self, position):
+        """Где то, что двигает ползунок, когда оно остановилось: сайт может доводить его сам, с задержкой."""
+        cur = position()
+        for _ in range(4):
+            self.wait(random.uniform(0.05, 0.09))
+            nxt = position()
+            if nxt is None or cur is None or abs(nxt - cur) < 0.3:
+                return nxt
+            cur = nxt
+        return cur
+
     def _nudge(self, sx, y, moved, delta):
         """Небольшая поправка ручки ползунка на delta пикселей."""
-        steps, dur = random.randint(6, 12), random.uniform(0.12, 0.3) * TIME_SCALE
+        steps, dur = random.randint(4, 8), random.uniform(0.07, 0.16) * TIME_SCALE
         t0 = time.monotonic()
         for i in range(1, steps + 1):
             self._emit(sx + moved + delta * _ease(i / steps) + random.uniform(-0.2, 0.2), y + random.uniform(-0.4, 0.4))
