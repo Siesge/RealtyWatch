@@ -35,10 +35,15 @@ _LD_ID = re.compile(r"_(\d+)/?$")
 # Карточки вне результатов поиска: карусели рекомендаций («Вам может понравиться» и т.п.)
 _SERP_CARDS = '//*[@data-marker="item"][not(ancestor::*[contains(@data-marker, "arousel")])]'
 PER_PAGE = 50
-# Открыта страница выдачи номер N (текущая страница в переключателе — не ссылка) или страница капчи
+# Открыта страница выдачи номер N (текущая страница в переключателе — не ссылка)
 _ON_PAGE_JS = """() => document.readyState !== 'loading' && !!document.querySelector('[data-marker="pagination-button/page(%d)"]:not(a)')"""
-_ARRIVED_JS = """() => document.readyState !== 'loading' && (!!document.querySelector('[data-marker="pagination-button/page(%d)"]:not(a)')
-  || !!document.querySelector('.js-firewall-form') || document.title.indexOf('Доступ ограничен') >= 0)"""
+
+
+def _arrived_js(page):
+    """Открылась страница выдачи номер page, страница проверки или окно проверки поверх страницы."""
+    return ("() => document.readyState !== 'loading' && (!!document.querySelector('[data-marker=\"pagination-button/page(%d)\"]:not(a)')"
+            " || !!document.querySelector('.js-firewall-form') || document.title.indexOf('Доступ ограничен') >= 0"
+            " || (%s)())" % (page, captcha.OVERLAY_JS))
 
 _TITLE = re.compile(r"(?:(\d+)-к\.|(студия)|(своб\. планировка))[^,]*,\s*([\d\s,\.]+)\s*м²(?:,\s*(\d+)/(\d+)\s*эт)?", re.I)
 
@@ -98,6 +103,8 @@ class Avito(Scraper):
     # Счётчик «N объявлений» у Авито включает соседние города и не совпадает с выдачей — по нему полноту не проверяем
     MIN_COVERAGE = None
     AUTO_BROWSER = True
+    # Окно «Доступ ограничен» поверх выдачи (страница приходит с кодом 439): по HTML не отличить от заготовки
+    BLOCKED_JS = captcha.OVERLAY_JS
     detail_fields = ("lat", "lon", "address", "description", "renovation", "renovation_raw", "building_type",
                      "build_year", "floors", "living_area", "kitchen_area", "details_fetched", "published_at")
 
@@ -143,11 +150,12 @@ class Avito(Scraper):
         def via_browser(b):
             if page > 1 and b.page is not None and self._showing(b, page - 1):
                 # человек листает выдачу кнопкой «Следующая страница», а не набирает адрес
-                b.click_through('a[data-marker="pagination-button/nextPage"]', url, _ARRIVED_JS % page)
+                b.click_through('a[data-marker="pagination-button/nextPage"]', url, _arrived_js(page))
             else:
                 b.goto(url)
             raw = b.raw_html()
             b.scroll_through()  # просмотреть выдачу до конца, как человек
+            b.clear_overlay(url)  # окно проверки может появиться и посреди просмотра
             return b.page.content(), raw
         return self.fetch(lambda: (self.http.get(url).text, None), via_browser)
 

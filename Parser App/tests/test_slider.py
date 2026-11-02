@@ -74,31 +74,29 @@ class GapFinder(unittest.TestCase):
             self.assertLessEqual(abs(x - gx), 2)
 
 
-# ---------- имитация страницы Авито «Доступ ограничен» с окном GeeTest ----------
+# ---------- имитация Авито: страница «Доступ ограничен» и окно поверх выдачи, оба с окном GeeTest ----------
+# Как у настоящего GeeTest: задание приходит при загрузке страницы (до нажатия кнопки), у фона и кусочка одно
+# имя файла в папках bg/ и slice/, после неудачи — новое задание.
 
-FIREWALL = """<html><head><title>Доступ ограничен: проблема с IP</title></head><body>
-<form class="js-firewall-form"><div id="h-captcha" style="display: none">галочка</div>
-<fieldset id="inner-captcha" style="display: none"><img class="js-form-captcha-image" alt=""></fieldset>
-<div id="geetest_captcha" style="display: none"><p>Иногда IP выглядит необычно, поэтому нужно пройти простую проверку.</p></div>
-<div class="form-action"><button type="button" name="submit">Пройти проверку</button></div></form>
-<script>
-function showRedirectMessage() { document.querySelector('.form-action').innerHTML = '<p>Проверка пройдена, перенаправление...</p>'; }
+GT = """
 const RATIO = 0.9;  // кусочек едет медленнее ручки
-let LOT = null, start = null, btnX = 0;
+let TASK = null, start = null, btnX = 0;
 function jsonp(url) { return new Promise(res => { const cb = 'geetest_' + Date.now() + Math.floor(Math.random() * 1000);
   window[cb] = d => { delete window[cb]; res(d); }; const s = document.createElement('script'); s.src = url + '&callback=' + cb; document.head.appendChild(s); }); }
-async function load() { const r = await jsonp('/gt/load?captcha_id=test'); LOT = r.data.lot_number; render(r.data); }
+async function fetchTask() { TASK = (await jsonp('/gt/load?captcha_id=test')).data; return TASK; }
+const ready = fetchTask();
+async function openPopup() { await ready; render(TASK); }
 function place() { document.querySelector('.geetest_btn').style.left = btnX + 'px'; document.querySelector('.geetest_slice').style.left = (btnX * RATIO) + 'px'; }
 function render(d) {
   let wrap = document.querySelector('.geetest_box_wrap');
   if (!wrap) {
-    wrap = document.createElement('div'); wrap.className = 'geetest_box_wrap';
-    wrap.innerHTML = '<div class="geetest_box" style="position:fixed;left:260px;top:120px;width:300px;padding:20px;background:#fff">' +
+    wrap = document.createElement('div'); wrap.className = 'geetest_box_wrap_x1 geetest_box_wrap';
+    wrap.innerHTML = '<div class="geetest_box_x1 geetest_box" style="position:fixed;left:260px;top:120px;width:300px;padding:20px;background:#fff;z-index:20000">' +
       '<div class="geetest_wrap" style="position:relative;width:300px;height:200px;overflow:hidden">' +
-      '<div class="geetest_bg" style="position:absolute;left:0;top:0;width:300px;height:200px;background-size:100% 100%"></div>' +
-      '<div class="geetest_slice" style="position:absolute;left:0;top:0"><div class="geetest_slice_bg" style="background-size:100% 100%"></div></div></div>' +
+      '<div class="geetest_bg_x1 geetest_bg" style="position:absolute;left:0;top:0;width:300px;height:200px;background-size:100% 100%"></div>' +
+      '<div class="geetest_slice" style="position:absolute;left:0;top:0"><div class="geetest_slice_bg_x1 geetest_slice_bg" style="background-size:100% 100%"></div></div></div>' +
       '<div class="geetest_track" style="position:relative;width:300px;height:44px;margin-top:12px;background:#eee">' +
-      '<div class="geetest_btn" style="position:absolute;left:0;top:2px;width:52px;height:40px;background:#39f;cursor:pointer"></div></div></div>';
+      '<div class="geetest_btn_x1 geetest_btn" style="position:absolute;left:0;top:2px;width:52px;height:40px;background:#39f;cursor:pointer"></div></div></div>';
     document.body.appendChild(wrap);
     wrap.querySelector('.geetest_btn').addEventListener('mousedown', e => { start = e.clientX - btnX; e.preventDefault(); });
     document.addEventListener('mousemove', e => { if (start === null) return; btnX = Math.max(0, Math.min(248, e.clientX - start)); place(); });
@@ -114,12 +112,35 @@ function render(d) {
 }
 async function verify() {
   const x = parseFloat(document.querySelector('.geetest_slice').style.left);
-  const r = await jsonp('/gt/verify?captcha_id=test&lot_number=' + LOT + '&x=' + x.toFixed(1));
-  if (r.data.result === 'success') { showRedirectMessage(); document.cookie = 'st=ok; path=/'; setTimeout(() => location.reload(), 300); }
-  else setTimeout(load, 700);  // как GeeTest: после неудачи — новое задание
+  const r = await jsonp('/gt/verify?captcha_id=test&lot_number=' + TASK.lot_number + '&x=' + x.toFixed(1));
+  if (r.data.result === 'success') passed();
+  else setTimeout(async () => render(await fetchTask()), 700);
 }
-setTimeout(() => { document.getElementById('geetest_captcha').style.display = 'inline-block'; }, 500);
-document.querySelector('button[name=submit]').addEventListener('click', load);
+"""
+
+FIREWALL = """<html><head><title>Доступ ограничен: проблема с IP</title></head><body>
+<form class="js-firewall-form"><div id="h-captcha" style="display: none">галочка</div>
+<fieldset id="inner-captcha" style="display: none"><img class="js-form-captcha-image" alt=""></fieldset>
+<div id="geetest_captcha" style="display: none"><p>Иногда IP выглядит необычно, поэтому нужно пройти простую проверку.</p></div>
+<div class="form-action"><button type="button" name="submit">Пройти проверку</button></div></form>
+<script>%s
+const AUTO_OPEN = %s;
+function passed() { document.querySelector('.form-action').innerHTML = '<p>Проверка пройдена, перенаправление...</p>';
+  document.cookie = 'st=ok; path=/'; setTimeout(() => location.reload(), 300); }
+setTimeout(() => { document.getElementById('geetest_captcha').style.display = 'inline-block'; if (AUTO_OPEN) openPopup(); }, 500);
+document.querySelector('button[name=submit]').addEventListener('click', () => { fetch('/clicked'); openPopup(); });
+</script></body></html>"""
+
+OVERLAY = """<html><head><title>Купить квартиру в Ялте</title></head><body>
+<span data-marker="page-title/count">1</span><div data-marker="catalog-serp"><div data-marker="item" data-item-id="1">1</div></div>
+<div data-marker="portals-container"><div role="region" style="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:10000">
+<div aria-modal="true" role="dialog" style="position:absolute;left:300px;top:80px;width:500px;background:#fff;padding:24px">
+<h2>Доступ ограничен: проблема с IP</h2><p>Иногда такое случается, чтобы вернуться на сайт нажмите на кнопку Продолжить для решения капчи</p>
+<form><button type="submit">Продолжить</button></form></div></div></div>
+<script>%s
+function passed() { document.querySelector('[data-marker="portals-container"]').remove(); document.cookie = 'st=ok; path=/';
+  setTimeout(() => location.reload(), 300); }
+document.querySelector('[role=dialog] form').addEventListener('submit', e => { e.preventDefault(); fetch('/clicked'); openPopup(); });
 </script></body></html>"""
 CONTENT = '<html><body><span data-marker="page-title/count">1</span><div data-marker="item">1</div></body></html>'
 
@@ -130,9 +151,9 @@ class Site(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, body, ctype="text/html; charset=utf-8"):
+    def _send(self, body, ctype="text/html; charset=utf-8", status=200):
         data = body if isinstance(body, bytes) else body.encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.end_headers()
         self.wfile.write(data)
@@ -140,15 +161,21 @@ class Site(BaseHTTPRequestHandler):
     def do_GET(self):
         st, u = self.state, urlsplit(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        passed = "st=ok" in (self.headers.get("Cookie") or "")
         if u.path == "/search":
-            return self._send(CONTENT if "st=ok" in (self.headers.get("Cookie") or "") else FIREWALL)
+            return self._send(CONTENT) if passed else self._send(FIREWALL % (GT, "true" if st["auto_open"] else "false"), status=429)
+        if u.path == "/search439":
+            return self._send(CONTENT) if passed else self._send(OVERLAY % GT, status=439)
+        if u.path == "/clicked":
+            st["clicks"] += 1
+            return self._send("")
         if u.path == "/gt/load":
             st["loads"] += 1
             lot = f"lot{st['loads']}"
             bg, piece, gx, gy = make_puzzle(st["loads"] + 7)
             st["puzzles"][lot] = (bg, piece, gx)
-            data = {"lot_number": lot, "captcha_type": st["type"], "bg": f"pictures/bg_{lot}.png",
-                    "slice": f"pictures/slice_{lot}.png", "ypos": gy, "bg_w": W, "slice_w": P}
+            data = {"lot_number": lot, "captcha_type": st["type"], "bg": f"geetest/captcha_v4/{lot}/bg/p{lot}.png",
+                    "slice": f"geetest/captcha_v4/{lot}/slice/p{lot}.png", "ypos": gy, "bg_w": W, "slice_w": P}
             return self._send(f'{q["callback"]}({json.dumps({"status": "success", "data": data})})', "application/javascript")
         if u.path == "/gt/verify":
             st["verifies"] += 1
@@ -157,11 +184,10 @@ class Site(BaseHTTPRequestHandler):
             st["errors"].append(round(float(q["x"]) * W / SHOWN_W - gx, 1))
             return self._send(f'{q["callback"]}({{"status": "success", "data": {{"result": "{"success" if ok else "fail"}"}}}})',
                               "application/javascript")
-        if u.path.startswith("/pictures/"):
-            name = u.path.rsplit("/", 1)[-1]
-            lot = name.split("_", 1)[1].rsplit(".", 1)[0]
+        if u.path.startswith("/geetest/captcha_v4/"):
+            _, _, _, lot, kind, _ = u.path.split("/")
             bg, piece, _ = st["puzzles"][lot]
-            return self._send(bg if name.startswith("bg_") else piece, "image/png")
+            return self._send(bg if kind == "bg" else piece, "image/png")
         self.send_response(404)
         self.end_headers()
 
@@ -180,18 +206,22 @@ class SliderCaptcha(unittest.TestCase):
         self.addCleanup(setattr, alerts, "human_needed", orig)
         self.log = []
 
+    def site(self, **kw):
+        Site.state = dict({"type": "slide", "loads": 0, "verifies": 0, "clicks": 0, "fail_first": False, "auto_open": False,
+                           "puzzles": {}, "errors": []}, **kw)
+
     def browser(self, wait_min=1.0):
         b = LocalBrowser("avito", lambda html, url: "js-firewall-form" in html, self.log.append, None,
                          captcha_wait_min=wait_min, is_ready=lambda html, url: 'data-marker="item"' in html,
-                         label="Авито", solver=captcha.AvitoCaptcha())
+                         label="Авито", solver=captcha.AvitoCaptcha(), blocked_js=captcha.OVERLAY_JS)
         self.addCleanup(b.close)
         return b
 
-    def open(self, b):
-        return b.goto(f"http://127.0.0.1:{self.srv.server_port}/search", settle=(0.3, 0.3))
+    def open(self, b, path="/search"):
+        return b.goto(f"http://127.0.0.1:{self.srv.server_port}{path}", settle=(0.3, 0.3))
 
     def test_solves_slider_itself(self):
-        Site.state = {"type": "slide", "loads": 0, "verifies": 0, "fail_first": True, "puzzles": {}, "errors": []}
+        self.site(fail_first=True)
         b = self.browser()
         html = self.open(b)
         self.assertIn('data-marker="item"', html, "после пазла должна открыться выдача")
@@ -200,10 +230,30 @@ class SliderCaptcha(unittest.TestCase):
         self.assertIn("капча: GeeTest", self.log)
         self.assertTrue(any("пазл не принят (1 из 3)" in m for m in self.log), "после отказа — новая попытка")
         self.assertTrue(any("пройдена автоматически" in m for m in self.log))
+        self.assertEqual(Site.state["loads"], 2, "первое задание пришло при загрузке страницы, второе — после отказа")
         self.assertLessEqual(abs(Site.state["errors"][-1]), 4, f"кусочек не довели до выреза: {Site.state['errors']}")
 
+    def test_window_opened_by_site_is_not_reopened(self):
+        self.site(auto_open=True)
+        b = self.browser()
+        html = self.open(b)
+        self.assertIn('data-marker="item"', html)
+        self.assertEqual(b.solved, 1)
+        self.assertEqual(Site.state["clicks"], 0, "окно GeeTest уже открыто сайтом — кнопку «Пройти проверку» не нажимаем")
+
+    def test_window_over_search_page(self):
+        self.site()
+        b = self.browser()
+        html = self.open(b, "/search439")
+        self.assertIn('data-marker="item"', html)
+        self.assertNotIn("Доступ ограничен", html, "окно поверх выдачи пройдено")
+        self.assertEqual((b.captchas, b.solved), (1, 1))
+        self.assertIn("капча: GeeTest в окне поверх страницы", self.log)
+        self.assertEqual(Site.state["clicks"], 1, "нажата «Продолжить» в окне поверх выдачи")
+        self.assertEqual(self.asked, [])
+
     def test_other_kind_goes_to_human(self):
-        Site.state = {"type": "icon", "loads": 0, "verifies": 0, "fail_first": False, "puzzles": {}, "errors": []}
+        self.site(type="icon")
         b = self.browser(wait_min=0.05)
         with self.assertRaises(Blocked):
             self.open(b)
@@ -212,3 +262,4 @@ class SliderCaptcha(unittest.TestCase):
         self.assertIn("иконки по порядку", self.asked[0])
         self.assertTrue(any("такую программа сама не проходит" in m for m in self.log))
         self.assertTrue(any("НУЖНА РУЧНАЯ ПРОВЕРКА" in m for m in self.log))
+

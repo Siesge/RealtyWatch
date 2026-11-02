@@ -110,10 +110,13 @@ class Browser:
     PASSED_TEXT = "Проверка пройдена"
 
     def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10, is_ip_banned=None,
-                 is_ready=None, label=None, solver=None):
+                 is_ready=None, label=None, solver=None, blocked_js=None):
         self.site = site
         self.label = label or site
         self.is_blocked = is_blocked
+        # blocked_js: условие на JS «страницу закрывает окно проверки» — сайт может показать капчу поверх обычной
+        # страницы, и по HTML это не понять (такое окно бывает заготовлено скрытым)
+        self.blocked_js = blocked_js
         self.is_ip_banned = is_ip_banned or (lambda html, url: False)
         # is_ready(html, url): на странице уже нужное содержимое (выдача, объявление), а не промежуточная заглушка
         self.is_ready = is_ready or (lambda html, url: True)
@@ -134,6 +137,7 @@ class Browser:
         self.last_status = None
         self.last_url = None  # где оказалась последняя открытая страница (в том числе во вкладке, которую уже закрыли)
         self._docs = {}     # вкладка → последний ответ сервера на загрузку её страницы
+        self._gt = {}       # вкладка → ответы GeeTest (задание, картинки, итог) с момента загрузки её страницы
 
     def _nav(self, url):
         resp = self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -157,6 +161,10 @@ class Browser:
                                   # иначе Windows считает окно перекрытым и страница становится visibilityState=hidden
                                   "--disable-features=CalculateNativeWinOcclusion",
                                   "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding"])
+            # Флаг --disable-blink-features=AutomationControlled (его ставит patchright) нужен: без него
+            # navigator.webdriver = true. Но Chromium показывает над страницей полосу «unsupported command-line flag»,
+            # и окно становится на ~50 px ниже обычного. --test-type убирает полосу, сайту он не виден.
+            opts["args"].append("--test-type")
         profile = str(PROFILES / self.site / "browser")
         try:
             self.ctx = self._pw.chromium.launch_persistent_context(profile, **opts)
@@ -172,10 +180,40 @@ class Browser:
 
     def _on_response(self, resp):
         try:
+            url = resp.url
             if resp.request.resource_type == "document" and resp.frame.parent_frame is None:
                 self._docs[resp.frame.page] = resp
+                self._gt[resp.frame.page] = []  # новая страница — прежние задания GeeTest к ней не относятся
+            elif "geetest" in url or ("captcha_id=" in url and ("/load" in url or "/verify" in url)):
+                # Задание GeeTest страница может получить сразу при загрузке, ещё до нажатия «Пройти проверку»,
+                # поэтому ответы запоминаются всё время, а не только пока решатель работает
+                got = self._gt.setdefault(resp.frame.page, [])
+                got.append(resp)
+                del got[:-200]
         except Exception:
             pass
+
+    def gt_responses(self):
+        """Ответы GeeTest текущей вкладки (задания, картинки, итоги проверок) с момента загрузки её страницы."""
+        return self._gt.get(self.page, [])
+
+    def overlay(self):
+        """Страницу закрывает окно проверки (капча поверх обычной страницы)."""
+        if not self.blocked_js or self.page is None:
+            return False
+        try:
+            return bool(self.page.evaluate(self.blocked_js))
+        except Exception:
+            return False
+
+    def _blocked(self, html, url):
+        return self.is_blocked(html, url) or self.overlay()
+
+    def clear_overlay(self, url, settle=(2.5, 5.0)):
+        """Если страницу закрыло окно проверки (сайт показывает его и посреди просмотра), пройти его."""
+        if self.overlay():
+            self._pass_captcha(url, settle, self.page.content())
+            self._cooldown = True
 
     def raw_html(self):
         """HTML, который прислал сервер на загрузку текущей страницы (до работы её скриптов), или None."""
@@ -267,6 +305,7 @@ class Browser:
         """Переход, как у человека: курсор к ссылке selector и клик. arrived — условие на JS «открылась нужная
         страница» (или страница капчи). Нет ссылки или переход не случился — обычная загрузка url."""
         self._before_request()
+        self.clear_overlay(self.page.url, settle)  # клик по ссылке под окном проверки попал бы в окно
         b = self.box(selector)
         if b is None:
             return self.goto(url, settle)
@@ -286,6 +325,8 @@ class Browser:
         вкладка (с выдачей) остаётся как была."""
         self._before_request()
         main, main_mouse = self.page, self.mouse
+        if selector:
+            self.clear_overlay(main.url, settle)  # клик по карточке под окном проверки попал бы в окно
         b = self.box(selector) if selector else None
         t0, tab, note = time.time(), None, "новая вкладка"
         if b is not None:
@@ -344,8 +385,8 @@ class Browser:
         moved = "" if self.page.url == url else f"→ {self.page.url}"
         self._trace("browser", "GET", url, self.last_status, round((time.time() - t0) * 1000), len(html),
                     " · ".join(x for x in (how, moved) if x))
-        if self.is_blocked(html, self.page.url) and self.last_status not in (403, 429):
-            # Иногда это «мягкая» проверка, которая проходит сама после перезагрузки (на 403/429 — нет: только капча)
+        if self._blocked(html, self.page.url) and self.last_status not in (403, 429, 439):
+            # Иногда это «мягкая» проверка, которая проходит сама после перезагрузки (на 403/429/439 — нет: только капча)
             self.log("проверка безопасности — пробую перезагрузить")
             pause((8, 14), self.stop)
             self._nav(url)
@@ -355,7 +396,7 @@ class Browser:
             # Ограничение IP за частоту запросов: человек тут не поможет, нужна пауза (её делает парсер)
             self._trace("browser", "GET", url, self.last_status, None, len(html), "ограничение IP", html, "ограничение ip")
             raise IpBanned(self.page.url)
-        if self.is_blocked(html, self.page.url):
+        if self._blocked(html, self.page.url):
             html = self._pass_captcha(url, settle, html)
             self._cooldown = True
         self.last_url = self.page.url
@@ -373,7 +414,7 @@ class Browser:
     def left_firewall(self):
         """Страница капчи сменилась другой (капча пройдена)."""
         try:
-            return not self.is_blocked(self.page.content(), self.page.url)
+            return not self._blocked(self.page.content(), self.page.url)
         except Exception:
             return False
 
@@ -416,7 +457,7 @@ class Browser:
             if self.check_passed():
                 blocked_since = None
                 continue
-            if self.is_blocked(html, now_url):
+            if self._blocked(html, now_url):
                 blocked_since = blocked_since or time.time()
                 if time.time() - blocked_since > 12:
                     return None
@@ -428,7 +469,7 @@ class Browser:
         self.log("сайт не открыл страницу после проверки — открываю её сам")
         self._safe_nav(url, settle)
         html = self.page.content()
-        return None if self.is_blocked(html, self.page.url) else html
+        return None if self._blocked(html, self.page.url) else html
 
     def _ask_human(self, url, settle, what=""):
         if self.window == "headless":
@@ -467,7 +508,7 @@ class Browser:
                     passed_at = None
                     self._safe_nav(url, settle)
                 continue
-            if self.is_blocked(html, now_url):
+            if self._blocked(html, now_url):
                 passed_at = unknown_at = None
                 if time.time() - beeped > alerts.REPEAT_S:  # капча всё ещё ждёт — напомнить
                     alerts.captcha()

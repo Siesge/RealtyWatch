@@ -38,6 +38,8 @@ class Scraper:
     # Режим «авто» сразу через браузер, без попытки быстрого HTTP (сайт всё равно его блокирует,
     # а отказ HTTP-клиенту с cookies браузера помечает и сессию браузера)
     AUTO_BROWSER = False
+    # Условие на JS «страницу закрывает окно проверки» (капча поверх обычной страницы) или None
+    BLOCKED_JS = None
 
     def __init__(self, cfg, log, stop, progress):
         self.cfg = cfg
@@ -153,7 +155,7 @@ class Scraper:
             self.browser = Browser(self.name, self.is_blocked, self.log, self.stop,
                                    window=b.get("window", "hidden"), captcha_wait_min=b.get("captcha_wait_min", 10),
                                    is_ip_banned=self.is_ip_banned, is_ready=self.is_ready, label=self.label,
-                                   solver=self.captcha_solver())
+                                   solver=self.captcha_solver(), blocked_js=self.BLOCKED_JS)
             self.browser.trace = self._trace
             self.browser.note = lambda msg: self.runlog.line(msg)
         return self.browser

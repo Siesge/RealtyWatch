@@ -276,7 +276,7 @@ function card(o) {
       <p class="desc" title="Начало описания; полностью — в окне карточки (клик по карточке)">${esc((o.p.description || "").slice(0, 320))}</p>
     </div>
     <div class="card-foot"><span title="Когда объект впервые появился в базе; число объявлений на всех сайтах">с ${dt(o.first_seen)} · ${n} ${plural(n, "объявление", "объявления", "объявлений")}</span>
-      <span class="acts"><button class="icon-btn more" title="Подробности и график цен">${ICON.chart}</button>${o.lat != null ? `<button class="icon-btn pin" title="Показать на карте рядом">${ICON.map}</button>` : ""}</span></div>
+      <span class="acts">${o.lat != null ? `<button class="icon-btn pin" title="Показать на карте рядом">${ICON.map}</button>` : ""}</span></div>
   </article>`;
 }
 
