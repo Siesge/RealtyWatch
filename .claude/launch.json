@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "realtywatch",
-      "runtimeExecutable": "D:\\Claude\\RealtyWatch\\Parser App\\runtime\\python\\python.exe",
+      "runtimeExecutable": "D:\\Claude\\RealtyWatch\\RealtyWatch_Win\\runtime\\python\\python.exe",
       "runtimeArgs": ["-m", "app.main", "--server"],
       "port": 8765
     }

@@ -1,6 +1,6 @@
 """Сборка переносного архива RealtyWatch: dist/RealtyWatch-portable-<дата>.zip.
 
-В архив попадает только программа из последнего коммита (git archive HEAD:"Parser App"), README.md и
+В архив попадает только программа из последнего коммита (git archive HEAD:"RealtyWatch_Win"), README.md и
 «Как запустить.txt». База, профили с cookies, журналы, Python и Chromium в архив не попадают: на новом
 компьютере RealtyWatch.exe скачает Python, библиотеки и Chromium сам при первом запуске.
 
@@ -11,7 +11,7 @@
 попадают и туда: они привязаны к устройству, на чужом компьютере от них только вред.
 
 Запуск из корня репозитория:
-  "Parser App\\runtime\\python\\python.exe" release\\make_release.py [--with-db]
+  "RealtyWatch_Win\\runtime\\python\\python.exe" release\\make_release.py [--with-db]
 """
 import datetime
 import io
@@ -23,7 +23,7 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-APP = REPO / "Parser App"
+APP = REPO / "RealtyWatch_Win"
 FORBIDDEN = ("database/", "profiles/", "logs/", "runtime/", "browsers/", "data/", "__pycache__", ".db")
 DB_PREFIX = "RealtyWatch/database/"
 
@@ -55,10 +55,10 @@ def add_db(zout):
 def main():
     sys.stdout.reconfigure(errors="replace")  # консоль Windows может не знать кириллицу
     with_db = "--with-db" in sys.argv[1:]
-    if subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--", "Parser App"], capture_output=True, text=True).stdout.strip():
-        sys.exit("В папке Parser App есть незакоммиченные изменения — сначала закоммитьте их: архив собирается из коммита")
+    if subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--", "RealtyWatch_Win"], capture_output=True, text=True).stdout.strip():
+        sys.exit("В папке RealtyWatch_Win есть незакоммиченные изменения — сначала закоммитьте их: архив собирается из коммита")
     commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
-    raw = subprocess.run(["git", "-C", str(REPO), "archive", "--format=zip", "--prefix=RealtyWatch/", "HEAD:Parser App"],
+    raw = subprocess.run(["git", "-C", str(REPO), "archive", "--format=zip", "--prefix=RealtyWatch/", "HEAD:RealtyWatch_Win"],
                          capture_output=True, check=True).stdout
     today = datetime.date.today().isoformat()
     out = REPO / "dist" / f"RealtyWatch-{'с-базой' if with_db else 'portable'}-{today}.zip"

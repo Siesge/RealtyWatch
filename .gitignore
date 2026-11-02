@@ -1,13 +1,13 @@
 # Портативная среда выполнения (скачивается скриптом установки)
-Parser App/runtime/
-Parser App/browsers/
+RealtyWatch_Win/runtime/
+RealtyWatch_Win/browsers/
 
 # Данные пользователя: база, профили браузера, логи
-Parser App/data/
-Parser App/database/
-Parser App/exports/
-Parser App/profiles/
-Parser App/logs/
+RealtyWatch_Win/data/
+RealtyWatch_Win/database/
+RealtyWatch_Win/exports/
+RealtyWatch_Win/profiles/
+RealtyWatch_Win/logs/
 
 __pycache__/
 *.pyc
