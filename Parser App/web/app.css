@@ -449,6 +449,29 @@ table.grid td.num.bad { color: var(--bad); }
 .empty { text-align: center; padding: 80px 20px; color: var(--muted); }
 .empty b { display: block; color: var(--ink); font-size: 17px; margin-bottom: 6px; }
 
+/* ---------- первый запуск: краткая инструкция вместо пустого дашборда ---------- */
+.start { display: grid; gap: 16px; max-width: 1120px; }
+.start-hero { padding: 26px 30px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 22px; align-items: center;
+  background: linear-gradient(135deg, var(--accent-soft), transparent 55%), var(--surface); }
+.start-hero img { width: 56px; height: 56px; border-radius: 16px; box-shadow: var(--shadow-1); }
+.start-hero h2 { margin: 0 0 6px; font-size: 22px; font-weight: 800; letter-spacing: -.02em; }
+.start-hero p { margin: 0; max-width: 80ch; color: var(--ink-2); font-size: 14px; line-height: 1.55; }
+.start-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.start-steps li { padding: 20px; display: flex; flex-direction: column; align-items: start; gap: 9px; }
+.start-steps .n { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent); font-size: 14px; font-weight: 800; }
+.start-steps h3 { margin: 0; font-size: 15.5px; font-weight: 800; }
+.start-steps p { margin: 0; flex: 1; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
+.start-steps p b { color: var(--ink); }
+.start-steps .btn-run { flex: none; padding: 0 20px; }
+.start-more { padding: 18px 22px; }
+.start-more h3 { margin: 0 0 10px; font-size: 14px; font-weight: 800; }
+.start-more ul { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 8px 28px; }
+.start-more li { position: relative; padding-left: 16px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
+.start-more li::before { content: ""; position: absolute; left: 0; top: 8px; width: 6px; height: 6px; border-radius: 50%; background: var(--gold); }
+.start-more b { color: var(--ink); font-weight: 700; }
+@media (max-width: 1100px) { .start-steps { grid-template-columns: 1fr; } }
+
 @media (max-width: 1280px) { .kpi { min-width: 110px; } }
 @media (max-width: 1000px) {
   .app { grid-template-columns: 1fr; }

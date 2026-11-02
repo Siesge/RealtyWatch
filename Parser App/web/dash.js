@@ -139,8 +139,58 @@ async function renderDashboard() {
   paintDashboard();
 }
 
+// Первый запуск: в базе нет ни одного объявления — вместо пустого дашборда краткая инструкция
+function startScreen(el) {
+  const f = (SETTINGS && SETTINGS.filters) || {};
+  const what = [(f.rooms || []).length ? `${f.rooms.join(", ")}-комнатные` : "любые квартиры",
+                f.price_min || f.price_max ? `${mln(f.price_min)}–${mln(f.price_max)} млн ₽` : "любая цена",
+                f.area_min ? `от ${f.area_min} м²` : null].filter(Boolean).join(", ");
+  el.innerHTML = `
+    <div class="start">
+      <div class="panel start-hero">
+        <img src="/static/icon.png" alt="">
+        <div>
+          <h2>С чего начать</h2>
+          <p>RealtyWatch следит за квартирами в Ялте на ЦИАН, Авито и Яндекс Недвижимости: собирает объявления,
+            сводит одну и ту же квартиру с разных сайтов в один объект, хранит историю цен и показывает, что изменилось
+            с прошлой проверки. База пока пуста — вот три шага до первых цифр.</p>
+        </div>
+      </div>
+      <ol class="start-steps">
+        <li class="panel"><span class="n">1</span>
+          <h3>Проверьте, что ищем</h3>
+          <p>Комнаты, цена, площадь, ремонт и красный круг на карте — в настройках.
+            Сейчас: <b>${esc(what)}</b>.</p>
+          <button class="btn-sec" data-go="settings">Открыть настройки</button></li>
+        <li class="panel"><span class="n">2</span>
+          <h3>Запустите сбор</h3>
+          <p>Отметьте сайты слева и нажмите «Запустить» — или прямо отсюда. Первый сбор идёт 10–30 минут: программа
+            читает выдачу и открывает каждое объявление. Авито иногда показывает проверку — пазл программа проходит
+            сама, а если попросят другое, позовёт вас звуком.</p>
+          <button class="btn-run" data-run><svg viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z"/></svg>Запустить сбор</button></li>
+        <li class="panel"><span class="n">3</span>
+          <h3>Смотрите, что нашлось</h3>
+          <p>«Подборка» — карточки с фото и картой, «Таблица» — всё списком, «Карта» — точки по зонам,
+            «Изменения» — новое, снятое и смена цены. Клик по карточке открывает историю цен по каждому сайту.</p></li>
+      </ol>
+      <div class="panel start-more">
+        <h3>Что дальше</h3>
+        <ul>
+          <li><b>Автообновление</b> слева повторяет сбор по таймеру — даже когда окно свёрнуто в трей.</li>
+          <li><b>Графики</b> этого экрана строятся по проверкам: после первого сбора появятся цифры, после второго — линии.</li>
+          <li><b>♥ Избранное</b>: отметьте квартиру в подборке — её цена и динамика будут здесь, на виду.</li>
+          <li><b>Красный круг</b> на карте — ваш район: по нему считается отдельный срез рынка.</li>
+          <li><b>Вся база</b> лежит в папке программы; в настройках есть экспорт и импорт одним файлом.</li>
+        </ul>
+      </div>
+    </div>`;
+  el.querySelector("[data-go]").onclick = () => setView("settings");
+  el.querySelector("[data-run]").onclick = () => $("#btnRun").click();
+}
+
 function paintDashboard() {
   const el = $("#view-dashboard"), d = DASH_D, Z = DASH_ZONE;
+  if (!Object.keys(d.sources || {}).length) return startScreen(el);  // в базе ни одного объявления
   const S = d.snapshots, R = d.recent || S, last = R[R.length - 1], prev = R[R.length - 2];
   const cur = partAll(last), pcur = partAll(prev);
   const e24 = Z ? d.events_24h_a : d.events_24h, e7 = Z ? d.events_7d_a : d.events_7d;
