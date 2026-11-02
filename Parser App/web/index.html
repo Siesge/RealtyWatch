@@ -103,7 +103,7 @@
           <option value="finish">чистовая</option><option value="old">старый</option></select></label>
         <label class="sel" title="Вторичное жильё или новостройка"><span>Тип</span><select id="fNew"><option value="">все</option><option value="0">вторичка</option><option value="1">новостройки</option></select></label>
         <label class="sel" title="«Прошли отсев» — подходят под параметры поиска; «отсеянные» — не подошли (причина на карточке)"><span>Статус</span><select id="fState"><option value="pass">прошли отсев</option><option value="excluded">отсеянные</option><option value="all">все</option></select></label>
-        <label class="sel" title="Порядок карточек"><span>Сортировка</span><select id="fSort"><option value="new">сначала новые</option><option value="price">дешевле</option><option value="-price">дороже</option><option value="ppm">₽/м² ↑</option><option value="-area">площадь ↓</option></select></label>
+        <label class="sel" id="fSortBox" title="Порядок карточек; в таблице порядок задаётся кликом по заголовку колонки"><span>Сортировка</span><select id="fSort"><option value="new">сначала новые</option><option value="price">дешевле</option><option value="-price">дороже</option><option value="ppm">₽/м² ↑</option><option value="-area">площадь ↓</option></select></label>
         <label class="check" title="Скрыть объекты, снятые с продажи на всех сайтах"><input type="checkbox" id="fActive" checked><span>активные</span></label>
         <label class="check" title="Показать только объекты без координат (их нельзя отнести к зоне точно)"><input type="checkbox" id="fNoCoords"><span>без координат</span></label>
         <button id="btnReset" class="link" title="Вернуть фильтры просмотра по умолчанию">Сбросить</button>

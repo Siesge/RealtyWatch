@@ -33,7 +33,7 @@ const ICON = {
   img: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 5-4.5 4 3.5 3-2.5 4 3.5"/></svg>',
 };
 
-let LASTRUN = {}, ALL = [], OBJS = [], SETTINGS = null, view = "cards", jAfter = 0, tableSort = null, lastStates = {};
+let LASTRUN = {}, ALL = [], OBJS = [], SETTINGS = null, view = "cards", jAfter = 0, lastStates = {};
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -54,6 +54,10 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* хранилище недоступно */ } },
 };
+// Порядок строк таблицы: колонка и направление (−1 — по убыванию). Задаётся кликом по заголовку колонки
+// (выпадающей «Сортировки» в таблице нет) и помнится между запусками. По умолчанию — сначала найденные недавно.
+const TSORT_DEF = ["first_seen", -1];
+let tableSort = (() => { const s = String(store.get("rw.tableSort", "")).split(":"); return s.length === 2 ? [s[0], s[1] === "1" ? 1 : -1] : TSORT_DEF.slice(); })();
 const median = a => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
 const plural = (n, one, few, many) => { const m10 = n % 10, m100 = n % 100; return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20) ? few : many; };
 
@@ -343,17 +347,19 @@ const COLS = [
 ];
 
 function renderTable(rows) {
-  if (tableSort) {
+  if (!COLS.some(c => c[0] === tableSort[0])) tableSort = TSORT_DEF.slice();  // колонки больше нет
+  {
     const [k, d] = tableSort;
     const v = o => (k === "sources" ? o.sources.length : o[k]) ?? "";
     rows = [...rows].sort((a, b) => (v(a) > v(b) ? 1 : v(a) < v(b) ? -1 : 0) * d);
   }
-  $("#view-table").innerHTML = `<div class="panel"><table class="grid"><thead><tr>${COLS.map(c => `<th data-k="${c[0]}" class="${c[3] ? "num" : ""}">${c[1]}${tableSort && tableSort[0] === c[0] ? (tableSort[1] > 0 ? " ↑" : " ↓") : ""}</th>`).join("")}</tr></thead>
+  $("#view-table").innerHTML = `<div class="panel"><table class="grid"><thead><tr>${COLS.map(c => `<th data-k="${c[0]}" class="${c[3] ? "num" : ""}" title="Клик — сортировать по колонке «${esc(c[1])}»; порядок запомнится">${c[1]}${tableSort[0] === c[0] ? (tableSort[1] > 0 ? " ↑" : " ↓") : ""}</th>`).join("")}</tr></thead>
     <tbody>${rows.slice(0, 1500).map(o => `<tr class="${o.excluded ? "excl" : ""}" data-id="${esc(o.id)}" title="Клик — открыть карточку в подборке">${COLS.map(c => `<td class="${c[3] ? "num" : ""}">${c[2](o)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
   $$("#view-table tbody tr").forEach(tr => tr.onclick = e => { if (!e.target.closest("a")) goToCard(tr.dataset.id); });
   $$("#view-table th").forEach(th => th.onclick = () => {
     const k = th.dataset.k;
-    tableSort = tableSort && tableSort[0] === k ? [k, -tableSort[1]] : [k, 1];
+    tableSort = tableSort[0] === k ? [k, -tableSort[1]] : [k, 1];
+    store.set("rw.tableSort", tableSort.join(":"));
     render();
   });
 }
@@ -1056,6 +1062,7 @@ function setView(v) {
   const lists = v === "cards" || v === "table" || v === "map";
   if (v === "changes") markChangesSeen();
   $("#filters").classList.toggle("hidden", !lists);
+  $("#fSortBox").classList.toggle("hidden", v === "table");  // в таблице сортируют кликом по заголовку колонки
   $("#btnSide").classList.toggle("hidden", v !== "cards");
   $("#btnGroup").classList.toggle("hidden", v !== "cards");
   $(".main").classList.toggle("inner-scroll", v === "cards");
@@ -1080,6 +1087,8 @@ function setTheme(t) {
   store.set("rw.theme", t);
   $$("#theme button").forEach(b => b.classList.toggle("on", b.dataset.t === t));
   if (view === "map" || sideOn()) render();
+  // Цвета графиков берутся при отрисовке — после смены темы их надо нарисовать заново
+  if (view === "dashboard" && typeof drawDashCharts === "function") drawDashCharts();
 }
 
 $$(".nav button").forEach(b => b.onclick = () => setView(b.dataset.view));

@@ -58,6 +58,9 @@ function lineChart(id, labels, series, yFmt, extra = {}) {
   });
 }
 
+// Столбики одной проверки стоят друг на друге: проверок бывают десятки, и рядом они выходили бы
+// в пару пикселей шириной. Зазор между столбиками — за счёт ширины самого столбика (barPercentage),
+// а не рамки его же цветом фона: такая рамка на узком столбике съедала всю заливку, и цвета не было видно.
 function barChart(id, labels, series, yFmt) {
   chartTable(id, labels, series, yFmt);
   if (charts[id]) charts[id].destroy();
@@ -67,10 +70,13 @@ function barChart(id, labels, series, yFmt) {
   const opt = chartBase();
   opt.scales.y.ticks.callback = yFmt;
   opt.scales.y.ticks.precision = 0;
+  opt.scales.x.stacked = opt.scales.y.stacked = true;
+  opt.plugins.tooltip.callbacks = { label: c => ` ${c.dataset.label}: ${yFmt(c.parsed.y)}` };
+  const slot = Math.max(1, el.clientWidth - 48) / Math.max(1, labels.length);  // место под один столбик
   charts[id] = new Chart(el, {
     type: "bar",
-    data: { labels, datasets: series.map((s, i) => ({ label: s.label, data: s.data, backgroundColor: colors[i], borderRadius: 4, maxBarThickness: 18,
-      borderColor: css("--surface"), borderWidth: 2, borderSkipped: false })) },
+    data: { labels, datasets: series.map((s, i) => ({ label: s.label, data: s.data, backgroundColor: colors[i],
+      borderRadius: slot >= 8 ? 3 : 0, maxBarThickness: 26, categoryPercentage: 0.82, barPercentage: 0.96 })) },
     options: opt,
   });
 }

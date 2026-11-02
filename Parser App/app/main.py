@@ -233,6 +233,19 @@ class DesktopApi:
         return {"path": path} if path else {"cancelled": True}
 
 
+def _clean_caches():
+    """При закрытии убираем кэши браузера и окна: папку программы можно сразу заархивировать и переслать."""
+    try:
+        from . import cleanup
+
+        t0 = time.monotonic()
+        freed = cleanup.free_caches()
+        if freed:
+            print(f"очищены кэши: освобождено {freed / 1048576:.0f} МБ за {time.monotonic() - t0:.1f} с")
+    except Exception as e:  # очистка не должна мешать закрытию
+        print(f"не удалось очистить кэши: {type(e).__name__}: {e}")
+
+
 def _shutdown_runs():
     from .runner import manager
 
@@ -302,6 +315,7 @@ def main():
             tray.stop()
         _shutdown_runs()
         server.should_exit = True
+        _clean_caches()
         try:
             RUNTIME_FILE.unlink()
         except OSError:
