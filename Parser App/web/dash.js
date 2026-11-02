@@ -472,7 +472,7 @@ async function renderChanges() {
         : "Сборов ещё не было"}</div>` : ""}
     </div>
     ${tiles.length ? `<div class="ch-grid">${tiles.map(changeTile).join("")}</div>` :
-      `<div class="empty"><b>Изменений нет</b>${CH_PERIOD === "last" ? "Последнее обновление ничего не изменило" : "За выбранный период"} по выбранным типам. Первичная загрузка сайта изменениями не считается.</div>`}`;
+      `<div class="empty"><b>Изменений нет</b>${CH_PERIOD === "last" ? "Последнее обновление ничего не изменило" : "За выбранный период"} по выбранным типам. Первичная загрузка сайта изменениями не считается.</div>${aboutTab("changes")}`}`;
   el.querySelectorAll("input[name=chPeriod]").forEach(r => r.onchange = () => { CH_PERIOD = r.value; store.set("rw.chPeriod", r.value); renderChanges(); });
   el.querySelectorAll("input[name=chKind]").forEach(c => c.onchange = () => {
     store.set("rw.chKinds", JSON.stringify([...el.querySelectorAll("input[name=chKind]:checked")].map(x => x.value))); renderChanges();

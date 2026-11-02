@@ -450,14 +450,14 @@ table.grid td.num.bad { color: var(--bad); }
 .empty b { display: block; color: var(--ink); font-size: 17px; margin-bottom: 6px; }
 
 /* ---------- первый запуск: краткая инструкция вместо пустого дашборда ---------- */
-.start { display: grid; gap: 16px; max-width: 1120px; }
-.start-hero { padding: 26px 30px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 22px; align-items: center;
-  background: linear-gradient(135deg, var(--accent-soft), transparent 55%), var(--surface); }
+/* Весь блок стоит по центру окна — и по ширине, и по высоте */
+.start { display: grid; gap: 16px; width: min(1060px, 100%); margin: 0 auto; min-height: calc(100vh - 230px); align-content: center; text-align: center; }
+.start-hero { padding: 28px 32px; background: linear-gradient(160deg, var(--accent-soft), transparent 60%), var(--surface); }
 .start-hero img { width: 56px; height: 56px; border-radius: 16px; box-shadow: var(--shadow-1); }
-.start-hero h2 { margin: 0 0 6px; font-size: 22px; font-weight: 800; letter-spacing: -.02em; }
-.start-hero p { margin: 0; max-width: 80ch; color: var(--ink-2); font-size: 14px; line-height: 1.55; }
+.start-hero h2 { margin: 10px 0 8px; font-size: 23px; font-weight: 800; letter-spacing: -.02em; }
+.start-hero p { margin: 0 auto; max-width: 74ch; color: var(--ink-2); font-size: 14px; line-height: 1.55; }
 .start-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
-.start-steps li { padding: 20px; display: flex; flex-direction: column; align-items: start; gap: 9px; }
+.start-steps li { padding: 22px 20px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
 .start-steps .n { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
   background: var(--accent-soft); color: var(--accent); font-size: 14px; font-weight: 800; }
 .start-steps h3 { margin: 0; font-size: 15.5px; font-weight: 800; }
@@ -465,12 +465,16 @@ table.grid td.num.bad { color: var(--bad); }
 .start-steps p b { color: var(--ink); }
 .start-steps .btn-run { flex: none; padding: 0 20px; }
 .start-more { padding: 18px 22px; }
-.start-more h3 { margin: 0 0 10px; font-size: 14px; font-weight: 800; }
-.start-more ul { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 8px 28px; }
-.start-more li { position: relative; padding-left: 16px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
-.start-more li::before { content: ""; position: absolute; left: 0; top: 8px; width: 6px; height: 6px; border-radius: 50%; background: var(--gold); }
+.start-more h3 { margin: 0 0 12px; font-size: 14px; font-weight: 800; }
+.start-more ul { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 10px 28px; }
+.start-more li { color: var(--ink-2); font-size: 13px; line-height: 1.5; }
 .start-more b { color: var(--ink); font-weight: 700; }
-@media (max-width: 1100px) { .start-steps { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .start-steps { grid-template-columns: 1fr; } .start { min-height: 0; } }
+
+/* Пустая вкладка при первом запуске: чем она станет, когда появятся данные */
+.about { width: min(640px, 100%); margin: 0 auto; padding: 16px 22px 18px; border: 1px dashed var(--line-2); border-radius: var(--r); background: var(--surface-2); text-align: center; }
+.about b { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.about p { margin: 0; color: var(--ink-2); font-size: 13px; line-height: 1.55; }
 
 @media (max-width: 1280px) { .kpi { min-width: 110px; } }
 @media (max-width: 1000px) {

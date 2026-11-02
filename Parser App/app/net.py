@@ -2,6 +2,7 @@
 с общим набором cookies в profiles/<сайт>/."""
 import json
 import random
+import sys
 import time
 
 from curl_cffi import requests as cffi
@@ -235,8 +236,54 @@ class Browser:
             cdp.detach()
             if left >= 0:
                 self.page.bring_to_front()
+                self.raise_window(left, top)
         except Exception as e:
             self.log(f"не удалось переместить окно: {e}")
+
+    def raise_window(self, left=80, top=60):
+        """Поднять окно браузера поверх окна программы. bring_to_front() переключает только вкладку внутри
+        браузера — само окно Windows оставляет сзади и лишь мигает кнопкой в панели задач. Окно ищется по
+        месту, куда мы его только что поставили; если не нашли — ничего не делаем, это не повод падать."""
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            u = ctypes.windll.user32
+            u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            u.SetForegroundWindow.argtypes = [wintypes.HWND]
+            u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            found = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def visit(hwnd, _):
+                if not u.IsWindowVisible(hwnd):
+                    return True
+                name = ctypes.create_unicode_buffer(64)
+                u.GetClassNameW(hwnd, name, 64)
+                if name.value != "Chrome_WidgetWin_1":  # окно Chromium
+                    return True
+                r = wintypes.RECT()
+                u.GetWindowRect(hwnd, ctypes.byref(r))
+                if abs(r.left - left) <= 24 and abs(r.top - top) <= 24 and r.right - r.left > 400:
+                    found.append(hwnd)
+                    return False
+                return True
+
+            u.EnumWindows(visit, 0)
+            if not found:
+                return
+            hwnd = wintypes.HWND(found[0])
+            u.ShowWindow(hwnd, 9)  # SW_RESTORE — на случай свёрнутого окна
+            # коротко «поверх всех» и обратно: так окно выходит вперёд, даже когда Windows не отдаёт фокус
+            for order in (-1, -2):  # HWND_TOPMOST, HWND_NOTOPMOST
+                u.SetWindowPos(hwnd, wintypes.HWND(order), 0, 0, 0, 0, 0x0003)  # SWP_NOMOVE | SWP_NOSIZE
+            u.SetForegroundWindow(hwnd)
+        except Exception as e:
+            self.log(f"не удалось поднять окно браузера: {e}")
 
     def _humanize(self):
         """Человек на только что открытой странице: ведёт мышью, немного листает."""
@@ -513,6 +560,7 @@ class Browser:
                 passed_at = unknown_at = None
                 if time.time() - beeped > alerts.REPEAT_S:  # капча всё ещё ждёт — напомнить
                     alerts.captcha()
+                    self.raise_window()  # окно могло уйти за программу, пока человека не было
                     beeped = time.time()
                 continue  # капча на экране — человек её вводит, не мешаем
             if self.is_ready(html, now_url):

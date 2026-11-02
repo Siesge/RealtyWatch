@@ -88,13 +88,20 @@ class GapFinder(unittest.TestCase):
 
 GT = """
 const RATIO = 0.9;  // кусочек едет медленнее ручки
-let TASK = null, start = null, btnX = 0;
+const LAG = 0.07;   // и догоняет её с запозданием, как у настоящего GeeTest: на экране кусочек отстаёт от ручки
+let TASK = null, start = null, btnX = 0, sliceX = 0;
 function jsonp(url) { return new Promise(res => { const cb = 'geetest_' + Date.now() + Math.floor(Math.random() * 1000);
   window[cb] = d => { delete window[cb]; res(d); }; const s = document.createElement('script'); s.src = url + '&callback=' + cb; document.head.appendChild(s); }); }
 async function fetchTask() { TASK = (await jsonp('/gt/load?captcha_id=test')).data; return TASK; }
 const ready = fetchTask();
 async function openPopup() { await ready; render(TASK); }
-function place() { document.querySelector('.geetest_btn').style.left = btnX + 'px'; document.querySelector('.geetest_slice').style.left = (btnX * RATIO) + 'px'; }
+function place() { document.querySelector('.geetest_btn').style.left = btnX + 'px'; }
+function follow() {  // кусочек подтягивается к ручке не сразу
+  const sl = document.querySelector('.geetest_slice');
+  if (sl) { sliceX += (btnX * RATIO - sliceX) * LAG; sl.style.left = sliceX + 'px'; }
+  requestAnimationFrame(follow);
+}
+requestAnimationFrame(follow);
 function render(d) {
   let wrap = document.querySelector('.geetest_box_wrap');
   if (!wrap) {
@@ -116,11 +123,12 @@ function render(d) {
   sb.style.backgroundImage = 'url(/' + d.slice + ')';
   sb.style.width = sb.style.height = (d.slice_w * k) + 'px';
   sl.style.top = (d.ypos * k) + 'px';
-  btnX = 0; place();
+  btnX = 0; sliceX = 0; place();
 }
 async function verify() {
-  const x = parseFloat(document.querySelector('.geetest_slice').style.left);
-  const r = await jsonp('/gt/verify?captcha_id=test&lot_number=' + TASK.lot_number + '&x=' + x.toFixed(1));
+  const x = btnX * RATIO;        // ответ считается по ручке, а не по тому, куда кусочек успел доехать
+  const lag = Math.abs(x - sliceX);  // догнал ли кусочек ручку к тому моменту, как ползунок отпустили
+  const r = await jsonp('/gt/verify?captcha_id=test&lot_number=' + TASK.lot_number + '&x=' + x.toFixed(1) + '&lag=' + lag.toFixed(1));
   if (r.data.result === 'success') passed();
   else setTimeout(async () => render(await fetchTask()), 700);
 }
@@ -190,6 +198,7 @@ class Site(BaseHTTPRequestHandler):
             gx = st["puzzles"][q["lot_number"]][2]
             ok = abs(float(q["x"]) * W / SHOWN_W - gx) <= 4 and not (st["fail_first"] and st["verifies"] == 1)
             st["errors"].append(round(float(q["x"]) * W / SHOWN_W - gx, 1))
+            st["lags"].append(float(q.get("lag", 0)))
             return self._send(f'{q["callback"]}({{"status": "success", "data": {{"result": "{"success" if ok else "fail"}"}}}})',
                               "application/javascript")
         if u.path.startswith("/geetest/captcha_v4/"):
@@ -217,7 +226,7 @@ class SliderCaptcha(unittest.TestCase):
 
     def site(self, **kw):
         Site.state = dict({"type": "slide", "loads": 0, "verifies": 0, "clicks": 0, "fail_first": False, "auto_open": False,
-                           "puzzles": {}, "errors": []}, **kw)
+                           "puzzles": {}, "errors": [], "lags": []}, **kw)
 
     def browser(self, wait_min=1.0):
         b = LocalBrowser("avito", lambda html, url: "js-firewall-form" in html, self.log.append, None,
@@ -243,6 +252,8 @@ class SliderCaptcha(unittest.TestCase):
         self.assertTrue(any("пройдена автоматически" in m for m in self.log))
         self.assertEqual(Site.state["loads"], 2, "первое задание пришло при загрузке страницы, второе — после отказа")
         self.assertLessEqual(abs(Site.state["errors"][-1]), 4, f"кусочек не довели до выреза: {Site.state['errors']}")
+        self.assertLessEqual(max(Site.state["lags"]), 1.5,
+                             f"ползунок отпустили, пока кусочек ещё ехал — поправка шла по старому месту: {Site.state['lags']}")
         note = next((m for m in self.log if m.startswith("пазл: ")), "")
         self.assertRegex(note, r"вырез x=\d+ \(уверенность .+?\), довели с ошибкой -?[\d.]+ px")
         self.assertEqual([(r, e) for r, e, _ in self.kept], [("пазл фон", "png"), ("пазл кусочек", "png")],

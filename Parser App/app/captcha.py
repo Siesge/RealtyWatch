@@ -398,15 +398,17 @@ class AvitoCaptcha:
         gap, conf = find_gap(bg, piece, top=tops or None)
         target = el["bg"]["x"] + gap * sx
         b.mouse.wait(random.uniform(0.6, 1.6))  # человек сначала смотрит на картинку
-        b.mouse.drag(el["btn"], target - el["slice"]["x"],
-                     position=lambda: b.page.evaluate(_SLICE_X_JS, names["slice"]), target=target)
+        seen = b.mouse.drag(el["btn"], target - el["slice"]["x"],
+                            position=lambda: b.page.evaluate(_SLICE_X_JS, names["slice"]), target=target)
         off = self._off(b, names, target, sx)
+        held = round((seen - target) / sx, 1) if seen is not None and sx else None  # куда рука целилась перед отпусканием
         verdict = rec.wait_json("/verify", 10)
         result = (verdict or {}).get("result")
         b.note(f"пазл: картинка {bw}×{bh} в окне {round(el['bg']['width'])} px (×{round(sx, 2)}), кусочек {pw} px, "
                f"верх {'—' if shown is None else round(shown)} (в задании {task.get('ypos', '—')}), "
                f"вырез x={gap} (уверенность {conf}{'' if conf >= SURE else ', мало'}), "
-               f"довели с ошибкой {'—' if off is None else off} px, GeeTest ответил: {result or 'нет ответа'}")
+               f"довели с ошибкой {'—' if off is None else off} px "
+               f"(перед отпусканием {'—' if held is None else held}), GeeTest ответил: {result or 'нет ответа'}")
         if keep and result != "success":  # разобраться потом, где на картинке был вырез
             b.keep(bg, "пазл фон", "png")
             b.keep(piece, "пазл кусочек", "png")
