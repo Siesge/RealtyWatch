@@ -45,7 +45,7 @@ class Site(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-@unittest.skipUnless(has_browser(), "Chromium не установлен (setup.bat)")
+@unittest.skipUnless(has_browser(), "Chromium не установлен (bin/bootstrap.sh)")
 class Captcha(unittest.TestCase):
     def test_waits_for_site_redirect(self):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), Site)

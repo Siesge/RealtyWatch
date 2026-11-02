@@ -4,4 +4,4 @@
 # к настоящим сайтам тесты не обращаются.
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 bash bin/bootstrap.sh
-exec "$HOME/Library/Application Support/RealtyWatch/runtime/venv/bin/python" -m unittest discover -s tests -t . -v
+exec "${RW_HOME:-$HOME/Library/Application Support/RealtyWatch}/runtime/venv/bin/python" -m unittest discover -s tests -t . -v

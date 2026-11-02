@@ -35,9 +35,13 @@ chmod +x "$APP/Contents/MacOS/RealtyWatch"
 # иконка: .icns собирается из assets/icon.png средствами системы
 ICONSET="$(mktemp -d)/icon.iconset"
 mkdir -p "$ICONSET"
+SRC="$(sips -g pixelWidth "$HERE/assets/icon.png" | awk '/pixelWidth/ {print $2}')"
 for size in 16 32 64 128 256 512; do
   sips -z $size $size "$HERE/assets/icon.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-  sips -z $((size * 2)) $((size * 2)) "$HERE/assets/icon.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  # вдвое больше исходника не рисуем: вышла бы размытая картинка, системе она не поможет
+  if [ "$((size * 2))" -le "${SRC:-0}" ]; then
+    sips -z $((size * 2)) $((size * 2)) "$HERE/assets/icon.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  fi
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns"
 rm -rf "$(dirname "$ICONSET")"

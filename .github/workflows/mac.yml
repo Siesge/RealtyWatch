@@ -5,6 +5,7 @@ name: macOS
 
 on:
   push:
+    branches: [main]
     paths: ["RealtyWatch_Mac/**", ".github/workflows/mac.yml"]
   workflow_dispatch:
 
@@ -18,8 +19,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Какой это Mac
+        run: |
+          sw_vers
+          echo "процессор: $(uname -m), bash: $BASH_VERSION"
+
       - name: Доставить среду (uv, Python, библиотеки, Chromium)
         run: bash bin/bootstrap.sh
+
+      - name: Повторный запуск установщика ничего не доставляет
+        run: |
+          if bash bin/bootstrap.sh --check; then
+            echo "среда на месте, второй раз ничего не качается"
+          else
+            echo "установщик не узнаёт свою же среду — смотреть метку runtime/installed.txt"
+            exit 1
+          fi
 
       - name: Тесты
         run: |
@@ -29,23 +44,42 @@ jobs:
       - name: Собрать RealtyWatch.app
         run: ./build_app.sh
 
-      - name: Приложение запускается и отвечает
+      - name: Бандл собран целиком
+        run: |
+          APP="dist/RealtyWatch.app"
+          [ -x "$APP/Contents/MacOS/RealtyWatch" ] || { echo "запускатор не исполняемый"; exit 1; }
+          [ -s "$APP/Contents/Resources/icon.icns" ] || { echo "иконка не собралась"; exit 1; }
+          [ -f "$APP/Contents/Resources/app/main.py" ] || { echo "кода нет внутри бандла"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP/Contents/Info.plist"
+          codesign -dv "$APP" 2>&1 | head -3
+          du -sh "$APP"
+
+      - name: Программа запускается и отдаёт интерфейс
         run: |
           PY="$HOME/Library/Application Support/RealtyWatch/runtime/venv/bin/python"
           "$PY" -m app.main --server &
-          for i in $(seq 1 40); do
+          SRV=$!
+          for _ in $(seq 1 30); do
+            if ! kill -0 "$SRV" 2>/dev/null; then echo "сервер завершился сам"; break; fi
+            if curl -fsS http://127.0.0.1:8765/api/settings > /dev/null; then break; fi
             sleep 2
-            curl -fsS http://127.0.0.1:8765/api/settings > /dev/null && break
           done
           curl -fsS http://127.0.0.1:8765/api/settings | head -c 200
-          curl -fsS http://127.0.0.1:8765/ | grep -q RealtyWatch && echo "интерфейс отдаётся"
-          kill %1
+          echo
+          curl -fsS http://127.0.0.1:8765/ | grep -q "<title>RealtyWatch</title>"
+          echo "интерфейс отдаётся"
+          kill "$SRV" 2>/dev/null || true
 
       - name: Журналы, если что-то пошло не так
         if: failure()
-        run: cat "$HOME/Library/Application Support/RealtyWatch/logs/"*.log || true
+        run: |
+          cat "$HOME/Library/Application Support/RealtyWatch/logs/"*.log || true
+          ls -la "$HOME/Library/Application Support/RealtyWatch" || true
+
+      - name: Упаковать .app (ditto сохраняет права на запуск)
+        run: ditto -c -k --sequesterRsrc --keepParent dist/RealtyWatch.app dist/RealtyWatch.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: RealtyWatch-app
-          path: RealtyWatch_Mac/dist/RealtyWatch.app
+          path: RealtyWatch_Mac/dist/RealtyWatch.zip

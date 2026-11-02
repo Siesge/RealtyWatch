@@ -80,7 +80,7 @@ class Site(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-@unittest.skipUnless(has_browser(), "Chromium не установлен (setup.bat)")
+@unittest.skipUnless(has_browser(), "Chromium не установлен (bin/bootstrap.sh)")
 class AvitoLikeHuman(Case):
     def setUp(self):
         super().setUp()

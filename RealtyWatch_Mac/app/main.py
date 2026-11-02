@@ -220,7 +220,7 @@ def main():
     port = cfg["server"]["port"] if server_only else _free_port(cfg["server"]["port"])
     server = _start_server(port)
     if not server.started:
-        _message(f"Не удалось запустить внутренний сервер (порт {port}). Подробности в logs\\console.log")
+        _message(f"Не удалось запустить внутренний сервер (порт {port}). Подробности в logs/console.log")
         return
     url = f"http://127.0.0.1:{port}/"
     RUNTIME_FILE.write_text(json.dumps({"pid": os.getpid(), "url": url}), encoding="utf-8")

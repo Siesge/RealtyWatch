@@ -209,7 +209,7 @@ class Site(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-@unittest.skipUnless(has_browser(), "Chromium не установлен (setup.bat)")
+@unittest.skipUnless(has_browser(), "Chromium не установлен (bin/bootstrap.sh)")
 class SliderCaptcha(unittest.TestCase):
     def setUp(self):
         fast_timing(self)
