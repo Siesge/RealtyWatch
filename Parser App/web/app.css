@@ -166,8 +166,8 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
   border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow-1);
 }
 .tb-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.search { flex: 1 1 260px; display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 14px; border-radius: 11px; background: var(--sunken); color: var(--muted); }
-.search input { flex: 1; border: 0; outline: 0; background: transparent; color: var(--ink); height: 100%; }
+.search { flex: 1 1 200px; min-width: 120px; display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 14px; border-radius: 11px; background: var(--sunken); color: var(--muted); }
+.search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); height: 100%; }
 .search:focus-within { box-shadow: 0 0 0 2px var(--accent-soft), inset 0 0 0 1px var(--accent); }
 .seg { display: inline-flex; background: var(--sunken); border-radius: 11px; padding: 3px; gap: 2px; }
 .seg label { cursor: pointer; }
@@ -185,11 +185,30 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
 .range i { color: var(--muted); font-style: normal; }
 .sel select { border: 0; outline: 0; background: transparent; height: 100%; font-weight: 700; padding-right: 6px; cursor: pointer; }
 .sel select option { background: var(--surface); color: var(--ink); }
+.sel > .ic { display: none; width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Свёрнутый фильтр: квадрат с иконкой вместо подписи и значения — строка фильтров остаётся одной
+   строкой даже на 1920×1080 (с подписями она занимала бы около 1800 px). Список открывается как обычно,
+   кружок в углу значит, что фильтр не в положении по умолчанию; что именно выбрано — в подсказке. */
+.sel.ico { position: relative; width: 36px; padding: 0; justify-content: center; color: var(--muted); }
+.sel.ico > span { display: none; }
+.sel.ico > .ic { display: block; }
+.sel.ico select { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; opacity: 0; }
+.sel.ico:hover { color: var(--accent); border-color: var(--accent); }
+.sel.ico.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2)); background: var(--accent-soft); }
+.sel.ico.on::after { content: ""; position: absolute; top: -3px; right: -3px; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 2px var(--surface); }
 .check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; color: var(--ink-2); cursor: pointer; }
 .check input { accent-color: var(--accent); width: 15px; height: 15px; }
 .link { background: none; border: 0; color: var(--accent); font-weight: 700; padding: 6px 8px; border-radius: 8px; }
 .link:hover { background: var(--accent-soft); }
 .tb-right { margin-left: auto; display: flex; gap: 8px; }
+/* совсем тесно — у кнопок справа и «без координат» остаются только значки (что это, скажет подсказка) */
+.tb-row.tight .toggle { width: 36px; padding: 0; justify-content: center; }
+.tb-row.tight .toggle span { display: none; }
+.tb-row.tight .check.wide span { display: none; }
+.tb-row.tight .like-toggle b { display: none; }
+.like-toggle b { font-weight: inherit; }
 .toggle { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); font-weight: 700; color: var(--ink-2); }
 .toggle.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .toolbar.compact .tb-row:nth-child(2) { display: none; }

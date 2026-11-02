@@ -78,7 +78,7 @@
         <label class="search" title="Поиск по заголовку, адресу и описанию всех объявлений объекта"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
           <input type="search" id="fText" placeholder="Улица, ЖК, слово из описания"></label>
         <label class="like-toggle" title="Показать только объекты, отмеченные сердечком"><input type="checkbox" id="fLiked">
-          <span><svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z"/></svg>Избранное <em id="likeCount"></em></span></label>
+          <span><svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z"/></svg><b>Избранное</b> <em id="likeCount"></em></span></label>
         <div class="seg" id="zoneSeg">
           <label title="Зона A — внутри красного круга с GeoZone_v1.jpg (радиус ~1 км). Число — объектов по текущим фильтрам"><input type="checkbox" name="zone" value="A" checked><span><i class="zdot A"></i>Круг <em id="zc-A"></em></span></label>
           <label title="Зона B — город Ялта вне круга (по официальной границе города)"><input type="checkbox" name="zone" value="B" checked><span><i class="zdot B"></i>Ялта <em id="zc-B"></em></span></label>
@@ -98,18 +98,18 @@
       <div class="tb-row">
         <div class="range" title="Цена объекта (минимальная среди его объявлений), миллионов рублей"><span>Цена, млн</span><input type="number" id="fPmin" step="0.1" placeholder="от"><i>—</i><input type="number" id="fPmax" step="0.1" placeholder="до"></div>
         <div class="range" title="Общая площадь, м²"><span>Площадь</span><input type="number" id="fAmin" placeholder="от, м²"></div>
-        <label class="sel" title="Вид ремонта по данным сайта или по описанию. «Указан» — любой явно указанный ремонт"><span>Ремонт</span><select id="fReno"><option value="">любой</option><option value="known">указан</option>
+        <label class="sel" id="fRenoBox" title="Вид ремонта по данным сайта или по описанию. «Указан» — любой явно указанный ремонт"><svg class="ic" viewBox="0 0 24 24"><path d="M4 7h10v4H4zM14 9h3a2 2 0 0 1 2 2v1M19 14v6h-4v-6z"/></svg><span>Ремонт</span><select id="fReno"><option value="">любой</option><option value="known">указан</option>
           <option value="design">дизайнерский</option><option value="euro">евро</option><option value="cosmetic">косметический</option>
           <option value="finish">чистовая</option><option value="old">старый</option></select></label>
-        <label class="sel" title="Вторичное жильё или новостройка"><span>Тип</span><select id="fNew"><option value="">все</option><option value="0">вторичка</option><option value="1">новостройки</option></select></label>
-        <label class="sel" title="«Прошли отсев» — подходят под параметры поиска; «отсеянные» — не подошли (причина на карточке)"><span>Статус</span><select id="fState"><option value="pass">прошли отсев</option><option value="excluded">отсеянные</option><option value="all">все</option></select></label>
-        <label class="sel" id="fSortBox" title="Порядок карточек; в таблице порядок задаётся кликом по заголовку колонки"><span>Сортировка</span><select id="fSort"><option value="new">сначала новые</option><option value="price">дешевле</option><option value="-price">дороже</option><option value="ppm">₽/м² ↑</option><option value="-area">площадь ↓</option></select></label>
+        <label class="sel" id="fNewBox" title="Вторичное жильё или новостройка"><svg class="ic" viewBox="0 0 24 24"><path d="M4 20V10.5L12 5l8 5.5V20M9.5 20v-5.5h5V20"/></svg><span>Тип</span><select id="fNew"><option value="">все</option><option value="0">вторичка</option><option value="1">новостройки</option></select></label>
+        <label class="sel" id="fStateBox" title="«Прошли отсев» — подходят под параметры поиска; «отсеянные» — не подошли (причина на карточке)"><svg class="ic" viewBox="0 0 24 24"><path d="M4 5h16l-6 7.5V19l-4 2v-8.5z"/></svg><span>Статус</span><select id="fState"><option value="pass">прошли отсев</option><option value="excluded">отсеянные</option><option value="all">все</option></select></label>
+        <label class="sel" id="fSortBox" title="Порядок карточек; в таблице порядок задаётся кликом по заголовку колонки"><svg class="ic" viewBox="0 0 24 24"><path d="M7 4.5v15M7 19.5l-3-3M7 19.5l3-3M17 19.5v-15M17 4.5l-3 3M17 4.5l3 3"/></svg><span>Сортировка</span><select id="fSort"><option value="new">сначала новые</option><option value="price">дешевле</option><option value="-price">дороже</option><option value="ppm">₽/м² ↑</option><option value="-area">площадь ↓</option></select></label>
         <label class="check" title="Скрыть объекты, снятые с продажи на всех сайтах"><input type="checkbox" id="fActive" checked><span>активные</span></label>
-        <label class="check" title="Показать только объекты без координат (их нельзя отнести к зоне точно)"><input type="checkbox" id="fNoCoords"><span>без координат</span></label>
+        <label class="check wide" title="Показать только объекты без координат (их нельзя отнести к зоне точно)"><input type="checkbox" id="fNoCoords"><span>без координат</span></label>
         <button id="btnReset" class="link" title="Вернуть фильтры просмотра по умолчанию">Сбросить</button>
         <span class="tb-right">
-        <button id="btnGroup" class="toggle" title="Разделить карточки на блоки по зонам (круг / Ялта / посёлки) или показать одним списком"><svg viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6" rx="1.5"/><rect x="3.5" y="14" width="17" height="6" rx="1.5"/></svg>По зонам</button>
-        <button id="btnSide" class="toggle" title="Карта рядом с карточками. Разделитель между ними можно двигать"><svg viewBox="0 0 24 24"><path d="M9 4 3 6.5v13.5l6-2.5 6 2.5 6-2.5V4l-6 2.5L9 4z"/></svg>Карта рядом</button>
+        <button id="btnGroup" class="toggle" title="Разделить карточки на блоки по зонам (круг / Ялта / посёлки) или показать одним списком"><svg viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6" rx="1.5"/><rect x="3.5" y="14" width="17" height="6" rx="1.5"/></svg><span>По зонам</span></button>
+        <button id="btnSide" class="toggle" title="Карта рядом с карточками. Разделитель между ними можно двигать"><svg viewBox="0 0 24 24"><path d="M9 4 3 6.5v13.5l6-2.5 6 2.5 6-2.5V4l-6 2.5L9 4z"/></svg><span>Карта рядом</span></button>
         </span>
       </div>
     </div>

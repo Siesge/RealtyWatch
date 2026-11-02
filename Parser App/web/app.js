@@ -161,6 +161,8 @@ function renderHeader(rows) {
 function render() {
   const rows = filtered();
   renderHeader(rows);
+  markFilters();
+  fitToolbar();  // счётчики в фильтрах меняют ширину строки
   if (view === "cards") renderCards(rows);
   if (view === "table") renderTable(rows);
   if (view === "map") renderMap(rows);
@@ -1065,6 +1067,42 @@ async function poll() {
 }
 
 // ---------- навигация и события ----------
+// Панель фильтров должна оставаться в одну строку: на 1920×1080 с подписями она занимает около 1800 px
+// и расползается на два-три ряда, съедая высоту экрана. Сворачиваем по шагам, пока строка не поместится:
+// сначала «Тип», «Статус» и «Сортировка» становятся квадратными значками, потом «Ремонт», потом подписи
+// у кнопок справа и у «без координат». Что выбрано в свёрнутом фильтре, видно по кружку и подсказке.
+const TB_FOLD = [["fNewBox", "fStateBox", "fSortBox"], ["fRenoBox"]];
+
+function fitToolbar() {
+  const [top, row] = $$("#filters .tb-row");
+  if (!row || !row.clientWidth) return;  // панель скрыта — мерить нечего
+  const over = r => [...r.children].reduce((s, k) => s + k.getBoundingClientRect().width, 10 * (r.children.length - 1)) > r.clientWidth + 1;
+  TB_FOLD.flat().forEach(id => $(`#${id}`).classList.remove("ico"));
+  row.classList.remove("tight");
+  for (const group of TB_FOLD) {
+    if (!over(row)) break;
+    group.forEach(id => $(`#${id}`).classList.add("ico"));
+  }
+  row.classList.toggle("tight", over(row));
+  top.classList.remove("tight");          // в верхней строке сворачивается подпись «Избранное»
+  top.classList.toggle("tight", over(top));
+}
+
+// Кружок на свёрнутом фильтре, если он не в положении по умолчанию, и выбранное — в подсказку:
+// у свёрнутого фильтра значения на экране не видно (подсказки живут в data-tip, см. initTips)
+function markFilters() {
+  $$("#filters .sel").forEach(l => {
+    const s = l.querySelector("select");
+    if (!s) return;
+    l.classList.toggle("on", s.value !== s.options[0].value);
+    const base = l.dataset.base || (l.dataset.base = l.getAttribute("title") || l.dataset.tip || "");
+    const text = `${l.querySelector("span").textContent}: ${s.options[s.selectedIndex].text} — ${base}`;
+    if (l.hasAttribute("title")) l.title = text; else l.dataset.tip = text;
+  });
+}
+
+addEventListener("resize", fitToolbar);
+
 function setView(v) {
   if (ZE && v !== view) { endZoneEdit(); toast("warn", "Изменение круга отменено", "Круг остался прежним"); }
   view = v;
@@ -1077,6 +1115,7 @@ function setView(v) {
   if (v === "changes") markChangesSeen();
   $("#filters").classList.toggle("hidden", !lists);
   $("#fSortBox").classList.toggle("hidden", v === "table");  // в таблице сортируют кликом по заголовку колонки
+  if (lists) requestAnimationFrame(fitToolbar);  // панель только что показали — теперь её можно измерить
   $("#btnSide").classList.toggle("hidden", v !== "cards");
   $("#btnGroup").classList.toggle("hidden", v !== "cards");
   $(".main").classList.toggle("inner-scroll", v === "cards");
