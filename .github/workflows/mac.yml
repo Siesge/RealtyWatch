@@ -70,6 +70,14 @@ jobs:
           echo "интерфейс отдаётся"
           kill "$SRV" 2>/dev/null || true
 
+      - name: Всё лежит в одной папке
+        run: |
+          du -sh "$HOME/Library/Application Support/RealtyWatch"/*
+          for p in "$HOME/Library/Caches/uv" "$HOME/.cache/uv" "$HOME/Library/Caches/ms-playwright" "$HOME/.local/share/uv"; do
+            if [ -e "$p" ]; then echo "осталось снаружи: $p"; exit 1; fi
+          done
+          echo "снаружи рабочей папки ничего не осталось"
+
       - name: Журналы, если что-то пошло не так
         if: failure()
         run: |

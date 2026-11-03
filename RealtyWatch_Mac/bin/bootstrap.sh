@@ -52,8 +52,11 @@ if [ ! -x "$UV" ]; then
   xattr -dr com.apple.quarantine "$UV" 2>/dev/null || true
 fi
 
-# Python ставим рядом с собой, а не в ~/.local — чтобы всё жило в одной папке
+# Python, запускатели и кеш установщика — рядом с собой, а не в ~/.local и ~/Library/Caches:
+# тогда всё живёт в одной папке и удаляется вместе с ней
 export UV_PYTHON_INSTALL_DIR="$RUNTIME/python"
+export UV_PYTHON_BIN_DIR="$RUNTIME/bin"
+export UV_CACHE_DIR="$RUNTIME/cache"
 echo "[2/4] Python $PY_VERSION"
 "$UV" python install "$PY_VERSION" --quiet
 [ -x "$PY" ] || "$UV" venv --python "$PY_VERSION" --quiet "$VENV"
@@ -65,6 +68,9 @@ echo "[4/4] браузер Chromium"
 PLAYWRIGHT_BROWSERS_PATH="$BROWSERS" "$PY" -m patchright install chromium
 # Скачанный браузер попадает под карантин Gatekeeper и молча не запускается — снимаем метку
 xattr -dr com.apple.quarantine "$BROWSERS" 2>/dev/null || true
+
+# Скачанные пакеты своё дело сделали — незачем им занимать место
+"$UV" cache clean > /dev/null 2>&1 || true
 
 echo "$WANT" > "$STAMP"
 echo
