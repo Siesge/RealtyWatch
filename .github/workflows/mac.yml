@@ -8,6 +8,11 @@ on:
     branches: [main]
     paths: ["RealtyWatch_Mac/**", ".github/workflows/mac.yml"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Номер версии в Info.plist, например 1.0. Пусто — дата сборки."
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -42,6 +47,8 @@ jobs:
           "$PY" -m unittest discover -s tests -t . -v
 
       - name: Собрать RealtyWatch.app
+        env:
+          RW_VERSION: ${{ inputs.version }}
         run: ./build_app.sh
 
       - name: Бандл собран целиком
@@ -51,6 +58,7 @@ jobs:
           [ -s "$APP/Contents/Resources/icon.icns" ] || { echo "иконка не собралась"; exit 1; }
           [ -f "$APP/Contents/Resources/app/main.py" ] || { echo "кода нет внутри бандла"; exit 1; }
           /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist"
           codesign -dv "$APP" 2>&1 | head -3
           du -sh "$APP"
 

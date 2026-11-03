@@ -13,7 +13,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${1:-$HERE/dist}"
 APP="$OUT/RealtyWatch.app"
-VERSION="$(date +%Y.%m.%d)"
+VERSION="${RW_VERSION:-$(date +%Y.%m.%d)}"   # для релиза задают номер, иначе — дата сборки
 ID="ru.realtywatch.yalta"
 
 [ "$(uname)" = "Darwin" ] || { echo "Собирать .app нужно на macOS"; exit 1; }
