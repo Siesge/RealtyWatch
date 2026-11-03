@@ -73,4 +73,5 @@ codesign --force --deep --sign - "$APP" 2>/dev/null || echo "codesign не от�
 xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 
 echo "готово: $APP"
-echo "Перенесите его в «Программы» и запустите. Первый запуск доставит Python и Chromium (~350 МБ)."
+echo "Перенесите его в «Программы» и запустите. Первый запуск доставит Python и Chromium:"
+echo "качает около 300 МБ, на диске занимает примерно 800 МБ."
