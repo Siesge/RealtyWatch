@@ -17,7 +17,7 @@ jobs:
       run:
         working-directory: RealtyWatch_Mac
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Какой это Mac
         run: |
@@ -79,7 +79,7 @@ jobs:
       - name: Упаковать .app (ditto сохраняет права на запуск)
         run: ditto -c -k --sequesterRsrc --keepParent dist/RealtyWatch.app dist/RealtyWatch.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: RealtyWatch-app
           path: RealtyWatch_Mac/dist/RealtyWatch.zip
