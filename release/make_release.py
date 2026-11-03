@@ -10,8 +10,11 @@
 история цен и фотографии уже на месте, ничего импортировать не нужно. Профили браузера с cookies не
 попадают и туда: они привязаны к устройству, на чужом компьютере от них только вред.
 
+С ключом --version 1.0 архив получает имя релиза (dist/RealtyWatch-1.0-windows-portable.zip), и номер
+версии попадает в version.txt внутри архива. Без ключа имя и version.txt остаются с датой сборки.
+
 Запуск из корня репозитория:
-  "RealtyWatch_Win\\runtime\\python\\python.exe" release\\make_release.py [--with-db]
+  "RealtyWatch_Win\\runtime\\python\\python.exe" release\\make_release.py [--with-db] [--version 1.0]
 """
 import datetime
 import io
@@ -54,14 +57,19 @@ def add_db(zout):
 
 def main():
     sys.stdout.reconfigure(errors="replace")  # консоль Windows может не знать кириллицу
-    with_db = "--with-db" in sys.argv[1:]
+    args = sys.argv[1:]
+    with_db = "--with-db" in args
+    if "--version" in args and args.index("--version") + 1 >= len(args):
+        sys.exit("--version без номера: укажите, например, --version 1.0")
+    ver = args[args.index("--version") + 1] if "--version" in args else ""
     if subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--", "RealtyWatch_Win"], capture_output=True, text=True).stdout.strip():
         sys.exit("В папке RealtyWatch_Win есть незакоммиченные изменения — сначала закоммитьте их: архив собирается из коммита")
     commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     raw = subprocess.run(["git", "-C", str(REPO), "archive", "--format=zip", "--prefix=RealtyWatch/", "HEAD:RealtyWatch_Win"],
                          capture_output=True, check=True).stdout
     today = datetime.date.today().isoformat()
-    out = REPO / "dist" / f"RealtyWatch-{'с-базой' if with_db else 'portable'}-{today}.zip"
+    kind = "с-базой" if with_db else "portable"
+    out = REPO / "dist" / (f"RealtyWatch-{ver}-windows-{kind}.zip" if ver else f"RealtyWatch-{kind}-{today}.zip")
     out.parent.mkdir(exist_ok=True)
     howto = (REPO / "release" / "Как запустить.txt").read_text(encoding="utf-8")
     if with_db:
@@ -74,8 +82,8 @@ def main():
         zout.write(REPO / "README.md", "RealtyWatch/README.md")
         # с BOM и переводами строк Windows — чтобы Блокнот на любом компьютере открыл текст правильно
         zout.writestr("RealtyWatch/Как запустить.txt", "﻿" + howto.replace("\r\n", "\n").replace("\n", "\r\n"))
-        zout.writestr("RealtyWatch/version.txt", f"RealtyWatch, сборка {today}, коммит {commit}"
-                                                 f"{', с базой и фотографиями' if with_db else ''}\r\n")
+        zout.writestr("RealtyWatch/version.txt", f"RealtyWatch{' ' + ver if ver else ''}, сборка {today}, "
+                                                 f"коммит {commit}{', с базой и фотографиями' if with_db else ''}\r\n")
         files = add_db(zout) if with_db else 0
     names = zipfile.ZipFile(out).namelist()
     bad = [n for n in names if any(x in n for x in FORBIDDEN) and not (with_db and n.startswith(DB_PREFIX))]
