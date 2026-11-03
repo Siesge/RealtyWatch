@@ -79,6 +79,17 @@ jobs:
       - name: Упаковать .app (ditto сохраняет права на запуск)
         run: ditto -c -k --sequesterRsrc --keepParent dist/RealtyWatch.app dist/RealtyWatch.zip
 
+      - name: Собрать RealtyWatch.dmg — его и пересылают
+        run: |
+          ./build_dmg.sh
+          hdiutil verify dist/RealtyWatch.dmg
+          du -h dist/RealtyWatch.dmg
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: RealtyWatch-dmg
+          path: RealtyWatch_Mac/dist/RealtyWatch.dmg
+
       - uses: actions/upload-artifact@v7
         with:
           name: RealtyWatch-app
