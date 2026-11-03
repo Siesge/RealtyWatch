@@ -170,6 +170,8 @@ class Mouse:
                     break
                 ratio = (cur - start) / moved if abs(moved) > 5 else 1.0  # кусочек может ехать не 1:1 с ручкой
                 moved = self._burst(sx, sy, moved, (target - cur) / max(0.5, min(1.5, ratio or 1.0)))
+            else:  # поправки кончились, а кусочек ещё едет: отпускать ползунок на ходу — не по-человечески
+                cur = self._settled(position)
         self.wait(random.uniform(0.12, 0.3))  # рука замерла на месте, прежде чем отпустить
         self.page.mouse.up()
         return cur
