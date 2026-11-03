@@ -9,6 +9,16 @@ RealtyWatch_Win/exports/
 RealtyWatch_Win/profiles/
 RealtyWatch_Win/logs/
 
+# Форк для macOS: обычно всё это лежит в ~/Library/Application Support/RealtyWatch,
+# но рабочую папку можно задать переменной RW_HOME — в том числе внутри репозитория
+RealtyWatch_Mac/runtime/
+RealtyWatch_Mac/browsers/
+RealtyWatch_Mac/data/
+RealtyWatch_Mac/database/
+RealtyWatch_Mac/exports/
+RealtyWatch_Mac/profiles/
+RealtyWatch_Mac/logs/
+
 __pycache__/
 *.pyc
 .venv/
