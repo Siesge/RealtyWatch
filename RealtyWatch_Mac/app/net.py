@@ -355,6 +355,21 @@ class Browser:
         except Exception:
             pass
 
+    def _still(self, el):
+        """Где элемент, когда страница перестала ехать. Колёсико прокручивает плавно, и прямоугольник,
+        снятый на ходу, показывает не то место, куда мышь попадёт мгновением позже. Это ожидание страницы,
+        а не человека, — поэтому в тестах оно не ускоряется."""
+        b = el.bounding_box()
+        for _ in range(10):
+            self.mouse.idle(random.uniform(0.07, 0.11))
+            nxt = el.bounding_box()
+            if nxt is None or b is None:
+                return nxt
+            if abs(nxt["y"] - b["y"]) < 0.5:  # два замера на одном месте — страница доехала
+                return nxt
+            b = nxt
+        return b
+
     def box(self, selector):
         """Прямоугольник элемента в окне (для мыши) или None. Если элемент за краем окна — сначала
         прокрутка к нему колёсиком, как это сделал бы человек."""
@@ -363,7 +378,7 @@ class Browser:
             if el is None:
                 return None
             for _ in range(30):
-                b = el.bounding_box()
+                b = self._still(el)
                 if b is None:
                     return None
                 vh = self.page.evaluate("() => window.innerHeight")
@@ -371,8 +386,7 @@ class Browser:
                     return b
                 n = max(1, min(5, int(abs(b["y"] - vh * 0.45) / human.WHEEL_NOTCH)))
                 self.mouse.wheel(n if b["y"] > vh * 0.45 else -n)
-                self.mouse.wait(random.uniform(0.25, 0.7))
-            return el.bounding_box()
+            return self._still(el)
         except Stopped:
             raise
         except Exception:

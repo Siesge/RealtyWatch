@@ -53,7 +53,7 @@ class Mouse:
         if s > 0:
             time.sleep(s * TIME_SCALE)
 
-    def _idle(self, s):
+    def idle(self, s):
         """Пауза, которая ждёт страницу, а не изображает человека, — поэтому не ускоряется в тестах."""
         self._check()
         if s > 0:
@@ -170,6 +170,8 @@ class Mouse:
                     break
                 ratio = (cur - start) / moved if abs(moved) > 5 else 1.0  # кусочек может ехать не 1:1 с ручкой
                 moved = self._burst(sx, sy, moved, (target - cur) / max(0.5, min(1.5, ratio or 1.0)))
+            else:  # поправки кончились, а кусочек ещё едет: отпускать ползунок на ходу — не по-человечески
+                cur = self._settled(position)
         self.wait(random.uniform(0.12, 0.3))  # рука замерла на месте, прежде чем отпустить
         self.page.mouse.up()
         return cur
@@ -199,7 +201,7 @@ class Mouse:
         Эти паузы ждут не «как человек», а пока страница дорисует, поэтому в тестах они не ускоряются."""
         cur, calm = position(), 0
         for _ in range(7):
-            self._idle(random.uniform(0.07, 0.11))
+            self.idle(random.uniform(0.07, 0.11))
             nxt = position()
             if nxt is None or cur is None:
                 return nxt

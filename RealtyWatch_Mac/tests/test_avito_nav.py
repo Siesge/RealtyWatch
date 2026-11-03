@@ -128,7 +128,7 @@ class AvitoLikeHuman(Case):
         searches = {p: h for kind, p, h in Site.hits if kind == "search"}
         self.assertEqual(sorted(searches), [1, 2, 3, 4], "каждая страница выдачи открыта один раз")
         for p in (2, 3, 4):
-            self.assertIn(f"p={p - 1}" if p > 2 else "prodam-TEST", searches[p]["Referer"], f"стр. {p}: переход со страницы {p - 1}")
+            self.assertIn(f"p={p - 1}" if p > 2 else "prodam-TEST", searches[p]["Referer"], f"стр. {p}: переход со страницы {p - 1}; журнал: {log}")
             self.assertEqual(searches[p]["Sec-Fetch-Site"], "same-origin", f"стр. {p}: переход кликом, а не по адресу")
             self.assertEqual(searches[p]["Sec-Fetch-User"], "?1", f"стр. {p}: переход по действию человека")
 
