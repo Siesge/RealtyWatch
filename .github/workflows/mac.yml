@@ -84,6 +84,12 @@ jobs:
           ./build_dmg.sh
           hdiutil verify dist/RealtyWatch.dmg
           du -h dist/RealtyWatch.dmg
+          # образ не просто целый: внутри лежит запускаемое приложение и ярлык, на который его тянут
+          hdiutil attach dist/RealtyWatch.dmg -nobrowse -readonly -mountpoint /tmp/rw-dmg
+          ls -l /tmp/rw-dmg
+          [ -x /tmp/rw-dmg/RealtyWatch.app/Contents/MacOS/RealtyWatch ] || { echo "в образе нет запускаемого приложения"; exit 1; }
+          [ -L "/tmp/rw-dmg/Программы" ] || { echo "в образе нет ярлыка Программ"; exit 1; }
+          hdiutil detach /tmp/rw-dmg
 
       - uses: actions/upload-artifact@v7
         with:
