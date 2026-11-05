@@ -44,7 +44,7 @@ class Schedule(unittest.TestCase):
         def rec(sources, auto=False):
             got = orig(sources, auto)
             for s in got:
-                starts[s].append(round(time.time() - t0))
+                starts[s].append(time.time() - t0)  # без округления: шаг расписания — секунда, в целых счёт врёт
             return got
         m.start = rec
         sc = scheduler.Scheduler(m)
@@ -59,10 +59,14 @@ class Schedule(unittest.TestCase):
             time.sleep(0.1)
 
         # быстрые сайты — каждый шаг; Авито — только когда закончил прошлый сбор
+        at = lambda ss: [round(x, 2) for x in ss]  # noqa: E731 — только для текста ошибки
         self.assertGreaterEqual(len(starts["cian"]), 8)
-        self.assertTrue(all(b - a <= 2 for a, b in zip(starts["cian"], starts["cian"][1:])))
+        self.assertTrue(all(b - a <= 2 * STEP + 0.5 for a, b in zip(starts["cian"], starts["cian"][1:])), at(starts["cian"]))
         self.assertLessEqual(len(starts["avito"]), 4)
-        self.assertTrue(all(b - a >= 3 for a, b in zip(starts["avito"], starts["avito"][1:])), starts["avito"])
+        # Между запусками Авито — не меньше, чем длится один его сбор: значит, идущий сбор не перезапускали.
+        # Это и есть проверяемое правило. В целых секундах его не проверить: запуски попадают на целые
+        # секунды расписания, и настоящий промежуток 2,5 с виден как разница в 2 — тест мерцал на этом.
+        self.assertTrue(all(b - a >= DUR["avito"] for a, b in zip(starts["avito"], starts["avito"][1:])), at(starts["avito"]))
         # быстрые сайты уведомляют без Авито
         self.assertTrue(any(s == ["cian", "yandex"] for _, s in notes), notes)
         self.assertTrue(any(s == ["avito"] for _, s in notes), notes)
