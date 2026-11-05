@@ -57,6 +57,11 @@ jobs:
           [ -x "$APP/Contents/MacOS/RealtyWatch" ] || { echo "запускатор не исполняемый"; exit 1; }
           [ -s "$APP/Contents/Resources/icon.icns" ] || { echo "иконка не собралась"; exit 1; }
           [ -f "$APP/Contents/Resources/app/main.py" ] || { echo "кода нет внутри бандла"; exit 1; }
+          # version.txt — из него окно «О программе» берёт номер версии
+          V="$APP/Contents/Resources/version.txt"
+          [ -s "$V" ] || { echo "version.txt не положен в бандл"; exit 1; }
+          cat "$V"
+          grep -q '^RealtyWatch ' "$V" || { echo "version.txt начинается не с имени — about.py не разберёт"; exit 1; }
           /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist"
           codesign -dv "$APP" 2>&1 | head -3
@@ -76,6 +81,14 @@ jobs:
           echo
           curl -fsS http://127.0.0.1:8765/ | grep -q "<title>RealtyWatch</title>"
           echo "интерфейс отдаётся"
+          # окно «О программе»: версии библиотек и Chromium берутся с живой среды
+          curl -fsS http://127.0.0.1:8765/api/about > /tmp/about.json
+          "$PY" -c 'import json; d=json.load(open("/tmp/about.json")); v={i["name"]: i["version"] for g in d["groups"] for i in g["items"]}; print("о программе:", d["author"], "|", d["version"] or "без номера версии"); print("версии:", {k: x for k, x in v.items() if x}); assert v["Python"] and v["Chromium"], "версии среды не определились"; assert not [k for k, x in v.items() if k in ("pythonnet", "pystray")], "в списке лицензий остались библиотеки Windows"'
+          # выгрузка избранного: на пустой базе эндпоинт должен сказать «пусто», а не упасть
+          CODE="$(curl -s -o /tmp/liked.json -w '%{http_code}' -X POST http://127.0.0.1:8765/api/liked/export)"
+          cat /tmp/liked.json; echo
+          [ "$CODE" = "400" ] || { echo "ожидали 400 на пустом избранном, получили $CODE"; exit 1; }
+          echo "экспорт избранного на месте"
           kill "$SRV" 2>/dev/null || true
 
       - name: Всё лежит в одной папке

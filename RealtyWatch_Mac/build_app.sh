@@ -6,6 +6,7 @@
 #   RealtyWatch.app/Contents/MacOS/RealtyWatch  — запускатор (bin/launch.sh)
 #   RealtyWatch.app/Contents/Resources/         — app/, web/, assets/, bin/, requirements.txt
 #   RealtyWatch.app/Contents/Resources/icon.icns
+#   RealtyWatch.app/Contents/Resources/version.txt — отсюда окно «О программе» берёт номер версии
 # Среда выполнения (Python, библиотеки, Chromium) в бандл не кладётся: её приносит первый запуск
 # в ~/Library/Application Support/RealtyWatch — так бандл остаётся на 2 МБ и не зависит от процессора.
 set -euo pipefail
@@ -27,6 +28,12 @@ for item in app web assets bin requirements.txt; do
 done
 find "$APP/Contents/Resources" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 chmod +x "$APP/Contents/Resources/bin/"*.sh
+
+# Номер версии — файлом рядом с кодом: его читает окно «О программе» (app/about.py).
+# Первая строка в том же виде, что у Windows-сборки, — разбор у них общий.
+COMMIT="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || true)"
+printf 'RealtyWatch %s, сборка %s%s\n' "$VERSION" "$(date +%F)" "${COMMIT:+, коммит $COMMIT}" \
+  > "$APP/Contents/Resources/version.txt"
 
 # запускатор
 cp "$HERE/bin/launch.sh" "$APP/Contents/MacOS/RealtyWatch"
@@ -63,6 +70,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSHighResolutionCapable</key>   <true/>
   <key>NSAppleEventsUsageDescription</key>
   <string>Чтобы показать окно браузера, когда сайт просит пройти проверку.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Чтобы сохранить на рабочий стол выгрузку базы или страницу с избранным.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Чтобы сохранить в «Документы» выгрузку базы или страницу с избранным.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Чтобы сохранить в «Загрузки» выгрузку базы или страницу с избранным.</string>
 </dict>
 </plist>
 PLIST

@@ -31,6 +31,7 @@ const ICON = {
   list: '<svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
   chart: '<svg viewBox="0 0 24 24"><path d="M4 19h16M6 15l4-4 3 3 5-6"/></svg>',
   img: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 5-4.5 4 3.5 3-2.5 4 3.5"/></svg>',
+  share: '<svg viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4"/></svg>',
 };
 
 let LASTRUN = {}, ALL = [], OBJS = [], SETTINGS = null, view = "cards", jAfter = 0, lastStates = {};
@@ -143,6 +144,7 @@ function renderHeader(rows) {
   for (const z of ["A", "B", "C"]) $(`#zc-${z}`).textContent = zr.filter(o => o.zone === z).length;
   const likes = OBJS.filter(o => o.liked).length;
   $("#likeCount").textContent = likes || "";
+  $("#btnShare").disabled = !likes;  // выгружать нечего, пока ничего не отмечено сердечком
   const ppm = median(rows.map(o => o.price_m2).filter(Boolean));
   const pr = median(rows.map(o => o.price).filter(Boolean));
   const multi = rows.filter(o => o.sources.length > 1).length;
@@ -804,19 +806,22 @@ async function renderSettings() {
     <div class="s-card s-db" id="dbCard"><h3>База данных</h3><p class="hint">Объявления, фото, избранное, история цен и настройки поиска — в папке database. Перенос на другое устройство: «Экспорт» здесь → «Импорт» там.</p>
       <div class="db-stats" id="dbStats"></div>
       <div class="db-path" id="dbPath" title="Папка базы — её можно копировать целиком"></div>
-      <div class="db-backups" id="dbBackups" title="Резервные копии лежат в database\\backups: перед импортом и очисткой база сохраняется туда автоматически. Восстановить — «Импорт…» с режимом «заменить полностью»"></div>
+      <div class="db-backups" id="dbBackups" title="Резервные копии лежат в database/backups: перед импортом и очисткой база сохраняется туда автоматически. Восстановить — «Импорт…» с режимом «заменить полностью»"></div>
       <div class="db-actions"><div class="btn-row">
         <button class="btn-sec" id="btnExport" title="Сохранить всю базу (объявления, фото, избранное, историю, настройки поиска) в один .zip">${ICON.down}Экспорт…</button>
-        <button class="btn-sec" id="btnImport" title="Загрузить базу из .zip. Перед импортом текущая база сохраняется в database\\backups">${ICON.up}Импорт…</button>
+        <button class="btn-sec" id="btnImport" title="Загрузить базу из .zip. Перед импортом текущая база сохраняется в database/backups">${ICON.up}Импорт…</button>
         <select id="impMode" title="«Объединить» — добавить новое и обновить более свежим; «заменить» — полностью заменить текущую базу"><option value="merge">объединить с текущей</option><option value="replace">заменить полностью</option></select>
       </div>
       <div class="btn-row" style="margin-top:8px">
         <button class="btn-sec" id="btnImages" title="Скачать фото, которые не загрузились (повторяется и само — после сбора и при запуске)">${ICON.img}Догрузить фото</button>
         <button class="btn-sec" id="btnRecheck" title="Открыть на сайтах все объявления, помеченные снятыми, и вернуть те, что на самом деле активны. Авито проверяется через браузер — это дольше">${ICON.ok}Перепроверить снятые</button>
-        ${desktop() ? `<button class="btn-sec" id="btnFolder" title="Открыть папку database в Проводнике">${ICON.folder}Открыть папку</button>` : ""}
+        ${desktop() ? `<button class="btn-sec" id="btnFolder" title="Открыть папку database в Finder">${ICON.folder}Открыть папку</button>` : ""}
+      </div>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn-sec" id="btnShareLiked" title="Сохранить избранное одной веб-страницей: плитки и таблица со своими фильтрами и сортировками, фотографии внутри файла. Открывается без интернета и без программы — такой файл можно просто отправить">${ICON.share}Экспорт избранного…</button>
       </div></div>
     </div>
-    <div class="s-card s-purge"><h3>Очистка данных</h3><p class="hint">Если сбор прошёл неудачно — сайт отдал не ту выдачу или парсер ошибся, — данные этих дней можно убрать из статистики. Перед любой очисткой база сохраняется в database\\backups.</p>
+    <div class="s-card s-purge"><h3>Очистка данных</h3><p class="hint">Если сбор прошёл неудачно — сайт отдал не ту выдачу или парсер ошибся, — данные этих дней можно убрать из статистики. Перед любой очисткой база сохраняется в database/backups.</p>
       ${field("Период", `<span class="pair dates"><input type="date" id="pFrom" title="С какого дня (включительно). Пусто — с самого начала"><i>—</i><input type="date" id="pTo" title="По какой день (включительно). Пусто — по сегодня"></span>`,
         "Обе даты включительно. Пустое «с» — с самого начала, пустое «по» — по сегодняшний день.")}
       <div class="purge-presets"><span>Быстро:</span>${[["today", "сегодня"], ["yesterday", "вчера"], ["3", "3 дня"], ["7", "неделя"], ["from-start", "всё до вчера"]]
@@ -824,7 +829,7 @@ async function renderSettings() {
       <div class="purge-prev" id="purgePrev" title="Удаляются: проверки рынка (точки графиков), изменения, прогоны и записи цен за период; объявления, которые видели только в эти дни, — целиком. Снятые в эти дни возвращаются в продажу и проверятся заново при следующем сборе">Выберите период — здесь появится, что будет удалено.</div>
       <div class="btn-row"><button class="btn-sec danger" id="btnPurge" disabled title="Удалить данные выбранного периода (с резервной копией)">${ICON.trash}Удалить данные за период…</button></div>
       <div class="purge-all"><span>Полностью: все объявления, история, изменения, избранное и фото. Настройки поиска и круг останутся.</span>
-        <button class="btn-sec danger" id="btnClearAll" title="Очистить всю базу (с резервной копией в database\\backups)">${ICON.trash}Очистить всю базу…</button></div>
+        <button class="btn-sec danger" id="btnClearAll" title="Очистить всю базу (с резервной копией в database/backups)">${ICON.trash}Очистить всю базу…</button></div>
     </div>
     <div class="s-actions"><button class="btn-primary" id="btnSave" title="Сохранить настройки и сразу пересчитать зоны, отсев и объединение дублей">Сохранить и пересчитать</button><span class="meta">Зоны, отсев и объединение пересчитаются сразу, параметры поиска — при следующем сборе.</span></div>
   </div>`;
@@ -837,6 +842,7 @@ async function renderSettings() {
     catch (e) { toast("warn", "Не получилось", e.message); }
   };
   if ($("#btnFolder")) $("#btnFolder").onclick = () => desktop().open_db_folder();
+  $("#btnShareLiked").onclick = () => shareLiked($("#btnShareLiked"));
   initPurge();
   renderDbInfo();
 }
@@ -871,7 +877,7 @@ function initPurge() {
     refresh();
   });
   btn.onclick = () => confirmBox("Удалить данные за период?",
-    `${prev.innerHTML}<p class="meta">Графики, изменения и прогоны этих дней исчезнут, история пересчитается. Резервная копия базы сохранится в database\\backups.</p>`,
+    `${prev.innerHTML}<p class="meta">Графики, изменения и прогоны этих дней исчезнут, история пересчитается. Резервная копия базы сохранится в database/backups.</p>`,
     "Удалить", async () => {
       const r = await post("/api/db/purge", { from: from.value, to: to.value });
       toast("ok", "Данные за период удалены", `Объявлений: ${r.listings}, проверок рынка: ${r.snapshots}, изменений: ${r.events}. Резервная копия: ${r.backup}`);
@@ -880,7 +886,7 @@ function initPurge() {
     });
   $("#btnClearAll").onclick = () => confirmBox("Очистить всю базу?",
     `<p>Будут удалены <b>все</b> объявления, история цен, изменения, проверки рынка, прогоны, избранное и фото. Настройки поиска и круг останутся.</p>
-     <p class="meta">Резервная копия базы с фото сохранится в database\\backups.</p>
+     <p class="meta">Резервная копия базы с фото сохранится в database/backups.</p>
      <label class="confirm-type">Для подтверждения введите слово <b>ОЧИСТИТЬ</b><input type="text" id="clearWord" autocomplete="off"></label>`,
     "Очистить всё", async () => {
       const r = await post("/api/db/clear", { confirm: "ОЧИСТИТЬ" });
@@ -935,6 +941,43 @@ async function doExport() {
   } finally { btn.disabled = false; }
 }
 
+// Избранное одной веб-страницей: файл автономный (фото и стили внутри) — его отправляют посмотреть
+async function shareLiked(btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = desktop() ? await desktop().export_liked() : await post("/api/liked/export");
+    if (r && r.error) toast("warn", "Выгружать нечего", r.error);
+    else if (r && !r.cancelled) toast("ok", `Избранное выгружено: ${r.objects} ${plural(r.objects, "объект", "объекта", "объектов")}`, r.path);
+  } catch (e) {
+    toast("warn", "Не удалось выгрузить", e.message || String(e));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---------- о программе ----------
+async function aboutBox() {
+  let d;
+  try {
+    d = await api("/api/about");
+  } catch (e) {
+    return toast("warn", "Не удалось открыть", e.message || String(e));
+  }
+  const row = i => `<tr><td><b>${esc(i.name)}</b>${i.version ? ` <span>${esc(i.version)}</span>` : ""}</td>
+    <td>${esc(i.license)}</td><td>${esc(i.what)}</td></tr>`;
+  $("#modalBody").innerHTML = `<div class="about-win">
+    <header><img src="/static/icon.png" alt=""><div><h3>${esc(d.name)}${d.version ? ` ${esc(d.version)}` : ""}</h3>
+      <p>${esc(d.about)}</p></div></header>
+    <p class="about-author">Автор — <b>${esc(d.author)}</b></p>
+    <h4 class="about-h">Используемые библиотеки и данные</h4>
+    ${d.groups.map(g => `<section class="about-grp"><h5>${esc(g.title)}</h5><table>${g.items.map(row).join("")}</table></section>`).join("")}
+    <p class="about-note">Каждая библиотека распространяется по своей лицензии: её полный текст идёт в составе пакета
+      и опубликован на странице проекта. Карта и границы города — данные OpenStreetMap, © участники OpenStreetMap,
+      лицензия ODbL 1.0.</p>
+  </div>`;
+  $("#modal").classList.remove("hidden");
+}
+
 async function doImport() {
   let path;
   if (desktop()) {
@@ -946,7 +989,7 @@ async function doImport() {
     if (!path) return;
   }
   const mode = $("#impMode").value;
-  if (mode === "replace" && !confirm("Заменить текущую базу содержимым архива? Текущая база будет сохранена в database\\backups.")) return;
+  if (mode === "replace" && !confirm("Заменить текущую базу содержимым архива? Текущая база будет сохранена в database/backups.")) return;
   toast("ok", "Импорт…", "Это может занять до минуты");
   try {
     const r = await post("/api/db/import", { path, mode });
@@ -1159,6 +1202,8 @@ $("#jToggle").onclick = () => { $("#journal").classList.toggle("collapsed"); $("
 $("#jClose").onclick = () => $("#journal").classList.add("collapsed");
 $("#btnSide").onclick = () => setSide(!sideOn());
 $("#btnGroup").onclick = () => setGroup(!groupOn());
+$("#btnShare").onclick = () => shareLiked($("#btnShare"));
+$("#brand").onclick = aboutBox;
 $$("#theme button").forEach(b => b.onclick = () => setTheme(b.dataset.t));
 $("#cardsList").addEventListener("mouseover", e => {
   const c = e.target.closest(".card");
