@@ -44,7 +44,7 @@ class Schedule(unittest.TestCase):
         def rec(sources, auto=False):
             got = orig(sources, auto)
             for s in got:
-                starts[s].append(round(time.time() - t0))
+                starts[s].append(time.time() - t0)
             return got
         m.start = rec
         sc = scheduler.Scheduler(m)
@@ -58,11 +58,16 @@ class Schedule(unittest.TestCase):
         while m.any_running():
             time.sleep(0.1)
 
-        # быстрые сайты — каждый шаг; Авито — только когда закончил прошлый сбор
+        def at(s):
+            """Времена запусков с сотыми — в сообщение об ошибке."""
+            return [round(x, 2) for x in starts[s]]
+
+        # Быстрые сайты — каждый шаг; Авито — только когда закончил прошлый сбор. Времена точные:
+        # округление до секунд превращало верный промежуток 2.5 в «2» и роняло тест на правильном поведении.
         self.assertGreaterEqual(len(starts["cian"]), 8)
-        self.assertTrue(all(b - a <= 2 for a, b in zip(starts["cian"], starts["cian"][1:])))
+        self.assertTrue(all(b - a <= 2 * STEP + 0.5 for a, b in zip(starts["cian"], starts["cian"][1:])), at("cian"))
         self.assertLessEqual(len(starts["avito"]), 4)
-        self.assertTrue(all(b - a >= 3 for a, b in zip(starts["avito"], starts["avito"][1:])), starts["avito"])
+        self.assertTrue(all(b - a >= DUR["avito"] for a, b in zip(starts["avito"], starts["avito"][1:])), at("avito"))
         # быстрые сайты уведомляют без Авито
         self.assertTrue(any(s == ["cian", "yandex"] for _, s in notes), notes)
         self.assertTrue(any(s == ["avito"] for _, s in notes), notes)
