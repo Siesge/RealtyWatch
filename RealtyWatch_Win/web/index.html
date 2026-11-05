@@ -16,10 +16,10 @@
 <div class="app">
 
   <aside class="sidebar">
-    <div class="brand">
+    <button class="brand" id="brand" title="О программе: автор, версия и лицензии">
       <img src="/static/icon.png" alt="">
       <div><div class="brand-name">RealtyWatch</div><div class="brand-sub">Ялта · квартиры</div></div>
-    </div>
+    </button>
 
     <nav class="nav">
       <button data-view="dashboard" class="active" title="Сводка рынка: цены, динамика, новые и снятые объявления, избранное"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Дашборд</button>
@@ -108,6 +108,7 @@
         <label class="check wide" title="Показать только объекты без координат (их нельзя отнести к зоне точно)"><input type="checkbox" id="fNoCoords"><span>без координат</span></label>
         <button id="btnReset" class="link" title="Вернуть фильтры просмотра по умолчанию">Сбросить</button>
         <span class="tb-right">
+        <button id="btnShare" class="toggle" title="Сохранить избранное одной веб-страницей: плитки и таблица со своими фильтрами, фотографии внутри файла. Открывается без интернета — такой файл можно просто отправить"><svg viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4"/></svg><span>Выгрузить</span></button>
         <button id="btnGroup" class="toggle" title="Разделить карточки на блоки по зонам (круг / Ялта / посёлки) или показать одним списком"><svg viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6" rx="1.5"/><rect x="3.5" y="14" width="17" height="6" rx="1.5"/></svg><span>По зонам</span></button>
         <button id="btnSide" class="toggle" title="Карта рядом с карточками. Разделитель между ними можно двигать"><svg viewBox="0 0 24 24"><path d="M9 4 3 6.5v13.5l6-2.5 6 2.5 6-2.5V4l-6 2.5L9 4z"/></svg><span>Карта рядом</span></button>
         </span>

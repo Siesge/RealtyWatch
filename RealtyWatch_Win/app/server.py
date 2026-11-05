@@ -6,7 +6,7 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import alerts, db, dedupe, geo, history, images, paths, purge, rules, runlog, settings, transfer
+from . import about, alerts, db, dedupe, geo, history, images, paths, purge, rules, runlog, settings, share, transfer
 from .paths import EXPORTS, WEB
 from .runner import manager
 from .scrapers import SCRAPERS
@@ -165,6 +165,26 @@ def db_import(body: dict = Body(...)):
     except (ValueError, KeyError, OSError) as e:
         raise HTTPException(400, str(e))
     manager.log("db", f"импорт базы ({res['mode']}): добавлено {res['added']}, обновлено {res['updated']}, фото {res['images']}")
+    return res
+
+
+@app.get("/api/about")
+def about_info():
+    return about.info()
+
+
+@app.post("/api/liked/export")
+def liked_export(body: dict = Body(default={})):
+    """Избранное одной автономной веб-страницей. Без окна программы (отладочный сервер) — в папку exports."""
+    con = db.connect()
+    try:
+        if not share.has_liked(con):
+            raise HTTPException(400, "в избранном пусто")
+        EXPORTS.mkdir(exist_ok=True)
+        res = share.export(body.get("path") or str(EXPORTS / share.default_name()), con)
+    finally:
+        con.close()
+    manager.log("db", f"избранное выгружено: {res['path']} ({res['objects']} объектов, {res['mb']} МБ)")
     return res
 
 

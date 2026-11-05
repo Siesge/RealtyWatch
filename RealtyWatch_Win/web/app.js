@@ -31,6 +31,7 @@ const ICON = {
   list: '<svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
   chart: '<svg viewBox="0 0 24 24"><path d="M4 19h16M6 15l4-4 3 3 5-6"/></svg>',
   img: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 5-4.5 4 3.5 3-2.5 4 3.5"/></svg>',
+  share: '<svg viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4"/></svg>',
 };
 
 let LASTRUN = {}, ALL = [], OBJS = [], SETTINGS = null, view = "cards", jAfter = 0, lastStates = {};
@@ -143,6 +144,7 @@ function renderHeader(rows) {
   for (const z of ["A", "B", "C"]) $(`#zc-${z}`).textContent = zr.filter(o => o.zone === z).length;
   const likes = OBJS.filter(o => o.liked).length;
   $("#likeCount").textContent = likes || "";
+  $("#btnShare").disabled = !likes;  // выгружать нечего, пока ничего не отмечено сердечком
   const ppm = median(rows.map(o => o.price_m2).filter(Boolean));
   const pr = median(rows.map(o => o.price).filter(Boolean));
   const multi = rows.filter(o => o.sources.length > 1).length;
@@ -814,6 +816,9 @@ async function renderSettings() {
         <button class="btn-sec" id="btnImages" title="Скачать фото, которые не загрузились (повторяется и само — после сбора и при запуске)">${ICON.img}Догрузить фото</button>
         <button class="btn-sec" id="btnRecheck" title="Открыть на сайтах все объявления, помеченные снятыми, и вернуть те, что на самом деле активны. Авито проверяется через браузер — это дольше">${ICON.ok}Перепроверить снятые</button>
         ${desktop() ? `<button class="btn-sec" id="btnFolder" title="Открыть папку database в Проводнике">${ICON.folder}Открыть папку</button>` : ""}
+      </div>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn-sec" id="btnShareLiked" title="Сохранить избранное одной веб-страницей: плитки и таблица со своими фильтрами и сортировками, фотографии внутри файла. Открывается без интернета и без программы — такой файл можно просто отправить">${ICON.share}Экспорт избранного…</button>
       </div></div>
     </div>
     <div class="s-card s-purge"><h3>Очистка данных</h3><p class="hint">Если сбор прошёл неудачно — сайт отдал не ту выдачу или парсер ошибся, — данные этих дней можно убрать из статистики. Перед любой очисткой база сохраняется в database\\backups.</p>
@@ -837,6 +842,7 @@ async function renderSettings() {
     catch (e) { toast("warn", "Не получилось", e.message); }
   };
   if ($("#btnFolder")) $("#btnFolder").onclick = () => desktop().open_db_folder();
+  $("#btnShareLiked").onclick = () => shareLiked($("#btnShareLiked"));
   initPurge();
   renderDbInfo();
 }
@@ -933,6 +939,43 @@ async function doExport() {
   } catch (e) {
     toast("warn", "Экспорт не удался", e.message || String(e));
   } finally { btn.disabled = false; }
+}
+
+// Избранное одной веб-страницей: файл автономный (фото и стили внутри) — его отправляют посмотреть
+async function shareLiked(btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = desktop() ? await desktop().export_liked() : await post("/api/liked/export");
+    if (r && r.error) toast("warn", "Выгружать нечего", r.error);
+    else if (r && !r.cancelled) toast("ok", `Избранное выгружено: ${r.objects} ${plural(r.objects, "объект", "объекта", "объектов")}`, r.path);
+  } catch (e) {
+    toast("warn", "Не удалось выгрузить", e.message || String(e));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---------- о программе ----------
+async function aboutBox() {
+  let d;
+  try {
+    d = await api("/api/about");
+  } catch (e) {
+    return toast("warn", "Не удалось открыть", e.message || String(e));
+  }
+  const row = i => `<tr><td><b>${esc(i.name)}</b>${i.version ? ` <span>${esc(i.version)}</span>` : ""}</td>
+    <td>${esc(i.license)}</td><td>${esc(i.what)}</td></tr>`;
+  $("#modalBody").innerHTML = `<div class="about-win">
+    <header><img src="/static/icon.png" alt=""><div><h3>${esc(d.name)}${d.version ? ` ${esc(d.version)}` : ""}</h3>
+      <p>${esc(d.about)}</p></div></header>
+    <p class="about-author">Автор — <b>${esc(d.author)}</b></p>
+    <h4 class="about-h">Используемые библиотеки и данные</h4>
+    ${d.groups.map(g => `<section class="about-grp"><h5>${esc(g.title)}</h5><table>${g.items.map(row).join("")}</table></section>`).join("")}
+    <p class="about-note">Каждая библиотека распространяется по своей лицензии: её полный текст идёт в составе пакета
+      и опубликован на странице проекта. Карта и границы города — данные OpenStreetMap, © участники OpenStreetMap,
+      лицензия ODbL 1.0.</p>
+  </div>`;
+  $("#modal").classList.remove("hidden");
 }
 
 async function doImport() {
@@ -1159,6 +1202,8 @@ $("#jToggle").onclick = () => { $("#journal").classList.toggle("collapsed"); $("
 $("#jClose").onclick = () => $("#journal").classList.add("collapsed");
 $("#btnSide").onclick = () => setSide(!sideOn());
 $("#btnGroup").onclick = () => setGroup(!groupOn());
+$("#btnShare").onclick = () => shareLiked($("#btnShare"));
+$("#brand").onclick = aboutBox;
 $$("#theme button").forEach(b => b.onclick = () => setTheme(b.dataset.t));
 $("#cardsList").addEventListener("mouseover", e => {
   const c = e.target.closest(".card");

@@ -206,6 +206,21 @@ class DesktopApi:
             path += ".zip"
         return {"path": transfer.export_zip(path)}
 
+    def export_liked(self):
+        from . import db, share
+
+        con = db.connect()
+        try:
+            if not share.has_liked(con):
+                return {"error": "отметьте квартиры сердечком — выгружать пока нечего"}
+            path = self._dialog("SAVE", file_types=("Страница с избранным (*.html)",),
+                                directory=str(Path.home() / "Desktop"), save_filename=share.default_name())
+            if not path:
+                return {"cancelled": True}
+            return share.export(path, con)
+        finally:
+            con.close()
+
     def open_db_folder(self):
         os.startfile(str(paths.DB_DIR))
         return {"ok": True}
