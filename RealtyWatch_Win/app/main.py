@@ -319,7 +319,8 @@ def main():
                     # капча, которую программа не прошла сама, — уведомление Windows (окно браузера уже на экране)
                     from . import alerts
                     alerts.on_human_needed(lambda title, text: tray.notify(f"RealtyWatch — {title}", text))
-                    window.events.minimized += tray.hide  # свернуть = убрать в трей
+                    # «Свернуть» — обычная панель задач, «Закрыть» — в трей, если так в настройках
+                    window.events.closing += tray.on_close
 
             window.events.shown += on_shown
             webview.start(private_mode=False, storage_path=str(paths.DATA / "webview"))

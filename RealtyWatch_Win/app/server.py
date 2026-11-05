@@ -240,7 +240,7 @@ def get_settings():
 @app.post("/api/settings")
 def set_settings(cfg: dict = Body(...)):
     cur = settings.load()
-    for k in ("filters", "zone", "sites", "browser"):
+    for k in ("filters", "zone", "sites", "browser", "ui"):
         if k in cfg:
             cur[k] = cfg[k]
     settings.save(cur)

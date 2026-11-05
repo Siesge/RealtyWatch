@@ -13,6 +13,7 @@ class Tray:
         self.window = window
         self.click_view = "changes"
         self.hint_shown = False
+        self.quitting = False
         tray = self
 
         class _Icon(pystray.Icon):
@@ -49,12 +50,24 @@ class Tray:
         except Exception:
             pass
 
+    def on_close(self):
+        """Нажата кнопка «Закрыть». Если в настройках включено «сворачивать в трей по закрытию»,
+        окно уходит в трей, а закрытие отменяется (False); иначе программа закрывается как обычно.
+        Настройку читаем в момент нажатия — галочка действует сразу, без перезапуска."""
+        from . import settings
+        if self.quitting or not settings.load()["ui"].get("tray_on_close", True):
+            return True
+        self.hide()
+        return False
+
     def hide(self):
         self.window.hide()
         if not self.hint_shown:
             self.hint_shown = True
-            self.click_view = None
-            self.notify("RealtyWatch свёрнут в трей", "Сбор и автообновление продолжают работать. Двойной клик по значку — открыть.")
+            # уведомление — отдельным потоком: по «Закрыть» этот метод держит поток окна
+            threading.Thread(target=self.notify, daemon=True, args=(
+                "RealtyWatch свёрнут в трей",
+                "Сбор и автообновление продолжают работать. Двойной клик по значку — открыть.")).start()
 
     def notify(self, title, text, view=None):
         self.click_view = view
@@ -64,6 +77,7 @@ class Tray:
             pass
 
     def quit(self):
+        self.quitting = True  # «Выход» в меню значка: закрытие окна больше не перехватываем
         threading.Thread(target=self._quit, daemon=True).start()
 
     def _quit(self):

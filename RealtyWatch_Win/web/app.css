@@ -388,15 +388,15 @@ table.grid td.num.bad { color: var(--bad); }
 
 /* ---------- настройки ---------- */
 /* Настройки: слева «Параметры поиска», справа «Геозона» по содержимому и «База данных» до низа параметров;
-   ниже — «Сбор данных» и «Очистка данных» одной высоты */
+   ниже — «Сбор данных» слева, а справа «Очистка данных» и под ней «Интерфейс» */
 .settings { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; max-width: 1240px;
-  grid-template-areas: "params geo" "params db" "collect purge" "actions actions"; grid-template-rows: auto 1fr auto auto; }
-.s-params { grid-area: params; } .s-geo { grid-area: geo; } .s-db { grid-area: db; } .s-collect { grid-area: collect; } .s-purge { grid-area: purge; }
+  grid-template-areas: "params geo" "params db" "collect purge" "collect ui" "actions actions"; grid-template-rows: auto 1fr auto auto auto; }
+.s-params { grid-area: params; } .s-geo { grid-area: geo; } .s-db { grid-area: db; } .s-collect { grid-area: collect; } .s-purge { grid-area: purge; } .s-ui { grid-area: ui; }
 .settings .s-actions { grid-area: actions; }
 .s-db, .s-purge { display: flex; flex-direction: column; }
 .s-db .db-actions { margin-top: auto; }
 @media (max-width: 1100px) {
-  .settings { grid-template-columns: minmax(0, 1fr); grid-template-areas: "params" "geo" "db" "collect" "purge" "actions"; grid-template-rows: none; }
+  .settings { grid-template-columns: minmax(0, 1fr); grid-template-areas: "params" "geo" "db" "collect" "purge" "ui" "actions"; grid-template-rows: none; }
 }
 .s-card { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 22px; box-shadow: var(--shadow-1); }
 .s-card h3 { margin: 0 0 4px; font-size: 16px; font-weight: 800; }

@@ -831,6 +831,10 @@ async function renderSettings() {
       <div class="purge-all"><span>Полностью: все объявления, история, изменения, избранное и фото. Настройки поиска и круг останутся.</span>
         <button class="btn-sec danger" id="btnClearAll" title="Очистить всю базу (с резервной копией в database\\backups)">${ICON.trash}Очистить всю базу…</button></div>
     </div>
+    <div class="s-card s-ui"><h3>Интерфейс</h3><p class="hint">Поведение окна программы. Применяется сразу — отдельно сохранять не нужно.</p>
+      ${field("Сворачивать в трей по закрытию", sw("sTray", (SETTINGS.ui || {}).tray_on_close !== false),
+        "<b>Включено</b>: кнопка «Закрыть» убирает окно в трей — программа остаётся в области уведомлений, сбор и автообновление продолжаются (уведомление об этом приходит один раз за запуск). Чтобы выйти — «Выход» в меню значка в трее. <b>Выключено</b>: «Закрыть» закрывает программу. Кнопка «Свернуть» в обоих случаях сворачивает окно в панель задач, а значок в трее есть всегда — через него приходят уведомления о рынке и капче.")}
+    </div>
     <div class="s-actions"><button class="btn-primary" id="btnSave" title="Сохранить настройки и сразу пересчитать зоны, отсев и объединение дублей">Сохранить и пересчитать</button><span class="meta">Зоны, отсев и объединение пересчитаются сразу, параметры поиска — при следующем сборе.</span></div>
   </div>`;
   $("#btnSave").onclick = saveSettings;
@@ -843,6 +847,14 @@ async function renderSettings() {
   };
   if ($("#btnFolder")) $("#btnFolder").onclick = () => desktop().open_db_folder();
   $("#btnShareLiked").onclick = () => shareLiked($("#btnShareLiked"));
+  $("#sTray").onchange = async () => {
+    const on = $("#sTray").checked;
+    SETTINGS.ui = Object.assign(SETTINGS.ui || {}, { tray_on_close: on });
+    await post("/api/settings", { ui: SETTINGS.ui });
+    toast("ok", on ? "«Закрыть» свернёт в трей" : "«Закрыть» закроет программу",
+      on ? "Программа останется в области уведомлений, сбор и автообновление продолжатся. Выход — в меню значка в трее."
+         : "Сбор при закрытии остановится. «Свернуть» по-прежнему убирает окно в панель задач.");
+  };
   initPurge();
   renderDbInfo();
 }
