@@ -5,6 +5,13 @@ NIN_BALLOONUSERCLICK = 0x0405  # клик по всплывающему увед
 NIIF_NOSOUND = 0x10            # уведомление без звука
 
 
+def wanted():
+    """Нужен ли значок в трее. Он есть только с галочкой «сворачивать в трей по закрытию»:
+    без неё «Закрыть» закрывает программу, а значит, и уведомлениям Windows неоткуда взяться."""
+    from . import settings
+    return bool(settings.load()["ui"].get("tray_on_close", True))
+
+
 class Tray:
     def __init__(self, window, icon_path, title, on_update):
         import pystray
@@ -51,11 +58,10 @@ class Tray:
             pass
 
     def on_close(self):
-        """Нажата кнопка «Закрыть». Если в настройках включено «сворачивать в трей по закрытию»,
-        окно уходит в трей, а закрытие отменяется (False); иначе программа закрывается как обычно.
-        Настройку читаем в момент нажатия — галочка действует сразу, без перезапуска."""
-        from . import settings
-        if self.quitting or not settings.load()["ui"].get("tray_on_close", True):
+        """Нажата кнопка «Закрыть». Пока значок в трее есть, окно уходит в трей, а закрытие
+        отменяется (False); без галочки программа закрывается как обычно. Настройку читаем в момент
+        нажатия: «Выход» в меню значка и снятая галочка закрытие не перехватывают."""
+        if self.quitting or not wanted():
             return True
         self.hide()
         return False

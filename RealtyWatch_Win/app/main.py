@@ -159,9 +159,10 @@ def _changes_text(c):
     return " · ".join(parts)
 
 
-def _notify_hook(tray):
+def _notify_hook(tray=lambda: None):
     """Когда закончили все сайты одного запуска: уведомление, только если на рынке что-то изменилось.
-    Сайт, который собирает ещё с прошлого запуска, уведомляет отдельно, когда закончит."""
+    Сайт, который собирает ещё с прошлого запуска, уведомляет отдельно, когда закончит.
+    tray() — значок в трее на эту минуту или None: без галочки значка нет и уведомлений тоже."""
     from . import db, history
     from .runner import SOURCE_LABEL, manager
 
@@ -175,8 +176,9 @@ def _notify_hook(tray):
             manager.log("db", f"сбор завершён ({names}) — изменений на рынке нет")
             return
         manager.log("db", f"🔔 изменения на рынке ({names}): {text}")
-        if tray:
-            tray.notify(f"RealtyWatch: изменения на рынке — {names}", text + "\nНажмите, чтобы посмотреть", view="changes:last")
+        icon = tray()
+        if icon:
+            icon.notify(f"RealtyWatch: изменения на рынке — {names}", text + "\nНажмите, чтобы посмотреть", view="changes:last")
 
     return hook
 
@@ -293,14 +295,14 @@ def main():
     tray = None
     try:
         if server_only:
-            manager.on_launch_done.append(_notify_hook(None))
+            manager.on_launch_done.append(_notify_hook())
             print(f"RealtyWatch (сервер для отладки): {url}")
             while True:
                 time.sleep(1)
         else:
             import webview
 
-            from .tray import Tray
+            from .tray import Tray, wanted
 
             _set_app_id()
             api = DesktopApi()
@@ -310,17 +312,34 @@ def main():
             DesktopApi._window = window
             window.events.shown += _apply_icon
 
-            def on_shown():
+            hooked = False
+            tray_lock = threading.Lock()
+
+            def _tray(on):
+                """Значок в трее живёт ровно столько, сколько стоит галочка «сворачивать в трей
+                по закрытию»: сняли — убираем сразу, поставили — заводим, без перезапуска."""
                 nonlocal tray
-                if tray is None:
-                    tray = Tray(window, str(paths.ROOT / "assets" / "icon.png"), TITLE,
-                                on_update=lambda: manager.start(sched.get()["sources"]))
-                    manager.on_launch_done.append(_notify_hook(tray))
-                    # капча, которую программа не прошла сама, — уведомление Windows (окно браузера уже на экране)
-                    from . import alerts
-                    alerts.on_human_needed(lambda title, text: tray.notify(f"RealtyWatch — {title}", text))
-                    # «Свернуть» — обычная панель задач, «Закрыть» — в трей, если так в настройках
-                    window.events.closing += tray.on_close
+                with tray_lock:
+                    if on and tray is None:
+                        tray = Tray(window, str(paths.ROOT / "assets" / "icon.png"), TITLE,
+                                    on_update=lambda: manager.start(sched.get()["sources"]))
+                    elif tray and not on:
+                        tray.stop()
+                        tray = None
+
+            def on_shown():
+                nonlocal hooked
+                if hooked:
+                    return
+                hooked = True
+                manager.on_launch_done.append(_notify_hook(lambda: tray))
+                # капча, которую программа не прошла сама, — уведомление Windows (окно браузера уже на экране)
+                from . import alerts
+                alerts.on_human_needed(lambda title, text: tray and tray.notify(f"RealtyWatch — {title}", text))
+                # «Свернуть» — обычная панель задач, «Закрыть» — в трей, пока значок в трее есть
+                window.events.closing += (lambda: tray.on_close() if tray else True)
+                settings.on_change(lambda cfg: _tray(bool(cfg.get("ui", {}).get("tray_on_close", True))))
+                _tray(wanted())
 
             window.events.shown += on_shown
             webview.start(private_mode=False, storage_path=str(paths.DATA / "webview"))

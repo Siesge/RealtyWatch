@@ -47,6 +47,12 @@ DEFAULTS = {
 }
 
 _lock = threading.Lock()
+_watchers = []
+
+
+def on_change(fn):
+    """Кого позвать, когда настройки сохранили: значок в трее появляется и исчезает сразу."""
+    _watchers.append(fn)
 
 
 def _merge(base, over):
@@ -72,3 +78,8 @@ def load():
 def save(cfg):
     with _lock:
         SETTINGS_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    for fn in _watchers:  # вне замка: слушатель сам читает настройки
+        try:
+            fn(cfg)
+        except Exception:
+            pass

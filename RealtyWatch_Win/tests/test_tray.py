@@ -1,4 +1,5 @@
-"""Галочка «сворачивать в трей по закрытию»: что делает кнопка «Закрыть» и где стоит сама галочка.
+"""Галочка «сворачивать в трей по закрытию»: нужен ли значок в трее, что делает кнопка «Закрыть»
+и где стоит сама галочка.
 Настоящий значок в трее (pystray) не создаётся — проверяется решение Tray.on_close и разметка настроек.
 Настройки — во временной папке, реальный data/settings.json не затрагивается."""
 import time
@@ -39,6 +40,27 @@ class CloseButton(Case):
         t = FakeTray()
         self.assertIs(t.on_close(), False, "закрытие окна отменяется")
         self.assertEqual(t.window.hidden, 1, "окно ушло в трей")
+
+    def test_no_icon_without_tick(self):
+        self.assertIs(tray.wanted(), True, "с галочкой значок в трее нужен")
+        cfg = settings.load()
+        cfg["ui"]["tray_on_close"] = False
+        settings.save(cfg)
+        self.assertIs(tray.wanted(), False, "без галочки значка в трее нет вовсе")
+
+    def test_saving_wakes_listeners(self):
+        """Значок появляется и убирается сразу: сохранение настроек будит слушателей."""
+        seen = []
+
+        def listener(cfg):
+            seen.append(cfg["ui"]["tray_on_close"])
+
+        settings.on_change(listener)
+        self.addCleanup(settings._watchers.remove, listener)
+        cfg = settings.load()
+        cfg["ui"]["tray_on_close"] = False
+        settings.save(cfg)
+        self.assertEqual(seen, [False], "слушателю сказали, что галочку сняли")
 
     def test_without_tick_program_closes(self):
         cfg = settings.load()
@@ -82,6 +104,12 @@ class InterfaceCard(unittest.TestCase):
         self.assertIn('$("#sTray").onchange', js, "галочка сохраняется сразу, без кнопки «Сохранить»")
         self.assertIn('"collect purge" "collect ui"', css, "блок стоит справа, под очисткой данных")
         self.assertIn(".s-ui { grid-area: ui; }", css)
+
+    def test_icon_follows_the_tick(self):
+        """Переключение без перезапуска: окно подписано на сохранение настроек."""
+        main = (paths.ROOT / "app" / "main.py").read_text(encoding="utf-8")
+        self.assertIn("settings.on_change(", main, "значок заводится и убирается при сохранении настроек")
+        self.assertIn("tray.stop()", main, "снятая галочка убирает значок")
 
 
 if __name__ == "__main__":
