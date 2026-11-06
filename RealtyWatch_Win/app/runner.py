@@ -163,12 +163,6 @@ class RunManager:
         with self.lock:
             self.runlogs.pop(source, None)
         rl.close()
-        try:
-            c2 = db.connect()
-            history.snapshot(c2, run_id)
-            c2.close()
-        except Exception:
-            log.error(traceback.format_exc())
         with self.lock:
             launch = self.launches.get(self.run_launch.pop(source, None))
             done = None
@@ -178,6 +172,16 @@ class RunManager:
                 if not launch["left"]:
                     done = launch
                     self.launches = {k: v for k, v in self.launches.items() if v is not launch}
+        # Снимок рынка — один на запуск, когда отработали все сайты. Снимок после каждого сайта давал
+        # на графике три точки подряд, где у одного сайта данные уже новые, а у других ещё прошлые,
+        # и это выглядело как движение рынка. launch is None — прогон вне запуска (вызов напрямую).
+        if done or launch is None:
+            try:
+                c2 = db.connect()
+                history.snapshot(c2, run_id)
+                c2.close()
+            except Exception:
+                log.error(traceback.format_exc())
         if done:
             self._fire(done["runs"], done["auto"])
 

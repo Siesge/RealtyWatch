@@ -8,7 +8,7 @@ from datetime import datetime
 
 os.environ["RW_NO_SCHEDULER"] = "1"
 
-from app import runner, scheduler  # noqa: E402
+from app import db, runner, scheduler  # noqa: E402
 from app.scrapers.base import Scraper  # noqa: E402
 from tests.support import isolate  # noqa: E402
 
@@ -29,6 +29,22 @@ def fake(name):
 
 
 class Schedule(unittest.TestCase):
+    def test_one_snapshot_per_launch(self):
+        """Запуск — одна точка графика, сколько бы сайтов в нём ни было."""
+        isolate(self)
+        for s in DUR:
+            runner.SCRAPERS[s] = fake(s)
+        m = runner.RunManager()
+        m._log = m.log = lambda src, msg: None
+        for _ in range(2):
+            m.start(list(DUR))
+            while m.any_running():
+                time.sleep(0.05)
+        c = db.connect()
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 6)
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 2,
+                         "два запуска по три сайта — две точки, а не шесть")
+
     def test_cadence_skip_notify_overrun(self):
         d = isolate(self)
         scheduler.FILE = d / "schedule.json"

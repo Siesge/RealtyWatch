@@ -33,14 +33,15 @@ function chartBase() {
 }
 
 // Табличный вид графика: те же значения цифрами (обязателен, т.к. часть цветов ниже 3:1 на светлом фоне)
-function chartTable(id, labels, series, yFmt) {
+function chartTable(id, labels, series, yFmt, head = "Проверка") {
   const box = document.getElementById(`${id}-tbl`);
   if (!box) return;
-  box.innerHTML = `<table class="grid compact"><thead><tr><th>Проверка</th>${series.map(s => `<th class="num">${esc(s.label)}</th>`).join("")}</tr></thead>
+  box.innerHTML = `<table class="grid compact"><thead><tr><th>${esc(head)}</th>${series.map(s => `<th class="num">${esc(s.label)}</th>`).join("")}</tr></thead>
     <tbody>${labels.map((l, k) => `<tr><td>${esc(l)}</td>${series.map(s => `<td class="num">${s.data[k] == null ? "—" : yFmt(s.data[k])}</td>`).join("")}</tr>`).reverse().join("")}</tbody></table>`;
 }
 
-function lineChart(id, labels, series, yFmt, extra = {}) {
+// xs — время каждой точки: ось становится настоящей шкалой времени, и проверки стоят там, когда они были
+function lineChart(id, labels, series, yFmt, xs = null) {
   chartTable(id, labels, series, yFmt);
   if (charts[id]) charts[id].destroy();
   const el = document.getElementById(id);
@@ -49,10 +50,18 @@ function lineChart(id, labels, series, yFmt, extra = {}) {
   const opt = chartBase();
   opt.scales.y.ticks.callback = yFmt;
   opt.plugins.tooltip.callbacks = { label: c => ` ${c.dataset.label}: ${yFmt(c.parsed.y)}` };
-  Object.assign(opt, extra);
+  if (xs && xs.length) {
+    const a = xs[0], b = xs[xs.length - 1], pad = Math.max((b - a) * 0.02, 9e5);  // воздух по краям: крайние точки не липнут к оси
+    const tk = timeTicks(a, b);
+    Object.assign(opt.scales.x, { type: "linear", min: a - pad, max: b + pad,
+      afterBuildTicks: ax => { ax.ticks = tk.ticks.map(value => ({ value })); } });
+    Object.assign(opt.scales.x.ticks, { callback: tk.fmt, autoSkip: false, includeBounds: false });
+    opt.plugins.tooltip.callbacks.title = it => tsLabel(it[0].parsed.x);
+  }
   charts[id] = new Chart(el, {
     type: "line",
-    data: { labels, datasets: series.map((s, i) => ({ label: s.label, data: s.data, borderColor: s.color || colors[i], backgroundColor: s.color || colors[i],
+    data: { labels: xs ? undefined : labels, datasets: series.map((s, i) => ({ label: s.label,
+      data: xs ? s.data.map((y, k) => ({ x: xs[k], y })) : s.data, borderColor: s.color || colors[i], backgroundColor: s.color || colors[i],
       borderWidth: 2, pointRadius: labels.length < 12 ? 3 : 0, pointHoverRadius: 5, tension: .25, spanGaps: true, ...(s.ds || {}) })) },
     options: opt,
   });
@@ -61,8 +70,8 @@ function lineChart(id, labels, series, yFmt, extra = {}) {
 // Столбики одной проверки стоят друг на друге: проверок бывают десятки, и рядом они выходили бы
 // в пару пикселей шириной. Зазор между столбиками — за счёт ширины самого столбика (barPercentage),
 // а не рамки его же цветом фона: такая рамка на узком столбике съедала всю заливку, и цвета не было видно.
-function barChart(id, labels, series, yFmt) {
-  chartTable(id, labels, series, yFmt);
+function barChart(id, labels, series, yFmt, o = {}) {
+  chartTable(id, labels, series, yFmt, o.head);
   if (charts[id]) charts[id].destroy();
   const el = document.getElementById(id);
   if (!el) return;
@@ -72,6 +81,7 @@ function barChart(id, labels, series, yFmt) {
   opt.scales.y.ticks.precision = 0;
   opt.scales.x.stacked = opt.scales.y.stacked = true;
   opt.plugins.tooltip.callbacks = { label: c => ` ${c.dataset.label}: ${yFmt(c.parsed.y)}` };
+  if (o.titles) opt.plugins.tooltip.callbacks.title = it => o.titles[it[0].dataIndex];
   const slot = Math.max(1, el.clientWidth - 48) / Math.max(1, labels.length);  // место под один столбик
   charts[id] = new Chart(el, {
     type: "bar",
@@ -83,14 +93,45 @@ function barChart(id, labels, series, yFmt) {
 
 const tsLabel = t => new Date(t).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 const pct = (a, b) => (a && b ? (100 * (a - b) / b) : null);
+
+// ---------- шкала времени ----------
+// Время на графиках идёт равномерно: точка стоит там, когда проверка случилась на самом деле.
+// Пока промежутки были равными, десять проверок за день занимали больше места, чем неделя без них.
+const HOUR = 36e5, DAY = 864e5, WEEK = 7 * DAY;
+const TICK_STEPS = [HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, DAY, 2 * DAY, WEEK, 2 * WEEK];
+const midnight = t => { const d = new Date(t); d.setHours(0, 0, 0, 0); return +d; };
+const weekStart = t => { const d = new Date(midnight(t)); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return +d; };
+const monthStart = t => { const d = new Date(midnight(t)); d.setDate(1); return +d; };
+const addMonths = (t, n) => { const d = new Date(t); d.setMonth(d.getMonth() + n); return +d; };
+const dayLabel = t => new Date(t).toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+const monthLabel = t => new Date(t).toLocaleDateString("ru-RU", { month: "short", year: "2-digit" }).replace(" г.", "");
+const hourLabel = t => new Date(t).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+
+// Подписи оси: круглые часы, дни или месяцы — столько, чтобы читались (не больше восьми)
+function timeTicks(min, max) {
+  const span = Math.max(max - min, HOUR);
+  const out = [];
+  if (span > 100 * DAY) {
+    const step = Math.max(1, Math.round(span / DAY / 30 / 7));
+    for (let t = monthStart(min); t <= max; t = addMonths(t, step)) if (t >= min) out.push(t);
+    if (!out.length) out.push(min);
+    return { ticks: out, fmt: monthLabel };
+  }
+  const step = TICK_STEPS.find(s => span / s <= 7) || 30 * DAY;
+  for (let t = midnight(min); t <= max; t += step) if (t >= min) out.push(t);
+  if (!out.length) out.push(min);
+  return { ticks: out, fmt: step >= DAY ? dayLabel : t => (new Date(t).getHours() ? hourLabel(t) : dayLabel(t)) };
+}
 const signed = (v, d = 1) => v == null ? "" : `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v).toFixed(d)}%`;
 
 // ---------- дашборд ----------
 // Период, за который графики показывают проверки рынка (число дней или «всё время»)
-const DASH_PERIODS = [["7", "Неделя"], ["30", "Месяц"], ["182", "Полгода"], ["365", "Год"], ["all", "Всё время"]];
+const DASH_PERIODS = [["3", "3 дня"], ["7", "Неделя"], ["30", "Месяц"], ["182", "Полгода"], ["365", "Год"], ["all", "Всё время"]];
 let DASH_PERIOD = store.get("rw.dashPeriod", "all"), DASH_S = [], DASH_D = null;
 // Только внутри круга (зона A): все блоки пересчитываются по квартирам в круге
 let DASH_ZONE = store.get("rw.dashZone", "0") === "1";
+// Движение рынка: по умолчанию столбик — день (неделя, месяц на длинном периоде), по кнопке — проверка
+let DASH_EV_SCANS = store.get("rw.dashEvScans", "0") === "1";
 
 // Что показывает каждый блок и как его читать (подсказка на заголовке блока)
 const DASH_TIP = {
@@ -105,7 +146,8 @@ const DASH_TIP = {
 • новые — появились новые объявления;
 • снятые — сайт подтвердил, что объявление снято (статус на странице или страница удалена);
 • смена цены — продавец изменил цену (чаще снижает).
-Много новых — предложение растёт; много снятых — квартиры продаются или уходят с рынка; много смен цены — продавцы торгуются. Первичная загрузка сайта не считается.`,
+Много новых — предложение растёт; много снятых — квартиры продаются или уходят с рынка; много смен цены — продавцы торгуются. Первичная загрузка сайта не считается.
+Столбик — день целиком (на длинном периоде — неделя или месяц): все проверки за него сложены, и пустые дни видно как пустые. Кнопка «по проверкам» разбирает их обратно по сборам.`,
   count: z => z ? `Сколько подходящих квартир в продаже в красном круге в момент каждой проверки: всего и по комнатности.
 Дубли с разных сайтов считаются одной квартирой. Падение — предложение сокращается, рост — новых больше, чем уходит.`
     : `Сколько подходящих квартир в продаже в момент каждой проверки: по всей Ялте (A+B) и в красном круге (A).
@@ -121,9 +163,9 @@ const DASH_TIP = {
   likes: z => `Квартиры, отмеченные ♥${z ? " (только в круге)" : ""}: сколько ещё в продаже и сколько снято, как изменилась цена с момента появления в базе и насколько цена м² отличается от рынка той же комнатности и зоны.`,
 };
 
-const dcHead = (title, meta, tip, tbl) => `<div class="dc-head" title="${esc(tip)}"><h3>${title}<i class="info" aria-hidden="true">i</i></h3>
-  <span class="meta">${meta}${tbl ? ` <button class="link sm" data-tbl="${tbl}" title="Показать значения таблицей">таблица</button>` : ""}</span></div>`;
-const chartCard = (id, cls, title, meta, tip) => `<div class="panel dash-card ${cls}">${dcHead(title, meta, tip, id)}
+const dcHead = (title, meta, tip, tbl, extra = "") => `<div class="dc-head" title="${esc(tip)}"><h3>${title}<i class="info" aria-hidden="true">i</i></h3>
+  <span class="meta">${meta}${extra}${tbl ? ` <button class="link sm" data-tbl="${tbl}" title="Показать значения таблицей">таблица</button>` : ""}</span></div>`;
+const chartCard = (id, cls, title, meta, tip, extra = "") => `<div class="panel dash-card ${cls}">${dcHead(title, meta, tip, id, extra)}
   <div class="chart-box"><canvas id="${id}"></canvas></div><div class="chart-tbl hidden" id="${id}-tbl"></div></div>`;
 
 // Срез снимка рынка в текущем режиме: вся Ялта (A+B) или только круг (A)
@@ -229,7 +271,8 @@ function paintDashboard() {
 
       ${chartCard("chRooms", "span2", "Медианная цена по комнатности", `${scope}, каждая точка — одна проверка рынка`, DASH_TIP.rooms(Z))}
       ${chartCard("chPpm", "", Z ? "Цена м² в круге" : "Цена м² по зонам", Z ? "медиана по комнатности, ₽/м²" : "медиана, ₽/м²", DASH_TIP.ppm(Z))}
-      ${chartCard("chEvents", "", "Движение рынка", "событий между проверками", DASH_TIP.events(Z))}
+      ${chartCard("chEvents", "", "Движение рынка", `<span id="evMeta"></span>`, DASH_TIP.events(Z),
+        ` <button class="link sm" id="evMode" title="Переключить вид: сложить все проверки каждого дня в один столбик — или показать каждую проверку отдельно, с её временем под курсором"></button>`)}
       ${chartCard("chCount", "", Z ? "Предложение в круге" : "Предложение", "объектов в продаже", DASH_TIP.count(Z))}
       <div class="panel dash-card drops-card">${dcHead("Подешевели", "сильнее всего за период", DASH_TIP.drops(Z))}<div id="dropsBox"></div></div>
 
@@ -268,6 +311,11 @@ function paintDashboard() {
     await renderDashboard();  // сервер отдаёт проверки только за период (не больше 500 точек)
     $(".main").scrollTop = y;
   });
+  $("#evMode").onclick = () => {
+    DASH_EV_SCANS = !DASH_EV_SCANS;
+    store.set("rw.dashEvScans", DASH_EV_SCANS ? "1" : "0");
+    drawDashCharts();
+  };
   $("#dashZone").onchange = () => {
     DASH_ZONE = $("#dashZone").checked;
     store.set("rw.dashZone", DASH_ZONE ? "1" : "0");
@@ -303,6 +351,7 @@ function drawDashCharts() {
     if (empty && charts[id]) { charts[id].destroy(); delete charts[id]; }
   }
   const labels = S.map(s => tsLabel(s.ts));
+  const xs = S.map(s => new Date(s.ts).getTime());  // настоящее время каждой проверки — ось времени
   const byRooms = key => [
     { label: "Все", data: S.map(s => partAll(s)[key] ?? null) },
     ...["1", "2", "3"].map(n => ({ label: `${n}-комн.`, data: S.map(s => partRooms(s, n)[key] ?? null) })),
@@ -313,26 +362,74 @@ function drawDashCharts() {
     box.querySelectorAll("[data-card]").forEach(a => a.onclick = () => goToCard(a.dataset.card));
   }
   if (empty) return;
-  lineChart("chRooms", labels, byRooms("median_price"), v => `${mln(v)} млн`);
+  lineChart("chRooms", labels, byRooms("median_price"), v => `${mln(v)} млн`, xs);
   if (DASH_ZONE) {
-    lineChart("chPpm", labels, byRooms("median_ppm"), v => fmt(v));
-    lineChart("chCount", labels, byRooms("count").map((x, i) => i ? x : { ...x, label: "Круг (A)" }), v => fmt(v));
+    lineChart("chPpm", labels, byRooms("median_ppm"), v => fmt(v), xs);
+    lineChart("chCount", labels, byRooms("count").map((x, i) => i ? x : { ...x, label: "Круг (A)" }), v => fmt(v), xs);
   } else {
     lineChart("chPpm", labels, [
       { label: "Ялта A+B", data: S.map(s => s.city.median_ppm) },
       { label: "Круг (A)", data: S.map(s => s.zones.A.median_ppm) },
       { label: "Ялта (B)", data: S.map(s => s.zones.B.median_ppm) },
-    ], v => fmt(v));
+    ], v => fmt(v), xs);
     lineChart("chCount", labels, [
       { label: "Ялта A+B", data: S.map(s => s.city.count) },
       { label: "Круг (A)", data: S.map(s => s.zones.A.count) },
-    ], v => fmt(v));
+    ], v => fmt(v), xs);
   }
-  barChart("chEvents", labels, [
-    { label: "новые", data: S.map(s => partEvents(s).new || 0) },
-    { label: "снятые", data: S.map(s => partEvents(s).removed || 0) },
-    { label: "смена цены", data: S.map(s => (partEvents(s).price_down || 0) + (partEvents(s).price_up || 0)) },
-  ], v => fmt(v));
+  drawEvents(S, Math.max(from, xs[0]), Date.now());
+}
+
+// Движение рынка. Столбик — календарный день (на длинном периоде неделя или месяц): за день бывает
+// десяток проверок, и каждая отдельным столбиком ничего не говорит, а дни без проверок в таком ряду
+// не видны вовсе. Кнопка в шапке карточки возвращает подробный вид — столбик на проверку.
+const EV_UNIT = { day: ["дням", "День"], week: ["неделям", "Неделя"], month: ["месяцам", "Месяц"] };
+
+function evBuckets(S, from, to) {
+  const span = to - from;
+  const kind = span <= 45 * DAY ? "day" : span <= 220 * DAY ? "week" : "month";
+  const start = kind === "day" ? midnight : kind === "week" ? weekStart : monthStart;
+  const next = kind === "month" ? (t => addMonths(t, 1)) : (t => t + (kind === "week" ? WEEK : DAY));
+  const sum = new Map();
+  for (const s of S) {
+    const k = start(new Date(s.ts).getTime()), e = partEvents(s);
+    const b = sum.get(k) || { new: 0, removed: 0, price: 0, checks: 0 };
+    b.new += e.new || 0;
+    b.removed += e.removed || 0;
+    b.price += (e.price_down || 0) + (e.price_up || 0);
+    b.checks++;
+    sum.set(k, b);
+  }
+  const rows = [];
+  for (let t = start(from); t <= to; t = next(t)) rows.push({ t, end: next(t), ...(sum.get(t) || { new: 0, removed: 0, price: 0, checks: 0 }) });
+  return { kind, rows };
+}
+
+function drawEvents(S, from, to) {
+  const meta = $("#evMeta"), btn = $("#evMode");
+  if (btn) btn.textContent = DASH_EV_SCANS ? "по дням" : "по проверкам";
+  const series = take => [
+    { label: "новые", data: take("new") },
+    { label: "снятые", data: take("removed") },
+    { label: "смена цены", data: take("price") },
+  ];
+  if (DASH_EV_SCANS) {
+    if (meta) meta.textContent = "событий между проверками";
+    barChart("chEvents", S.map(s => tsLabel(s.ts)), series(k => S.map(s => {
+      const e = partEvents(s);
+      return k === "price" ? (e.price_down || 0) + (e.price_up || 0) : e[k] || 0;
+    })), v => fmt(v));
+    return;
+  }
+  const { kind, rows } = evBuckets(S, from, to);
+  const unit = EV_UNIT[kind];
+  if (meta) meta.textContent = `событий по ${unit[0]}`;
+  const axis = r => kind === "month" ? monthLabel(r.t) : dayLabel(r.t);
+  const full = r => kind === "week" ? `${dayLabel(r.t)} — ${dayLabel(r.end - DAY)}` : axis(r);
+  barChart("chEvents", rows.map(axis), series(k => rows.map(r => r[k])), v => fmt(v), {
+    head: unit[1],
+    titles: rows.map(r => `${full(r)} · ${r.checks ? `${r.checks} ${plural(r.checks, "проверка", "проверки", "проверок")}` : "проверок не было"}`),
+  });
 }
 
 // Подешевели за период графиков: цена на начало периода (или при появлении) → сейчас, по каждому сайту объекта

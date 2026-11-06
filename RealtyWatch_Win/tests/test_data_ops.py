@@ -112,6 +112,41 @@ class ZoneAndChanges(Case):
             server.set_zone({"center": [44.48, 34.14], "radius_m": 10})  # слишком маленький радиус
 
 
+class LaunchPoints(Case):
+    """Точка графика — одна на запуск. Снимок после каждого сайта давал три точки подряд, где у одного
+    сайта данные уже новые, а у других ещё прошлые, и это выглядело как движение рынка."""
+
+    def setUp(self):
+        super().setUp()
+        run("cian", cian(listings("cian", 20)))
+        stamp("2026-10-20T10:00:00", "2026-11")   # объявления появились раньше точек ниже
+        c = con()
+        c.execute("DELETE FROM snapshots")        # снимки напишем сами — с временами настоящего запуска
+        c.commit()
+
+    def launch(self, started, ends):
+        """Как писала прежняя версия: по снимку после каждого сайта одного запуска."""
+        c = con()
+        for site, end in zip(("cian", "avito", "yandex"), ends):
+            rid = c.execute("INSERT INTO runs(source, mode, started, finished, status) VALUES(?,?,?,?,'done')",
+                            (site, "http", started, end)).lastrowid
+            c.execute("INSERT INTO snapshots(ts, run_id, data) VALUES(?,?,'{}')", (end, rid))
+        c.commit()
+
+    def test_sites_of_one_launch_become_one_point(self):
+        # 5 ноября Авито закончил на полчаса позже остальных, 6 ноября — на двадцать минут
+        self.launch("2026-11-05T22:20:00", ["2026-11-05T22:23:00", "2026-11-05T23:00:00", "2026-11-05T22:24:00"])
+        self.launch("2026-11-06T10:20:00", ["2026-11-06T10:23:00", "2026-11-06T10:50:00", "2026-11-06T10:24:00"])
+        c = con()
+        self.assertEqual(history.merge_launches(c), 4, "из шести снимков остаётся по одному на запуск")
+        self.assertEqual([r["ts"] for r in c.execute("SELECT ts FROM snapshots ORDER BY ts")],
+                         ["2026-11-05T23:00:00", "2026-11-06T10:50:00"],
+                         "точка встаёт на момент, когда отработал последний сайт запуска")
+        data = json.loads(c.execute("SELECT data FROM snapshots ORDER BY ts DESC LIMIT 1").fetchone()[0])
+        self.assertEqual(data["city"]["count"], 20, "в точке — весь рынок, а не часть")
+        self.assertEqual(history.merge_launches(c), 0, "сводить больше нечего")
+
+
 class Sound(Case):
     def test_mute_toggle(self):
         self.assertFalse(alerts.muted())
