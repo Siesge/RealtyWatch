@@ -8,7 +8,7 @@ from datetime import datetime
 
 os.environ["RW_NO_SCHEDULER"] = "1"
 
-from app import runner, scheduler  # noqa: E402
+from app import db, runner, scheduler  # noqa: E402
 from app.scrapers.base import Scraper  # noqa: E402
 from tests.support import isolate  # noqa: E402
 
@@ -29,6 +29,22 @@ def fake(name):
 
 
 class Schedule(unittest.TestCase):
+    def test_one_snapshot_per_launch(self):
+        """Запуск — одна точка графика, сколько бы сайтов в нём ни было."""
+        isolate(self)
+        for s in DUR:
+            runner.SCRAPERS[s] = fake(s)
+        m = runner.RunManager()
+        m._log = m.log = lambda src, msg: None
+        for _ in range(2):
+            m.start(list(DUR))
+            while m.any_running():
+                time.sleep(0.05)
+        c = db.connect()
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 6)
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 2,
+                         "два запуска по три сайта — две точки, а не шесть")
+
     def test_cadence_skip_notify_overrun(self):
         d = isolate(self)
         scheduler.FILE = d / "schedule.json"
@@ -44,7 +60,7 @@ class Schedule(unittest.TestCase):
         def rec(sources, auto=False):
             got = orig(sources, auto)
             for s in got:
-                starts[s].append(time.time() - t0)  # без округления: шаг расписания — секунда, в целых счёт врёт
+                starts[s].append(time.time() - t0)
             return got
         m.start = rec
         sc = scheduler.Scheduler(m)
@@ -58,15 +74,16 @@ class Schedule(unittest.TestCase):
         while m.any_running():
             time.sleep(0.1)
 
-        # быстрые сайты — каждый шаг; Авито — только когда закончил прошлый сбор
-        at = lambda ss: [round(x, 2) for x in ss]  # noqa: E731 — только для текста ошибки
+        def at(s):
+            """Времена запусков с сотыми — в сообщение об ошибке."""
+            return [round(x, 2) for x in starts[s]]
+
+        # Быстрые сайты — каждый шаг; Авито — только когда закончил прошлый сбор. Времена точные:
+        # округление до секунд превращало верный промежуток 2.5 в «2» и роняло тест на правильном поведении.
         self.assertGreaterEqual(len(starts["cian"]), 8)
-        self.assertTrue(all(b - a <= 2 * STEP + 0.5 for a, b in zip(starts["cian"], starts["cian"][1:])), at(starts["cian"]))
+        self.assertTrue(all(b - a <= 2 * STEP + 0.5 for a, b in zip(starts["cian"], starts["cian"][1:])), at("cian"))
         self.assertLessEqual(len(starts["avito"]), 4)
-        # Между запусками Авито — не меньше, чем длится один его сбор: значит, идущий сбор не перезапускали.
-        # Это и есть проверяемое правило. В целых секундах его не проверить: запуски попадают на целые
-        # секунды расписания, и настоящий промежуток 2,5 с виден как разница в 2 — тест мерцал на этом.
-        self.assertTrue(all(b - a >= DUR["avito"] for a, b in zip(starts["avito"], starts["avito"][1:])), at(starts["avito"]))
+        self.assertTrue(all(b - a >= DUR["avito"] for a, b in zip(starts["avito"], starts["avito"][1:])), at("avito"))
         # быстрые сайты уведомляют без Авито
         self.assertTrue(any(s == ["cian", "yandex"] for _, s in notes), notes)
         self.assertTrue(any(s == ["avito"] for _, s in notes), notes)

@@ -1,9 +1,10 @@
-"""История рынка: снимки после каждого прогона (для графиков дашборда), события (для экрана «Изменения»),
+"""История рынка: снимок после каждого запуска сбора (точка на графиках дашборда), события (для экрана «Изменения»),
 восстановление истории по уже собранным данным и повторная проверка «снятых» объявлений."""
 import json
 import math
 import statistics
 from collections import defaultdict
+from datetime import datetime
 
 from . import db
 
@@ -133,6 +134,7 @@ def backfill(con):
         last = con.execute("SELECT data FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
         if '"a":' not in last["data"]:  # снимки до появления среза «внутри круга» — пересобрать
             rebuild_snapshots(con)
+    merge_launches(con)  # история, снятая по снимку на каждый сайт, сводится к одной точке на запуск
 
 
 def _write_snapshots(con, points):
@@ -162,6 +164,38 @@ def _write_snapshots(con, points):
             con.execute("INSERT INTO snapshots(ts, run_id, data) VALUES(?,?,?)", (t, run_id, json.dumps(data, ensure_ascii=False)))
             prev = t
     con.commit()
+
+
+LAUNCH_GAP = 120  # с: прогоны одного запуска стартуют вместе, медленный сайт лишь заканчивает позже
+
+
+def _launch_points(con):
+    """Моменты графика: по одной точке на запуск. Снимки, снятые после разных сайтов одного запуска,
+    сводятся в последний из них — к этому моменту отработали все сайты и рынок виден целиком.
+    Запуск узнаём по времени старта прогонов: все сайты запуска стартуют вместе."""
+    rows = con.execute("""SELECT s.ts, s.run_id, r.started FROM snapshots s
+                          LEFT JOIN runs r ON r.id = s.run_id ORDER BY s.ts""").fetchall()
+    out, key = [], None
+    for r in rows:
+        cur = r["started"] or r["ts"]
+        if key is not None and 0 <= (datetime.fromisoformat(cur) - datetime.fromisoformat(key)).total_seconds() <= LAUNCH_GAP:
+            out[-1] = (r["ts"], r["run_id"])  # тот же запуск: точка переезжает на последний снимок
+        else:
+            out.append((r["ts"], r["run_id"]))
+            key = cur
+    return out
+
+
+def merge_launches(con):
+    """Сводит снимки одного запуска в один и пересобирает их по базе. Нужно один раз — для истории,
+    снятой до того, как снимок стал одним на запуск. Возвращает, сколько точек убрано."""
+    points = _launch_points(con)
+    before = con.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+    if len(points) >= before:
+        return 0
+    con.execute("DELETE FROM snapshots")
+    _write_snapshots(con, points)
+    return before - con.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
 
 
 def rebuild_snapshots(con):

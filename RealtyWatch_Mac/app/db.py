@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS events(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, run_id INTEGER, source TEXT, source_id TEXT,
     kind TEXT, old_value INTEGER, new_value INTEGER, note TEXT, baseline INTEGER DEFAULT 0
 );
--- Сводка рынка после каждого прогона — для графиков дашборда
+-- Сводка рынка после каждого запуска сбора (когда отработали все сайты) — точка на графиках дашборда
 CREATE TABLE IF NOT EXISTS snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, run_id INTEGER, data TEXT);
 """
 
