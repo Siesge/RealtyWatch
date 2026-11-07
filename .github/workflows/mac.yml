@@ -47,8 +47,11 @@ jobs:
       - name: Тесты
         run: |
           PY="$HOME/Library/Application Support/RealtyWatch/runtime/venv/bin/python"
-          echo "нагрузка до тестов: $(uptime)"
-          trap 'echo "нагрузка после тестов: $(uptime)"' EXIT
+          # Пишем загрузку всё время, а не до и после. Браузерные тесты идут в середине набора:
+          # мерка «до» показывает хвост доставки среды, а не то, что было под ними. Actions метит
+          # каждую строку временем, поэтому видно, чем была занята машина под нужным тестом.
+          ( while :; do echo "нагрузка: $(uptime)"; sleep 20; done ) &
+          trap 'kill %1 2>/dev/null || true' EXIT
           "$PY" -m unittest discover -s tests -t . -v
 
       - name: Собрать RealtyWatch.app
