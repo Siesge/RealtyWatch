@@ -41,9 +41,14 @@ jobs:
             exit 1
           fi
 
+      # Два браузерных теста (пазл-капча, пагинация) срываются на занятом раннере, и это не каприз
+      # прибора: то же самое случается на живом сайте, где у страницы на перекладку целая секунда.
+      # Поэтому загрузку машины печатаем до и после — по ней видно, был ли прогон медленным.
       - name: Тесты
         run: |
           PY="$HOME/Library/Application Support/RealtyWatch/runtime/venv/bin/python"
+          echo "нагрузка до тестов: $(uptime)"
+          trap 'echo "нагрузка после тестов: $(uptime)"' EXIT
           "$PY" -m unittest discover -s tests -t . -v
 
       - name: Собрать RealtyWatch.app
