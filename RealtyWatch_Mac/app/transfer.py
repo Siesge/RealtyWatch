@@ -7,6 +7,7 @@
 Перед любым импортом текущая база копируется в database/backups/.
 """
 import json
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -14,7 +15,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from . import db, dedupe
+from . import db, dedupe, trash
 from .paths import BACKUPS, DB_DIR, IMAGES
 
 FORMAT = "realtywatch-db"
@@ -81,8 +82,57 @@ def backup(reason, with_images=False):
     return export_zip(BACKUPS / f"{reason}_{_stamp()}.zip", with_images=with_images)
 
 
-def _backup():
-    return backup("перед_импортом")  # фото при импорте не удаляются — копируем только базу
+def _label(name):
+    """«перед_очисткой_2026-11-07_1130.zip» → «перед очисткой»."""
+    return re.sub(r"_\d{4}-\d{2}-\d{2}_\d{4}\.zip$", "", name).replace("_", " ")
+
+
+def _peek(path):
+    """Что внутри копии: годится ли она для восстановления и есть ли в ней фотографии."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return {"ok": False, "images": False}
+    return {"ok": "realty.db" in names, "images": any(n.startswith("images/") and not n.endswith("/") for n in names)}
+
+
+def backups():
+    """Резервные копии, новые сверху: сколько их, сколько занимают и что в каждой."""
+    items = []
+    for p in sorted(BACKUPS.glob("*.zip"), key=lambda x: x.stat().st_mtime, reverse=True) if BACKUPS.exists() else []:
+        st = p.stat()
+        items.append({"name": p.name, "label": _label(p.name), "bytes": st.st_size,
+                      "mb": round(st.st_size / 2**20, 1),
+                      "ts": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"), **_peek(p)})
+    total = sum(i["bytes"] for i in items)
+    return {"items": items, "count": len(items), "bytes": total, "mb": round(total / 2**20, 1),
+            "folder": str(BACKUPS), "trash": trash.available(BACKUPS if BACKUPS.exists() else DB_DIR)}
+
+
+def backup_path(name):
+    """Путь копии по имени файла. Только файл .zip из database/backups — чужого пути сюда не передать."""
+    p = (BACKUPS / name).resolve()
+    if p.parent != BACKUPS.resolve() or p.suffix.lower() != ".zip" or not p.is_file():
+        raise ValueError(f"нет такой резервной копии: {name}")
+    return p
+
+
+def delete_backups(names=None):
+    """Удаляет резервные копии (по умолчанию все) — в Корзину, если получилось, иначе насовсем."""
+    chosen = [i for i in backups()["items"] if names is None or i["name"] in set(names)]
+    paths = [backup_path(i["name"]) for i in chosen]
+    n, trashed = trash.delete(paths)
+    freed = sum(i["bytes"] for i, p in zip(chosen, paths) if not p.exists())
+    return {"deleted": n, "mb": round(freed / 2**20, 1), "trash": trashed, "left": backups()["count"]}
+
+
+def restore(name):
+    """Восстановление из резервной копии: база, настройки поиска и фото из неё заменяют нынешние.
+    Нынешнее состояние перед заменой тоже уходит в копию, так что откатиться можно и обратно."""
+    res = import_zip(backup_path(name), mode="replace", before="перед_восстановлением")
+    res["restored"] = name
+    return res
 
 
 def _check(z):
@@ -111,11 +161,11 @@ def _extract_images(z, overwrite):
     return n
 
 
-def import_zip(path, mode="merge"):
+def import_zip(path, mode="merge", before="перед_импортом"):
     path = Path(path)
     with zipfile.ZipFile(path) as z:
         manifest = _check(z)
-        backup = _backup()
+        saved = backup(before)  # фото при импорте не удаляются — копируем только базу
         with tempfile.TemporaryDirectory() as tmp:
             z.extract("realty.db", tmp)
             imported = Path(tmp) / "realty.db"
@@ -130,7 +180,7 @@ def import_zip(path, mode="merge"):
     con = db.connect()
     result["objects"] = dedupe.rebuild(con)
     con.close()
-    result.update(backup=backup, mode=mode, exported_at=manifest.get("exported_at"))
+    result.update(backup=saved, mode=mode, exported_at=manifest.get("exported_at"))
     return result
 
 

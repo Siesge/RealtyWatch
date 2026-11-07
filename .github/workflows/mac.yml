@@ -89,7 +89,21 @@ jobs:
           cat /tmp/liked.json; echo
           [ "$CODE" = "400" ] || { echo "ожидали 400 на пустом избранном, получили $CODE"; exit 1; }
           echo "экспорт избранного на месте"
+          # «Очистка данных»: список резервных копий и выбор отдельных прогонов
+          curl -fsS http://127.0.0.1:8765/api/db/backups > /tmp/backups.json
+          "$PY" -c 'import json; d=json.load(open("/tmp/backups.json")); assert set(d) >= {"items", "count", "bytes", "mb", "folder", "trash"}, d; print("копии:", d["count"], "шт.,", d["mb"], "МБ |", d["folder"], "| уйдут в Корзину:", d["trash"])'
+          curl -fsS "http://127.0.0.1:8765/api/db/launches?from=2026-01-01&to=2026-12-31" > /tmp/launches.json
+          "$PY" -c 'import json; d=json.load(open("/tmp/launches.json")); assert isinstance(d, list), d; print("запусков в окне:", len(d))'
+          echo "очистка данных отвечает"
           kill "$SRV" 2>/dev/null || true
+
+      # Корзина на macOS делается не одной командой, а тремя способами по очереди (app/trash.py).
+      # Какой из них живой, зависит от того, что принесла с собой сборка, — поэтому спрашиваем
+      # у настоящего Мака. Ничего не удаляем: route/available/count только смотрят.
+      - name: Корзина macOS — каким способом уйдут резервные копии
+        run: |
+          PY="$HOME/Library/Application Support/RealtyWatch/runtime/venv/bin/python"
+          "$PY" -c 'from pathlib import Path; from app import trash; r = trash.route(); print("способ:", r); print("Корзина доступна:", trash.available(Path.home()), "| в ней сейчас:", trash.count(Path.home())); assert r, "ни один способ не доступен — копии будут стираться насовсем"'
 
       - name: Всё лежит в одной папке
         run: |

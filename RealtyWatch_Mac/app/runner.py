@@ -5,7 +5,7 @@ import traceback
 from collections import deque
 from datetime import datetime
 
-from . import db, dedupe, geo, history, images, rules, runlog, settings
+from . import db, dedupe, geo, history, images, offsale, rules, runlog, settings
 from .net import Blocked, IpBanned, Stopped, pause
 from .paths import LOGS
 from .scrapers import SCRAPERS
@@ -131,11 +131,18 @@ class RunManager:
                 seen.add(str(item["source_id"]))
                 pr(**counts)
             if scraper.complete:
-                removed, note = self._handle_missing(con, scraper, seen, prev_seen, started, run_id, lg, stop)
+                removed, notes = self._handle_missing(con, scraper, seen, prev_seen, started, run_id, lg, stop)
+                # Квартира снята, только когда её не осталось ни на одном сайте: пропажу с одного
+                # сайта считаем потерей ссылки, а не снятием с продажи
+                off = offsale.reconcile(con, run_id, lg)
+                if off:
+                    removed += off
+                    notes.insert(0, f"из них {off} — не осталось ни на одном сайте")
             else:
-                note = f" (выдача неполная: {scraper.incomplete_reason} — снятие не проверялось)"
+                notes = [f"выдача неполная: {scraper.incomplete_reason} — снятие не проверялось"]
             if not scraper.complete:
                 state = "partial"  # выдаче нельзя доверять: снятые не проверялись (см. Scraper.finish и mass_limit)
+            note = f" ({'; '.join(notes)})" if notes else ""
             message = f"найдено {counts['found']}, новых {counts['new']}, изменилось {counts['changed']}, снято {removed}{note}"
         except Stopped:
             state, message = "stopped", "остановлено пользователем"
@@ -227,10 +234,10 @@ class RunManager:
         """Объявления, пропавшие из полной выдачи, проверяются на своих страницах.
         Снятым считается только то, что сайт явно показывает снятым (статус, закрыто) или не находит (404,
         редирект в каталог). Если проверить не удалось, объявление остаётся в продаже с отметкой «нет в поиске»
-        (счётчик missed) и проверяется снова в следующем прогоне. Возвращает (снято, примечание)."""
+        (счётчик missed) и проверяется снова в следующем прогоне. Возвращает (снято, примечания к итогу)."""
         cand = db.missing(con, scraper.name, seen)
         if not cand:
-            return 0, ""
+            return 0, []
         limit_n, expected, tau, gap = mass_limit(con, scraper.name, prev_seen, started)
         active = len(prev_seen)
         if len(cand) > limit_n:
@@ -239,7 +246,7 @@ class RunManager:
             lg(f"⚠ из поиска пропало {len(cand)} из {active} объявлений за {gap:g} дн. — больше, чем рынок успевает снять "
                f"(ожидаемо ~{expected:.0f}, допуск {limit_n:.0f} при сроке жизни объявления ~{tau:.0f} дн.). "
                "Похоже на сбой выдачи — снятие не проверяется")
-            return 0, f" (пропало {len(cand)} из {active} за {gap:g} дн., допуск {limit_n:.0f} — похоже на сбой выдачи, снятие не проверялось)"
+            return 0, [f"пропало {len(cand)} из {active} за {gap:g} дн., допуск {limit_n:.0f} — похоже на сбой выдачи, снятие не проверялось"]
         limit = scraper.site.get("max_verify", 300)
         lg(f"не найдено в поиске: {len(cand)} — проверяю страницы объявлений" + (f" (не больше {limit})" if len(cand) > limit else ""))
         cand.sort(key=lambda r: -(r.get("missed") or 0))  # дольше всех без подтверждения — первыми
@@ -267,8 +274,10 @@ class RunManager:
                             ((row.get("missed") or 0) + 1, row["source"], row["source_id"]))
             con.commit()
         if unknown:
-            lg(f"статус не подтверждён у {unknown}: остаются в продаже с отметкой «нет в поиске», проверю в следующем прогоне")
-        return removed, (f" (не подтверждено {unknown} — оставлены в продаже)" if unknown else "")
+            lg(f"статус не подтверждён у {unknown}: проверю в следующем прогоне. Те, кого нет в поиске "
+               f"{offsale.GONE_AFTER} прогона подряд, считаются потерянными на этом сайте — ссылка на него убирается, "
+               "а снятыми они станут, если не найдутся и на других сайтах")
+        return removed, ([f"не подтверждено {unknown} — проверю в следующем прогоне"] if unknown else [])
 
     def _process(self, con, scraper, cfg, item, counts, run_id=None, baseline=0):
         f = cfg["filters"]

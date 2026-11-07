@@ -35,15 +35,21 @@
       <div class="side-label">Сбор данных</div>
       <div id="sources"></div>
       <div class="auto-row" id="autoRow">
-        <label class="auto-sw" title="Автообновление: сбор выбранных выше сайтов запускается сам через заданное число часов — даже когда окно свёрнуто в трей">
+        <label class="auto-sw" title="Автообновление: сбор выбранных выше сайтов запускается сам — через заданное число часов или в указанное время по дням недели, даже когда окно свёрнуто в Dock">
           <input type="checkbox" id="autoOn"><span class="switch"></span><span class="src-name">Автообновление</span></label>
         <div class="auto-cfg">
-          <span title="Интервал между автоматическими запусками">каждые</span>
-          <select id="autoHours" title="Интервал в часах; «своё» — вписать любое число">
-            <option value="1">1 ч</option><option value="3">3 ч</option><option value="6">6 ч</option>
-            <option value="8">8 ч</option><option value="12">12 ч</option><option value="custom">своё…</option></select>
-          <input type="number" id="autoCustom" class="hidden" min="0.25" step="0.25" title="Своё число часов (можно дробное: 0.5 = 30 минут)">
+          <select id="autoMode" title="«по таймеру» — через равные промежутки от последнего запуска. «по расписанию» — в указанное время в выбранные дни недели: например, по будням в 9:00, а по выходным в 11:00">
+            <option value="timer">по таймеру</option><option value="weekly">по расписанию</option></select>
+          <span class="auto-when" id="autoTimerCfg">
+            <span title="Интервал между автоматическими запусками">каждые</span>
+            <select id="autoHours" title="Интервал в часах; «своё» — вписать любое число">
+              <option value="1">1 ч</option><option value="3">3 ч</option><option value="6">6 ч</option>
+              <option value="8">8 ч</option><option value="12">12 ч</option><option value="custom">своё…</option></select>
+            <input type="number" id="autoCustom" class="hidden" min="0.25" step="0.25" title="Своё число часов (можно дробное: 0.5 = 30 минут)">
+          </span>
+          <button class="auto-btn hidden" id="autoPlan" title="Время запусков и дни недели">Расписание…</button>
         </div>
+        <div class="auto-plan hidden" id="autoPlanSum" title="Расписание запусков. Изменить — кнопка «Расписание…»"></div>
         <div class="auto-timer" id="autoTimer" title="Сколько осталось до следующего автоматического запуска"></div>
         <div class="auto-skip hidden" id="autoSkip" title="Сайт ещё собирает с прошлого запуска: он не прерывается и не перезапускается, а пропускает запуск по расписанию. Перезапустится в первый запуск после того, как закончит. Остальные сайты запускаются как обычно"></div>
       </div>
