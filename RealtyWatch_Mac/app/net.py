@@ -129,6 +129,7 @@ class Browser:
     AUTO_ROUNDS = 3          # капч подряд, которые решатель проходит сам (сайт иногда просит пройти ещё раз)
     AFTER_SOLVE_WAIT_S = 40  # сколько ждать, пока сайт откроет страницу после решённой капчи
     PASSED_TEXT = "Проверка пройдена"
+    CLICK_REACT_S = 4.0      # сколько ждать начала перехода после нажатия по ссылке
 
     def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10, is_ip_banned=None,
                  is_ready=None, label=None, solver=None, blocked_js=None):
@@ -159,6 +160,7 @@ class Browser:
         self.last_status = None
         self.last_url = None  # где оказалась последняя открытая страница (в том числе во вкладке, которую уже закрыли)
         self._docs = {}     # вкладка → последний ответ сервера на загрузку её страницы
+        self._navs = {}     # вкладка → запрос страницы, которым начался переход (нажатие попало по ссылке)
         self._gt = {}       # вкладка → ответы GeeTest (задание, картинки, итог) с момента загрузки её страницы
 
     def _nav(self, url):
@@ -189,8 +191,17 @@ class Browser:
             opts["chromium_sandbox"] = False
             self.ctx = self._pw.chromium.launch_persistent_context(profile, **opts)
         self.ctx.on("response", self._on_response)
+        self.ctx.on("request", self._on_request)
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         self.mouse = human.Mouse(self.page, self.stop, Stopped)
+
+    def _on_request(self, req):
+        """Запрос страницы ушёл — переход начался. Ответа ещё нет, но нажатие уже сработало."""
+        try:
+            if req.resource_type == "document" and req.is_navigation_request() and req.frame.parent_frame is None:
+                self._navs[req.frame.page] = req
+        except Exception:
+            pass
 
     def _on_response(self, resp):
         try:
@@ -392,6 +403,32 @@ class Browser:
         except Exception:
             return None
 
+    def _aim(self, selector):
+        """Прицел для human.Mouse.click: где цель сейчас, без прокрутки к ней. Прокрутка сдвинула бы цель
+        ещё раз, а курсор уже рядом — нужно только поправиться на то, насколько страница переложилась."""
+        def now():
+            try:
+                el = self.page.query_selector(selector)
+                return el.bounding_box() if el is not None else None
+            except Exception:
+                return None  # страница как раз меняется
+        return now
+
+    def _reacted(self):
+        """Начался ли переход после нажатия (ушёл запрос страницы). Не начался — нажатие ушло в пустоту:
+        цель уехала уже после доводки курсора. Это ожидание страницы, а не человека, — поэтому в тестах
+        оно не ускоряется. Ждём вызовом Playwright, а не сном: события (в том числе наш запрос страницы)
+        он разбирает только во время своих вызовов, и на простом сне мы бы их не увидели вовсе."""
+        end = time.time() + self.CLICK_REACT_S
+        while self._navs.get(self.page) is None and time.time() < end:
+            if self.stop is not None and self.stop.is_set():
+                raise Stopped()
+            try:
+                self.page.wait_for_timeout(100)
+            except Exception:
+                time.sleep(0.1)  # страница как раз меняется
+        return self._navs.get(self.page) is not None
+
     def _before_request(self):
         self.start()
         if self._cooldown:
@@ -415,7 +452,14 @@ class Browser:
             return self.goto(url, settle)
         t0 = time.time()
         self._docs.pop(self.page, None)
-        self.mouse.click(b)
+        self._navs.pop(self.page, None)
+        if not self.mouse.click(b, self._aim(selector)) or not self._reacted():
+            # ссылка переложилась, пока рука шла: нажатие или не состоялось, или ушло в пустоту.
+            # Человек в этом случае прокрутит к ссылке и нажмёт ещё раз, а не станет набирать адрес
+            self.log("ссылка уехала, пока курсор шёл к ней — прицеливаюсь заново")
+            b = self.box(selector)
+            if b is not None:
+                self.mouse.click(b, self._aim(selector))
         if not self._wait_js(arrived, timeout):
             self.log("переход по ссылке не открыл нужную страницу — открываю её по адресу")
             return self.goto(url, settle)
@@ -437,7 +481,7 @@ class Browser:
             before = main.url
             try:
                 with self.ctx.expect_page(timeout=15000) as info:
-                    self.mouse.click(b)
+                    self.mouse.click(b, self._aim(selector))
                 tab, note = info.value, "клик по карточке, новая вкладка"
             except Stopped:
                 raise
@@ -460,6 +504,7 @@ class Browser:
             return self._after_load(url, settle, t0, note)
         finally:
             self._docs.pop(tab, None)
+            self._navs.pop(tab, None)
             try:
                 tab.close()
             except Exception:
