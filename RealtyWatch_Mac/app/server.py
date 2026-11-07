@@ -273,7 +273,7 @@ def db_backups_delete(body: dict = Body(default={})):
     except ValueError as e:
         raise HTTPException(400, str(e))
     manager.log("db", f"резервные копии удалены: {res['deleted']} шт., освободилось {res['mb']} МБ"
-                      f"{' (в корзину)' if res['trash'] else ' (безвозвратно — в Корзину не удалось)'}")
+                      f"{' (в Корзину)' if res['trash'] else ' (безвозвратно — в Корзину не удалось)'}")
     return res
 
 
