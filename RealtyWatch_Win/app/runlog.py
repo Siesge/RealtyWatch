@@ -46,6 +46,21 @@ def run_log_path(run_id):
     return next(iter(sorted(RUNS_DIR.glob(f"{int(run_id):06d}_*.log"))), None)
 
 
+def drop(run_ids):
+    """Удаляет журналы и сохранённые страницы прогонов — вместе с самими прогонами: из программы
+    такой журнал уже не открыть. Возвращает, сколько файлов удалено."""
+    n = 0
+    for run_id in run_ids:
+        for folder, pattern in ((RUNS_DIR, f"{int(run_id):06d}_*.log"), (SNAP_DIR, f"{int(run_id):06d}_*.*")):
+            for p in folder.glob(pattern) if folder.exists() else []:
+                try:
+                    p.unlink()
+                    n += 1
+                except OSError:
+                    pass
+    return n
+
+
 class RunLog:
     """Подробный журнал одного прогона. Пишется из потока прогона (и потоков проверки фото)."""
 

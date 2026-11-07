@@ -6,13 +6,14 @@ const RENO = { design: "дизайнерский ремонт", euro: "евро�
   finish: "чистовая отделка", none: "без ремонта", any: "с ремонтом" };
 const RENO_RANK = { design: 6, euro: 5, cosmetic: 4, finish: 3, old: 2, any: 1 };
 const SELLER = { owner: "собственник", agent: "агент", developer: "застройщик" };
-const STATE = { running: "идёт сбор", paused: "пауза", done: "готово", partial: "неполный", error: "ошибка", blocked: "блокировка", stopped: "остановлен" };
+const STATE = { running: "идёт сбор", paused: "пауза", done: "готово", partial: "неполный", error: "ошибка", blocked: "блокировка", stopped: "остановлен", interrupted: "прерван" };
 const STATE_TIP = {
   done: "Выдача прочитана полностью; пропавшие из поиска объявления проверены на сайте",
   partial: "Сбор закончился, но выдаче нельзя доверять полностью (не все страницы, сайт отдал меньше заявленного или из поиска пропало слишком много). Новые и изменённые цены записаны, а снятые с продажи не проверялись — подробности в итоге и журнале прогона",
   error: "Сбор прерван ошибкой (сайт не ответил, страница пришла пустой и т.п.). Снятые не проверялись. Подробности — в журнале прогона",
   blocked: "Сайт заблокировал доступ (капча не пройдена, ограничение IP). Снятые не проверялись",
   stopped: "Остановлено вручную или при закрытии программы",
+  interrupted: "Сбор не доведён до конца: программа закрылась во время него. Данные, которые он успел записать, в базе есть, но выдача прочитана не вся",
 };
 const VIEW_TITLE = { dashboard: "Дашборд", cards: "Подборка", table: "Таблица", changes: "Изменения", map: "Карта", runs: "Прогоны", settings: "Настройки" };
 const ICON = {
@@ -48,6 +49,9 @@ const api = async (url, opts) => {
 };
 const post = (url, body) => api(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
 const dt = s => s ? new Date(s).toLocaleDateString("ru-RU", { day: "numeric", month: "short" }) : "";
+const fileName = p => String(p || "").split(/[\\/]/).pop();   // в уведомлении — имя файла: весь путь в него не влезает
+const bkLabel = n => fileName(n).replace(/_\d{4}-\d{2}-\d{2}_\d{4}\.zip$/, "").replace(/_/g, " ");
+const mbs = v => `${Number(v).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} МБ`;
 const today = () => new Date().toISOString().slice(0, 10);
 const key = r => `${r.source}:${r.source_id}`;
 const desktop = () => window.pywebview && window.pywebview.api;
@@ -806,10 +810,9 @@ async function renderSettings() {
     <div class="s-card s-db" id="dbCard"><h3>База данных</h3><p class="hint">Объявления, фото, избранное, история цен и настройки поиска — в папке database. Перенос на другое устройство: «Экспорт» здесь → «Импорт» там.</p>
       <div class="db-stats" id="dbStats"></div>
       <div class="db-path" id="dbPath" title="Папка базы — её можно копировать целиком"></div>
-      <div class="db-backups" id="dbBackups" title="Резервные копии лежат в database\\backups: перед импортом и очисткой база сохраняется туда автоматически. Восстановить — «Импорт…» с режимом «заменить полностью»"></div>
       <div class="db-actions"><div class="btn-row">
         <button class="btn-sec" id="btnExport" title="Сохранить всю базу (объявления, фото, избранное, историю, настройки поиска) в один .zip">${ICON.down}Экспорт…</button>
-        <button class="btn-sec" id="btnImport" title="Загрузить базу из .zip. Перед импортом текущая база сохраняется в database\\backups">${ICON.up}Импорт…</button>
+        <button class="btn-sec" id="btnImport" title="Загрузить базу из .zip. Перед импортом текущая база сохраняется в database\\backups — список копий и восстановление из них в «Очистке данных»">${ICON.up}Импорт…</button>
         <select id="impMode" title="«Объединить» — добавить новое и обновить более свежим; «заменить» — полностью заменить текущую базу"><option value="merge">объединить с текущей</option><option value="replace">заменить полностью</option></select>
       </div>
       <div class="btn-row" style="margin-top:8px">
@@ -821,13 +824,15 @@ async function renderSettings() {
         <button class="btn-sec" id="btnShareLiked" title="Сохранить избранное одной веб-страницей: плитки и таблица со своими фильтрами и сортировками, фотографии внутри файла. Открывается без интернета и без программы — такой файл можно просто отправить">${ICON.share}Экспорт избранного…</button>
       </div></div>
     </div>
-    <div class="s-card s-purge"><h3>Очистка данных</h3><p class="hint">Если сбор прошёл неудачно — сайт отдал не ту выдачу или парсер ошибся, — данные этих дней можно убрать из статистики. Перед любой очисткой база сохраняется в database\\backups.</p>
+    <div class="s-card s-purge"><h3>Очистка данных</h3><p class="hint">Если сбор прошёл неудачно — сайт отдал не ту выдачу или парсер ошибся, — данные можно убрать из статистики: весь период целиком или только отдельные прогоны.</p>
       ${field("Период", `<span class="pair dates"><input type="date" id="pFrom" title="С какого дня (включительно). Пусто — с самого начала"><i>—</i><input type="date" id="pTo" title="По какой день (включительно). Пусто — по сегодня"></span>`,
         "Обе даты включительно. Пустое «с» — с самого начала, пустое «по» — по сегодняшний день.")}
       <div class="purge-presets"><span>Быстро:</span>${[["today", "сегодня"], ["yesterday", "вчера"], ["3", "3 дня"], ["7", "неделя"], ["from-start", "всё до вчера"]]
         .map(([v, l]) => `<button class="chip" data-pp="${v}">${l}</button>`).join("")}</div>
       <div class="purge-prev" id="purgePrev" title="Удаляются: проверки рынка (точки графиков), изменения, прогоны и записи цен за период; объявления, которые видели только в эти дни, — целиком. Снятые в эти дни возвращаются в продажу и проверятся заново при следующем сборе">Выберите период — здесь появится, что будет удалено.</div>
-      <div class="btn-row"><button class="btn-sec danger" id="btnPurge" disabled title="Удалить данные выбранного периода (с резервной копией)">${ICON.trash}Удалить данные за период…</button></div>
+      <div class="btn-row"><button class="btn-sec danger" id="btnPurge" disabled title="Удалить данные выбранного периода целиком (с резервной копией)">${ICON.trash}Удалить всё за период…</button>
+        <button class="btn-sec" id="btnPickRuns" title="Список сборов за выбранный период: что собрал каждый сайт и чем закончил. Галочками отмечают неудачные — удалятся только они">${ICON.list}Выбрать прогоны…</button></div>
+      <div class="purge-backups" id="purgeBackups"></div>
       <div class="purge-all"><span>Полностью: все объявления, история, изменения, избранное и фото. Настройки поиска и круг останутся.</span>
         <button class="btn-sec danger" id="btnClearAll" title="Очистить всю базу (с резервной копией в database\\backups)">${ICON.trash}Очистить всю базу…</button></div>
     </div>
@@ -892,20 +897,144 @@ function initPurge() {
     `${prev.innerHTML}<p class="meta">Графики, изменения и прогоны этих дней исчезнут, история пересчитается. Резервная копия базы сохранится в database\\backups.</p>`,
     "Удалить", async () => {
       const r = await post("/api/db/purge", { from: from.value, to: to.value });
-      toast("ok", "Данные за период удалены", `Объявлений: ${r.listings}, проверок рынка: ${r.snapshots}, изменений: ${r.events}. Резервная копия: ${r.backup}`);
+      toast("ok", "Данные за период удалены", `Объявлений: ${r.listings}, проверок рынка: ${r.snapshots}, изменений: ${r.events}. Копия: ${fileName(r.backup)}`);
       await loadData();
       renderSettings();
     });
+  $("#btnPickRuns").onclick = () => pickRuns(from.value, to.value);
   $("#btnClearAll").onclick = () => confirmBox("Очистить всю базу?",
     `<p>Будут удалены <b>все</b> объявления, история цен, изменения, проверки рынка, прогоны, избранное и фото. Настройки поиска и круг останутся.</p>
      <p class="meta">Резервная копия базы с фото сохранится в database\\backups.</p>
      <label class="confirm-type">Для подтверждения введите слово <b>ОЧИСТИТЬ</b><input type="text" id="clearWord" autocomplete="off"></label>`,
     "Очистить всё", async () => {
       const r = await post("/api/db/clear", { confirm: "ОЧИСТИТЬ" });
-      toast("ok", "База очищена", `Удалено объявлений: ${r.listings}. Резервная копия: ${r.backup}`);
+      toast("ok", "База очищена", `Удалено объявлений: ${r.listings}. Копия с фото: ${fileName(r.backup)}`);
       await loadData();
       renderSettings();
     }, () => $("#clearWord").value.trim().toUpperCase() === "ОЧИСТИТЬ", "#clearWord");
+  renderBackups();
+}
+
+// ---------- выбор отдельных прогонов ----------
+// За день бывает несколько сборов, и неудачные портят статистику: их удаляют по одному, не трогая остальные.
+async function pickRuns(from, to, keep = []) {
+  let groups;
+  try { groups = await api(`/api/db/launches?from=${encodeURIComponent(from || "")}&to=${encodeURIComponent(to || "")}`); }
+  catch (e) { return toast("warn", "Не получилось", e.message); }
+  const period = from || to ? ` за ${from ? dt(from) : "всё время"} — ${to ? dt(to) : "сегодня"}` : "";
+  if (!groups.length) return toast("warn", "Прогонов нет", `За выбранный период сборов не было${period ? "" : " — сбор ещё не запускался"}`);
+  const num = (label, v) => v == null ? "" : `<span class="rp-num">${label} <b>${fmt(v)}</b></span>`;
+  // в итоге прогона цифры уже есть в строке; важна приписка в скобках — ею сбор сам признаётся,
+  // что выдаче верить нельзя («пропало 40 из 400 — похоже на сбой», «выдача неполная»)
+  const note = r => { const m = /\(([^)]*)\)\s*$/.exec(r.message || ""); return m ? m[1] : r.status === "done" ? "" : r.message || ""; };
+  const list = groups.map((g, k) => `<div class="rp-g">
+    <label class="rp-gh"><input type="checkbox" class="rp-all" data-k="${k}">
+      <span class="rp-when"><b>${dtt(g.started)}</b><i>${g.runs.length} ${plural(g.runs.length, "сайт", "сайта", "сайтов")} · собрано ${fmt(g.collected)}</i></span>
+      <span class="st-badge ${g.bad ? "partial" : "done"}">${g.bad ? "неудачный" : "готово"}</span></label>
+    ${g.runs.map(r => `<label class="rp-r"><input type="checkbox" class="rp-run" data-k="${k}" value="${r.id}">
+      <span class="rp-src"><i class="sdot ${r.source}"></i>${SRC[r.source] || r.source}</span>
+      <span class="st-badge ${r.status}" title="${esc(STATE_TIP[r.status] || "")}">${STATE[r.status] || r.status}</span>
+      ${num("собрано", r.collected != null ? r.collected : r.found)}${num("новых", r.new)}${num("изм.", r.changed)}${num("снято", r.removed)}
+      <span class="rp-msg" title="${esc(r.message || "")}">${esc(note(r))}</span></label>`).join("")}</div>`).join("");
+  $("#modalBody").innerHTML = `<div class="runpick"><h3>Прогоны${period}</h3>
+    <p class="meta">Сайты одного запуска идут вместе и дают одну точку на графиках. Отметьте неудачные: из статистики уйдут
+      только их данные — объявления, которые видели лишь в этом прогоне, его записи цен и изменения, а снятые им вернутся в продажу.
+      Остальные сайты запуска и их точка графика останутся.</p>
+    <div class="rp-tools"><button class="chip" id="rpBad" title="Отметить все запуски, где хотя бы один сайт закончил не «готово»">Отметить неудачные</button>
+      <button class="chip" id="rpNone">Снять все</button><span class="meta" id="rpCount">Ничего не выбрано</span></div>
+    <div class="rp-list">${list}</div>
+    <div class="confirm-acts"><button class="btn-sec" data-c="no">Отмена</button>
+      <button class="btn-pri danger" id="rpGo" disabled>Удалить выбранные</button></div></div>`;
+  $("#modal").classList.remove("hidden");
+  const go = $("#rpGo"), boxes = () => $$("#modalBody .rp-run");
+  const chosen = () => boxes().filter(b => b.checked).map(b => +b.value);
+  const upd = () => {
+    $$("#modalBody .rp-all").forEach(a => {
+      const mine = boxes().filter(b => b.dataset.k === a.dataset.k), on = mine.filter(b => b.checked).length;
+      a.checked = on === mine.length;
+      a.indeterminate = on > 0 && on < mine.length;
+    });
+    const n = chosen().length;
+    go.disabled = !n;
+    $("#rpCount").textContent = n ? `Выбрано ${n} ${plural(n, "прогон", "прогона", "прогонов")}` : "Ничего не выбрано";
+  };
+  $$("#modalBody .rp-all").forEach(a => a.onchange = () => {
+    boxes().filter(b => b.dataset.k === a.dataset.k).forEach(b => b.checked = a.checked);
+    upd();
+  });
+  boxes().forEach(b => { b.onchange = upd; b.checked = keep.includes(+b.value); });
+  $("#rpBad").onclick = () => {
+    const bad = new Set(groups.filter(g => g.bad).flatMap(g => g.runs.map(r => String(r.id))));
+    boxes().forEach(b => { if (bad.has(b.value)) b.checked = true; });
+    upd();
+  };
+  $("#rpNone").onclick = () => { boxes().forEach(b => b.checked = false); upd(); };
+  $('#modalBody [data-c="no"]').onclick = closeModal;
+  upd();
+  go.onclick = async () => {
+    const ids = chosen();
+    go.disabled = true;
+    try {
+      const p = await post("/api/db/runs/delete", { ids, dry_run: true });
+      confirmBox(`Удалить ${ids.length} ${plural(ids.length, "прогон", "прогона", "прогонов")}?`,
+        `<p>Будет удалено: <span>объявлений целиком <b>${p.listings}</b></span><span>изменений <b>${p.events}</b></span>
+           <span>записей цен <b>${p.prices}</b></span><span>точек графика <b>${p.snapshots}</b></span>${p.unremoved ? `<span>вернётся в продажу <b>${p.unremoved}</b></span>` : ""}</p>
+         <p class="meta">Подробные журналы этих прогонов удалятся вместе с ними. История графиков пересчитается.
+           Резервная копия базы сохранится в database\\backups.</p>`,
+        "Удалить", async () => {
+          const r = await post("/api/db/runs/delete", { ids });
+          toast("ok", `Удалено ${r.runs} ${plural(r.runs, "прогон", "прогона", "прогонов")}`,
+            `Объявлений: ${r.listings}, изменений: ${r.events}, точек графика: ${r.snapshots}. Копия: ${fileName(r.backup)}`);
+          await loadData();
+          renderSettings();
+        });
+      $('#modalBody [data-c="no"]').onclick = () => pickRuns(from, to, ids);  // «Отмена» — назад к списку с галочками
+    } catch (e) {
+      toast("warn", "Не получилось", e.message);
+      go.disabled = false;
+    }
+  };
+}
+
+// ---------- резервные копии ----------
+async function renderBackups() {
+  const box = $("#purgeBackups");
+  if (!box) return;
+  let b;
+  try { b = await api("/api/db/backups"); }
+  catch (e) { box.textContent = e.message; return; }
+  const how = "Копии создаются сами перед очисткой, удалением прогонов и импортом — любое удаление можно отменить.";
+  box.innerHTML = `<div class="pb-head"><b>Резервные копии</b>${b.count
+      ? `<span>${b.count} ${plural(b.count, "копия", "копии", "копий")} · ${mbs(b.mb)}</span>` : "<span>пока нет</span>"}</div>
+    <p class="meta">${b.count ? `${how} Последняя — ${dtt(b.items[0].ts)}, «${esc(b.items[0].label)}».` : how}</p>
+    <div class="btn-row">
+      <button class="btn-sec" id="btnRestore" ${b.count ? "" : "disabled"} title="Вернуть базу к состоянию из копии: объявления, история, избранное и настройки поиска из неё">${ICON.up}Восстановить…</button>
+      <button class="btn-sec danger" id="btnDropBackups" ${b.count ? "" : "disabled"} title="${b.trash ? "Удалить все копии в корзину Windows" : "Удалить все копии (корзины на этом диске нет — насовсем)"}">${ICON.trash}Удалить копии…</button>
+    </div>`;
+  if (!b.count) return;
+  $("#btnRestore").onclick = () => confirmBox("Восстановить базу из копии?",
+    `<div class="bk-list">${b.items.map((i, n) => `<label class="bk-row"><input type="radio" name="bk" value="${esc(i.name)}" ${i.ok && !n ? "checked" : ""} ${i.ok ? "" : "disabled"}>
+      <span><b>${esc(i.label)}</b><i>${dtt(i.ts)} · ${mbs(i.mb)}${i.images ? " · с фотографиями" : ""}${i.ok ? "" : " · файл не читается"}</i></span></label>`).join("")}</div>
+     <p class="meta">Выбранная копия заменит нынешнюю базу, избранное и настройки поиска. Нынешнее состояние перед заменой тоже уйдёт в копию, так что вернуться обратно можно.
+       Фотографии есть только в копиях «перед полной очисткой» — из остальных они не восстанавливаются, недостающие догрузятся сами.</p>`,
+    "Восстановить", async () => {
+      const name = $('#modalBody input[name=bk]:checked').value;
+      const r = await post("/api/db/backups/restore", { name });
+      toast("ok", "База восстановлена", `Из копии «${bkLabel(name)}»: объявлений ${r.added}, фото ${r.images}. Прежнее состояние: ${fileName(r.backup)}`);
+      await loadData();
+      renderSettings();
+    }, () => !!$('#modalBody input[name=bk]:checked'), ".bk-list");
+  $("#btnDropBackups").onclick = () => confirmBox("Удалить резервные копии?",
+    `<p>Будут удалены все <b>${b.count}</b> ${plural(b.count, "копия", "копии", "копий")} — освободится ${mbs(b.mb)}.</p>
+     <p>${b.trash ? "Копии уйдут в <b>корзину</b> Windows — оттуда их можно вернуть." : "Корзины на этом диске нет, поэтому копии будут стёрты <b>насовсем</b>."}</p>
+     <p class="meta">Отменить прошлые очистки после этого будет нечем. Новая копия появится сама перед следующей очисткой или импортом.</p>`,
+    "Удалить копии", async () => {
+      const r = await post("/api/db/backups/delete");
+      toast("ok", r.trash ? "Копии в корзине" : "Копии удалены",
+        `${r.deleted} ${plural(r.deleted, "копия", "копии", "копий")}, освободилось ${mbs(r.mb)}${r.trash ? " — файлы в корзине Windows" : ""}`);
+      renderBackups();
+      renderDbInfo();
+    });
 }
 
 // Окно подтверждения опасного действия; ok — асинхронное действие, ready — можно ли нажать (ввод подтверждения)
@@ -934,12 +1063,8 @@ async function renderDbInfo() {
     <div title="Сохранённых в базе главных фото"><b>${d.images}</b><span>фото</span></div>
     <div title="Объявлений, отмеченных сердечком"><b>${d.likes}</b><span>в избранном</span></div>
     <div title="Активных объявлений, подходящих под параметры поиска"><b>${d.passing}</b><span>прошли отсев</span></div>
-    <div title="Объём базы с фото"><b>${d.size_mb} МБ</b><span>размер</span></div>`;
+    <div title="Объём базы с фото"><b>${mbs(d.size_mb)}</b><span>размер</span></div>`;
   $("#dbPath").textContent = d.folder;
-  const lb = d.last_backup;
-  $("#dbBackups").innerHTML = lb
-    ? `Резервных копий: <b>${d.backups}</b> · последняя ${dtt(lb.ts)} — ${esc(lb.name.replace(/_\d{4}-\d{2}-\d{2}_\d{4}\.zip$/, "").replace(/_/g, " "))}, ${lb.mb} МБ`
-    : "Резервных копий пока нет — они создаются автоматически перед импортом и очисткой";
 }
 
 async function doExport() {
@@ -1005,7 +1130,7 @@ async function doImport() {
   toast("ok", "Импорт…", "Это может занять до минуты");
   try {
     const r = await post("/api/db/import", { path, mode });
-    toast("ok", "Импорт завершён", `Добавлено ${r.added}, обновлено ${r.updated}, фото ${r.images}. Резервная копия: ${r.backup}`);
+    toast("ok", "Импорт завершён", `Добавлено ${r.added}, обновлено ${r.updated}, фото ${r.images}. Копия прежней базы: ${fileName(r.backup)}`);
     await loadSettings();
     await loadData();
     renderSettings();

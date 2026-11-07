@@ -2,7 +2,7 @@
 import json
 import os
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -216,6 +216,76 @@ def db_clear(body: dict = Body(...)):
         raise HTTPException(409, "Сначала дождитесь окончания или остановите сбор данных")
     res = purge.clear_all()
     manager.log("db", f"база очищена полностью ({res['listings']} объявлений). Резервная копия: {res['backup']}")
+    return res
+
+
+@app.get("/api/db/launches")
+def db_launches(date_from: str = Query("", alias="from"), date_to: str = Query("", alias="to")):
+    """Запуски сбора за период: что собрал каждый сайт и чем закончил — для выбора, какие удалить."""
+    con = db.connect()
+    try:
+        return purge.launches(con, date_from or None, date_to or None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        con.close()
+
+
+@app.post("/api/db/runs/delete")
+def db_runs_delete(body: dict = Body(...)):
+    """Удаление выбранных прогонов {ids}; dry_run — только посчитать."""
+    if manager.any_running():
+        raise HTTPException(409, "Сначала дождитесь окончания или остановите сбор данных")
+    try:
+        ids = [int(x) for x in (body.get("ids") or [])]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "неверные номера прогонов")
+    if not ids:
+        raise HTTPException(400, "не выбрано ни одного прогона")
+    if body.get("dry_run"):
+        con = db.connect()
+        try:
+            return purge.runs_preview(con, ids)
+        finally:
+            con.close()
+    try:
+        res = purge.purge_runs(ids)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    manager.log("db", f"удалены прогоны {', '.join(f'№{i}' for i in ids)}: объявлений {res['listings']}, "
+                      f"точек графика {res['snapshots']}, изменений {res['events']}, записей цен {res['prices']}; "
+                      f"возвращено в продажу {res['unremoved']}. Резервная копия: {res['backup']}")
+    return res
+
+
+@app.get("/api/db/backups")
+def db_backups():
+    return transfer.backups()
+
+
+@app.post("/api/db/backups/delete")
+def db_backups_delete(body: dict = Body(default={})):
+    """Удаляет резервные копии: {names} или все, если список не задан."""
+    try:
+        res = transfer.delete_backups(body.get("names") or None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    manager.log("db", f"резервные копии удалены: {res['deleted']} шт., освободилось {res['mb']} МБ"
+                      f"{' (в корзину)' if res['trash'] else ' (безвозвратно — корзины на диске нет)'}")
+    return res
+
+
+@app.post("/api/db/backups/restore")
+def db_backups_restore(body: dict = Body(...)):
+    """Восстановление базы из резервной копии (нынешнее состояние уходит в новую копию)."""
+    if manager.any_running():
+        raise HTTPException(409, "Сначала дождитесь окончания или остановите сбор данных")
+    try:
+        res = transfer.restore(body["name"])
+    except (ValueError, KeyError, OSError) as e:
+        raise HTTPException(400, str(e))
+    manager.log("db", f"восстановление из копии {res['restored']}: объявлений {res['added']}, фото {res['images']}. "
+                      f"Нынешнее состояние сохранено: {res['backup']}")
     return res
 
 

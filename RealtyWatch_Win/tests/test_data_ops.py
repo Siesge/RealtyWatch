@@ -1,8 +1,10 @@
-"""Операции с данными: очистка за период и полностью, новый круг с пересчётом зон и истории,
-«последнее обновление» на экране изменений, срез «внутри круга» в снимках рынка, звук."""
+"""Операции с данными: очистка за период, по отдельным прогонам и полностью, резервные копии
+(список, удаление, восстановление), новый круг с пересчётом зон и истории, «последнее обновление»
+на экране изменений, срез «внутри круга» в снимках рынка, звук."""
 import json
+from pathlib import Path
 
-from app import alerts, db, history, purge, server
+from app import alerts, db, history, purge, runlog, server, transfer, trash
 from app.scrapers.cian import Cian
 from tests.support import Case, cian_offer, con, counts, listings, run
 
@@ -62,7 +64,10 @@ class Purge(Case):
         self.assertEqual(now, before)                                                          # цены вернулись
         self.assertEqual(c.execute("SELECT COUNT(*) FROM events WHERE ts=?", (BAD,)).fetchone()[0], 0)
         self.assertEqual(c.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
-        self.assertTrue(all(json.loads(r[0])["city"]["count"] for r in c.execute("SELECT data FROM snapshots")))
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM listings WHERE excluded IS NOT NULL").fetchone()[0], 0,
+                         "отсев пересчитан: с возвращённой ценой объявления снова проходят")
+        self.assertTrue(all(json.loads(r[0])["city"]["count"] == 120 for r in c.execute("SELECT data FROM snapshots")),
+                        "в точках графика — весь рынок, а не только непострадавшие объявления")
 
     def test_open_ranges_and_bad_dates(self):
         c = con()
@@ -169,3 +174,133 @@ class DashboardPoints(Case):
         self.assertEqual(sum(s["events"]["new"] for s in d["snapshots"]), 1200)   # события не теряются
         self.assertEqual(d["recent"][-1]["city"]["count"], 1199)                  # последняя проверка — точно
         self.assertEqual(d["snapshots"][-1]["city"]["count"], 1199)
+
+
+class PickRuns(Case):
+    """Удаление отдельных прогонов: за день могло быть пять сборов, из них четыре неудачных."""
+
+    def setUp(self):
+        super().setUp()
+        self.rows = listings("cian", 120)
+        run("cian", cian(self.rows))                     # хороший сбор 20 октября
+        stamp(GOOD, "2026-11")
+        self.bogus = listings("cian", 10, seed=7)        # неудачный сбор 22 октября
+        for i, r in enumerate(self.bogus):
+            r["source_id"] = str(90_000_000 + i)
+        bad = [dict(r, price=r["price"] // 2) if i < 5 else r for i, r in enumerate(self.rows[:-5])] + self.bogus
+        gone = {r["source_id"] for r in self.rows[-5:]}
+        run("cian", cian(bad, verify=lambda r: ("removed", "тест", None) if r["source_id"] in gone else (None, None, None)))
+        stamp(BAD, "2026-11")
+        c = con()
+        # в том же запуске отработал Яндекс — и остановился на полпути, своих объявлений не записав
+        self.yandex = c.execute("INSERT INTO runs(source, mode, started, finished, status, found, message) "
+                                "VALUES('yandex','http',?,?,'stopped',0,'остановлено пользователем')", (BAD, BAD)).lastrowid
+        c.commit()
+        self.good, self.bad = 1, 2
+
+    def test_launches_group_sites_and_mark_failures(self):
+        groups = purge.launches(con())
+        self.assertEqual([len(g["runs"]) for g in groups], [2, 1], "новые запуски сверху, сайты запуска вместе")
+        self.assertTrue(groups[0]["bad"], "в запуске есть остановленный прогон — он неудачный")
+        self.assertFalse(groups[1]["bad"])
+        self.assertEqual(sorted(r["source"] for r in groups[0]["runs"]), ["cian", "yandex"])
+        self.assertEqual(groups[1]["collected"], 120, "сколько собрал каждый сайт — из самого прогона")
+        self.assertEqual(purge.launches(con(), "2026-10-21", None)[0]["started"], BAD, "период отбирает запуски")
+
+    def test_delete_bad_run_restores_good_state_and_keeps_point(self):
+        before = {r["source_id"]: r["price"] for r in self.rows}
+        prev = purge.runs_preview(con(), [self.bad])
+        self.assertEqual((prev["runs"], prev["listings"], prev["unremoved"]), (1, 10, 5))
+        self.assertEqual(prev["snapshots"], 0, "от запуска остаётся прогон Яндекса — точка графика никуда не денется")
+        res = purge.purge_runs([self.bad])
+        self.assertTrue(res["backup"].endswith(".zip"))
+        c = con()
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM listings").fetchone()[0], 120, "чужие объявления удалены")
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM listings WHERE active=0").fetchone()[0], 0, "снятия отменены")
+        self.assertEqual({r["source_id"]: r["price"] for r in c.execute("SELECT source_id, price FROM listings")}, before)
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (self.bad,)).fetchone()[0], 0)
+        self.assertEqual([r["id"] for r in c.execute("SELECT id FROM runs ORDER BY id")], [self.good, self.yandex])
+        self.assertEqual([r["run_id"] for r in c.execute("SELECT run_id FROM snapshots ORDER BY ts")],
+                         [self.good, self.yandex], "точка запуска переехала на оставшийся прогон")
+        self.assertTrue(all(json.loads(r[0])["city"]["count"] == 120 for r in c.execute("SELECT data FROM snapshots")),
+                        "точки пересчитаны по базе после удаления")
+
+    def test_delete_whole_launch_removes_its_point(self):
+        prev = purge.runs_preview(con(), [self.bad, self.yandex])
+        self.assertEqual(prev["snapshots"], 1, "удаляют весь запуск — точка графика исчезает")
+        purge.purge_runs([self.bad, self.yandex])
+        c = con()
+        self.assertEqual([r["id"] for r in c.execute("SELECT id FROM runs")], [self.good])
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 1)
+
+    def test_run_log_goes_with_the_run(self):
+        self.assertIsNotNone(runlog.run_log_path(self.bad), "журнал неудачного прогона записан")
+        res = purge.purge_runs([self.bad])
+        self.assertGreaterEqual(res["logs"], 1)
+        self.assertIsNone(runlog.run_log_path(self.bad), "подробный журнал удалён вместе с прогоном")
+        self.assertIsNotNone(runlog.run_log_path(self.good), "журнал хорошего прогона остался")
+
+    def test_api_checks_input(self):
+        self.assertEqual(server.db_runs_delete({"ids": [self.bad], "dry_run": True})["listings"], 10)
+        self.assertEqual(con().execute("SELECT COUNT(*) FROM listings").fetchone()[0], 130, "примерка ничего не меняет")
+        for body in ({"ids": []}, {"ids": ["не число"]}, {"ids": [99999]}):
+            with self.assertRaises(Exception):
+                server.db_runs_delete(body)
+
+
+class Backups(Case):
+    """Резервные копии: сколько их, удаление в корзину и восстановление."""
+
+    def setUp(self):
+        super().setUp()
+        real = trash._to_trash                  # в тестах — обычное удаление: корзину хозяина не трогаем
+        trash._to_trash = lambda files: False
+        self.addCleanup(setattr, trash, "_to_trash", real)
+        run("cian", cian(listings("cian", 20)))
+
+    def test_list_counts_and_contents(self):
+        img = self.dir / "images" / "cian"
+        img.mkdir(parents=True, exist_ok=True)
+        (img / "1.webp").write_bytes(b"\x00" * 1024)
+        transfer.backup("перед_очисткой")
+        transfer.backup("перед_полной_очисткой", with_images=True)
+        b = transfer.backups()
+        self.assertEqual(b["count"], 2)
+        self.assertEqual(b["items"][0]["label"], "перед полной очисткой", "в имени — повод и дата")
+        self.assertTrue(all(i["ok"] for i in b["items"]), "в копии есть база — восстановить можно")
+        self.assertEqual([i["images"] for i in b["items"]], [True, False])
+        self.assertGreater(b["bytes"], 0)
+        self.assertEqual(b["folder"], str(transfer.BACKUPS))
+
+    def test_delete_all_and_one(self):
+        first = transfer.backup("перед_очисткой")
+        transfer.backup("перед_импортом")
+        res = transfer.delete_backups([Path(first).name])
+        self.assertEqual((res["deleted"], res["left"], res["trash"]), (1, 1, False))
+        self.assertFalse(Path(first).exists())
+        res = transfer.delete_backups()
+        self.assertEqual((res["deleted"], res["left"]), (1, 0))
+        self.assertEqual(transfer.delete_backups()["deleted"], 0, "удалять больше нечего")
+
+    def test_only_own_backups(self):
+        for name in ("../realty.db", "нет_такой.zip", "перед_очисткой_2026-01-01_1200.txt"):
+            with self.assertRaises(ValueError):
+                transfer.backup_path(name)
+
+    def test_restore_undoes_a_purge(self):
+        c = con()
+        c.execute("INSERT INTO runs(source, mode, started, finished, status) VALUES('cian','http',?,?,'done')", (BAD, BAD))
+        c.commit()
+        res = purge.purge(BAD[:10], BAD[:10])             # очистка сама делает копию «перед очисткой»
+        self.assertEqual(res["runs"], 1)
+        name = Path(res["backup"]).name
+        back = transfer.restore(name)
+        self.assertEqual(back["restored"], name)
+        self.assertEqual(back["added"], 20, "объявления из копии вернулись")
+        self.assertEqual(con().execute("SELECT COUNT(*) FROM runs").fetchone()[0], 2, "и удалённый прогон тоже")
+        self.assertTrue(any(i["label"] == "перед восстановлением" for i in transfer.backups()["items"]),
+                        "нынешнее состояние перед заменой тоже ушло в копию")
+
+    def test_restore_rejects_foreign_name(self):
+        with self.assertRaises(ValueError):
+            transfer.restore("нет_такой.zip")
