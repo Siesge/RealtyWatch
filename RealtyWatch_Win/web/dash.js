@@ -730,14 +730,16 @@ $("#modalBody").addEventListener("click", e => {
 
 // ---------- автообновление ----------
 let AUTO = null;
+const DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
 async function initAuto() {
   try { AUTO = await api("/api/schedule"); } catch (e) { return; }
-  const sel = $("#autoHours"), custom = $("#autoCustom");
+  const sel = $("#autoHours"), custom = $("#autoCustom"), mode = $("#autoMode");
   const preset = ["1", "3", "6", "8", "12"].includes(String(AUTO.hours));
   sel.value = preset ? String(AUTO.hours) : "custom";
   custom.value = AUTO.hours;
   custom.classList.toggle("hidden", preset);
   $("#autoOn").checked = AUTO.enabled;
+  mode.value = AUTO.mode === "weekly" ? "weekly" : "timer";
   $$(".src-run").forEach(c => { c.checked = AUTO.sources.includes(c.value); });
   const save = async patch => { AUTO = await post("/api/schedule", patch); tick(); };
   $("#autoOn").onchange = () => save({ enabled: $("#autoOn").checked, hours: currentHours(), sources: $$(".src-run:checked").map(i => i.value) });
@@ -747,6 +749,11 @@ async function initAuto() {
     save({ hours: +sel.value });
   };
   custom.onchange = () => { if (+custom.value > 0) save({ hours: +custom.value }); };
+  mode.onchange = async () => {
+    await save({ mode: mode.value });
+    if (mode.value === "weekly" && !(AUTO.slots || []).length) schedBox();  // расписания ещё нет — сразу его и зададим
+  };
+  $("#autoPlan").onclick = schedBox;
   $("#sources").addEventListener("change", () => save({ sources: $$(".src-run:checked").map(i => i.value) }));
   setInterval(tick, 1000);
   // пропуски запуска и идущие сборы меняются со временем — обновляем расписание раз в 20 с
@@ -754,19 +761,116 @@ async function initAuto() {
   tick();
 }
 function currentHours() { return $("#autoHours").value === "custom" ? +$("#autoCustom").value || 6 : +$("#autoHours").value; }
+
+// «пн–пт», «сб, вс», «каждый день» — подряд идущие дни сворачиваются в промежуток
+function daysLabel(days) {
+  const s = [...new Set(days)].sort((a, b) => a - b);
+  if (s.length === 7) return "каждый день";
+  const parts = [];
+  for (let i = 0; i < s.length;) {
+    let j = i;
+    while (j + 1 < s.length && s[j + 1] === s[j] + 1) j++;
+    parts.push(j - i >= 2 ? `${DAYS[s[i] - 1]}–${DAYS[s[j] - 1]}` : s.slice(i, j + 1).map(x => DAYS[x - 1]).join(", "));
+    i = j + 1;
+  }
+  return parts.join(", ");
+}
+const slotsLabel = slots => (slots || []).map(s => `${daysLabel(s.days)} в ${s.time}`).join(" · ");
+
+// Окно расписания: время запуска + дни недели у каждого пункта, плюс догонять ли пропущенное
+function schedBox() {
+  const slots = JSON.parse(JSON.stringify(AUTO.slots || []));
+  const row = (s, i) => `<div class="sch-slot" data-i="${i}">
+    <input type="time" value="${s.time}" title="Время запуска, местное">
+    <span class="sch-days">${DAYS.map((d, n) => `<button class="sch-day ${s.days.includes(n + 1) ? "on" : ""}" data-d="${n + 1}" title="${d}">${d}</button>`).join("")}</span>
+    <button class="icon-btn" data-del title="Убрать это время">${ICON.trash}</button></div>`;
+  $("#modalBody").innerHTML = `<div class="sched"><h3>Расписание автообновления</h3>
+    <p class="meta">Сбор выбранных сайтов запускается в это время в отмеченные дни. Время местное, по часам компьютера.
+      Сайт, который в этот момент ещё собирает с прошлого раза, пропустит запуск — остальные запустятся.</p>
+    <div class="sch-list" id="schList">${slots.map(row).join("")}</div>
+    <div class="sch-tools"><button class="chip" id="schAdd">+ Добавить время</button><span class="sch-note" id="schNote"></span></div>
+    <label class="sch-catch"><input type="checkbox" id="schCatch" ${AUTO.catch_up ? "checked" : ""}>
+      <span>Догонять пропущенный запуск при старте программы
+        <i>Программа не работала в назначенное время — тогда при следующем её запуске сбор начнётся сам, через полторы минуты.
+          Выключено: пропущенное время просто пропускается, программа ждёт следующего по расписанию.</i></span></label>
+    <div class="confirm-acts"><button class="btn-sec" data-c="no">Отмена</button><button class="btn-pri" id="schSave">Сохранить</button></div></div>`;
+  $("#modal").classList.remove("hidden");
+  const list = $("#schList"), note = $("#schNote"), save = $("#schSave");
+  const read = () => $$(".sch-slot", list).map(el => ({
+    time: el.querySelector("input[type=time]").value,
+    days: $$(".sch-day.on", el).map(b => +b.dataset.d),
+  }));
+  const upd = () => {
+    const cur = read();
+    const bad = cur.some(s => !s.days.length || !s.time);
+    $$(".sch-slot", list).forEach((el, i) => el.classList.toggle("bad", !cur[i].days.length || !cur[i].time));
+    note.textContent = bad ? "у каждого времени нужен хотя бы один день недели" : cur.length ? slotsLabel(cur) : "расписание пустое — автообновление ничего не запустит";
+    note.classList.toggle("warn", bad);
+    save.disabled = bad;
+  };
+  list.onclick = e => {
+    const day = e.target.closest(".sch-day"), del = e.target.closest("[data-del]");
+    if (day) { day.classList.toggle("on"); upd(); }
+    if (del) { del.closest(".sch-slot").remove(); upd(); }
+  };
+  list.oninput = upd;
+  $("#schAdd").onclick = () => {
+    const cur = read(), last = cur[cur.length - 1];
+    const h = last ? (+last.time.slice(0, 2) + 3) % 24 : 9;   // новое время — через три часа от последнего
+    list.insertAdjacentHTML("beforeend", row({ time: `${String(h).padStart(2, "0")}:00`, days: [1, 2, 3, 4, 5, 6, 7] }, cur.length));
+    upd();
+  };
+  $('#modalBody [data-c="no"]').onclick = closeModal;
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      AUTO = await post("/api/schedule", { mode: "weekly", slots: read(), catch_up: $("#schCatch").checked });
+      $("#autoMode").value = "weekly";
+      closeModal();
+      tick();
+      toast("ok", "Расписание сохранено", AUTO.slots.length
+        ? `${slotsLabel(AUTO.slots)}${AUTO.enabled ? "" : " — включите автообновление, чтобы оно заработало"}`
+        : "Пусто: автообновление ничего не запустит");
+    } catch (e) {
+      save.disabled = false;
+      toast("warn", "Не получилось", e.message);
+    }
+  };
+  upd();
+}
 let autoSkew = 0;
 const hhmm = t => new Date(t).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+// «сегодня в 21:00», «завтра в 09:00», «в пн, 09:00» — когда до запуска больше часа, часы с секундами не нужны
+const whenJs = iso => {
+  const d = new Date(iso), n = new Date(), day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  const days = Math.round((day(d) - day(n)) / 864e5), hm = hhmm(iso);
+  return days === 0 ? `сегодня в ${hm}` : days === 1 ? `завтра в ${hm}`
+    : days < 7 ? `в ${DAYS[(d.getDay() + 6) % 7]}, ${hm}` : `${d.toLocaleDateString("ru-RU", { day: "numeric", month: "short" })} в ${hm}`;
+};
 function tick() {
   const t = $("#autoTimer");
   if (!AUTO) return;
   $("#autoRow").classList.toggle("on", AUTO.enabled);
+  const weekly = AUTO.mode === "weekly", sum = $("#autoPlanSum");
+  $("#autoTimerCfg").classList.toggle("hidden", weekly);
+  $("#autoPlan").classList.toggle("hidden", !weekly);
+  sum.classList.toggle("hidden", !weekly);
+  if (weekly) {
+    sum.innerHTML = (AUTO.slots || []).length
+      ? esc(slotsLabel(AUTO.slots)) + (AUTO.catch_up ? " · <b>догоняет пропущенное</b>" : "")
+      : "расписание пустое — задайте время";
+  }
   const skip = $("#autoSkip"), sk = AUTO.enabled ? Object.entries(AUTO.skipped || {}) : [];
   const ov = AUTO.enabled ? Object.entries(AUTO.overrun || {}) : [];
   skip.classList.toggle("hidden", !sk.length && !ov.length);
   skip.innerHTML = [...sk.map(([s, v]) => `${SRC[s]} ещё собирает${v.since ? ` с ${hhmm(v.since)}` : ""} — пропустил запуск ${hhmm(v.tick)}`),
     ...ov.map(([s, v]) => `⚠ ${SRC[s]}: ${v.streak} сбора подряд не уложились в шаг${v.avg_hours ? ` (сбор ~${v.avg_hours.toFixed(1)} ч)` : ""} — увеличьте шаг`)].join("<br>");
-  if (!AUTO.enabled || !AUTO.next_run) { t.textContent = "выключено"; return; }
+  if (!AUTO.enabled || !AUTO.next_run) {
+    t.textContent = AUTO.enabled && weekly ? "расписание пустое" : "выключено";
+    return;
+  }
   const left = Math.max(0, (new Date(AUTO.next_run) - new Date()) / 1000);
+  if (weekly && left > 3600) { t.innerHTML = `следующий запуск <b>${whenJs(AUTO.next_run)}</b>`; return; }
   const h = Math.floor(left / 3600), m = Math.floor(left % 3600 / 60), s = Math.floor(left % 60);
   t.innerHTML = left > 0 ? `следующий запуск через <b>${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}</b>` : "запускаю…";
   if (left <= 0 && Date.now() - autoSkew > 15000) { autoSkew = Date.now(); api("/api/schedule").then(a => { AUTO = a; }); }

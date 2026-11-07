@@ -326,6 +326,28 @@ svg:not(.leaflet-zoom-animated) { width: 18px; height: 18px; fill: none; stroke:
 .bk-row input { accent-color: var(--accent); flex: none; }
 .bk-list .bk-row span { display: grid; min-width: 0; margin: 0; }   /* перебивает .confirm-text span внутри окна подтверждения */
 .bk-row i { color: var(--muted); font-size: 11.5px; font-style: normal; }
+/* расписание автообновления */
+.modal-card:has(.sched) { width: min(660px, 100%); }
+.sched h3 { margin: 0 40px 8px 0; font-size: 18px; }
+.sched > .meta { display: block; margin: 0 0 14px; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
+.sch-list { display: grid; gap: 8px; }
+.sch-slot { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); }
+.sch-slot.bad { border-color: var(--bad); }
+.sch-slot input[type=time] { width: 110px; height: 34px; padding: 0 8px; border-radius: 9px; border: 1px solid var(--line-2);
+  background: var(--surface); color: var(--ink); font: inherit; font-weight: 700; color-scheme: light dark; }
+.sch-slot input[type=time]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: 0; }
+.sch-days { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+.sch-day { width: 36px; height: 30px; border-radius: 9px; border: 1px solid var(--line-2); background: var(--surface);
+  color: var(--muted); font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; transition: all .12s; }
+.sch-day:hover { border-color: var(--accent); }
+.sch-day.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.sch-tools { display: flex; align-items: center; gap: 10px; margin: 10px 0 0; }
+.sch-note { font-size: 12px; color: var(--muted); min-width: 0; }
+.sch-note.warn { color: var(--bad); font-weight: 700; }
+.sch-catch { display: flex; align-items: flex-start; gap: 10px; margin-top: 16px; padding: 11px 13px; border-radius: 12px;
+  background: var(--surface-2); border: 1px solid var(--line); cursor: pointer; font-size: 13px; font-weight: 600; }
+.sch-catch input { accent-color: var(--accent); margin-top: 2px; flex: none; }
+.sch-catch i { display: block; margin-top: 4px; font-style: normal; font-size: 11.5px; font-weight: 500; color: var(--muted); line-height: 1.5; }
 /* выбор прогонов для удаления */
 .modal-card:has(.runpick) { width: min(860px, 100%); }
 .runpick h3 { margin: 0 40px 8px 0; font-size: 18px; }
@@ -560,6 +582,13 @@ table.grid td.num.bad { color: var(--bad); }
 .auto-cfg { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--side-muted); font-weight: 600; }
 .auto-cfg select, .auto-cfg input { height: 28px; border-radius: 8px; border: 1px solid var(--side-line); background: var(--side-2); color: var(--side-ink); font-weight: 700; padding: 0 6px; }
 .auto-cfg input { width: 64px; }
+.auto-when { display: flex; align-items: center; gap: 6px; }
+.auto-cfg { flex-wrap: wrap; }
+.auto-btn { height: 28px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--side-line); background: var(--side-2);
+  color: var(--side-ink); font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }
+.auto-btn:hover { border-color: var(--accent); color: var(--accent); }
+.auto-plan { font-size: 11.5px; line-height: 1.45; color: var(--side-muted); }
+.auto-plan b { color: var(--side-ink); font-weight: 700; }
 .auto-timer { font-size: 11.5px; color: var(--side-muted); }
 .auto-skip { margin-top: 4px; font-size: 11px; line-height: 1.35; color: var(--warn); }
 .auto-timer b { color: var(--side-ink); font-variant-numeric: tabular-nums; }
