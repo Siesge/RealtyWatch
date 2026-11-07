@@ -19,6 +19,7 @@ const VIEW_TITLE = { dashboard: "Дашборд", cards: "Подборка", tab
 const ICON = {
   pin: '<svg viewBox="0 0 24 24"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></svg>',
   ext: '<svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>',
+  noext: '<svg viewBox="0 0 24 24"><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5M14 4h6v6M4 4l16 16"/></svg>',
   map: '<svg viewBox="0 0 24 24"><circle cx="12" cy="10" r="2.5"/><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/></svg>',
   heart: '<svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z"/></svg>',
   warn: '<svg viewBox="0 0 24 24"><path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4.5M12 17.2v.1"/></svg>',
@@ -224,11 +225,22 @@ function goneTip(i) {
   return `снято ${dtt(i.removed_at) || "—"}. ${i.removed_reason || "Не найдено в поиске сайта"}. Последний раз в поиске: ${dtt(i.last_seen)}`;
 }
 
-// Пропало из полной выдачи, но сайт не подтвердил снятие (страницу не удалось проверить) — не снято
+// Пропало из полной выдачи, но сайт не подтвердил снятие (страницу не удалось проверить)
 function missTip(i) {
-  return `Нет в поиске ${SRC[i.source]} ${i.missed} ${plural(i.missed, "полный сбор", "полных сбора", "полных сборов")} подряд (последний раз видели ${dtt(i.last_seen)}). ` +
-    "Страницу объявления проверить не удалось, поэтому оно не считается снятым и остаётся в продаже. " +
-    "Снятым объявление станет, только если сайт сам покажет, что оно снято или удалено (статус на странице, страница не найдена)";
+  const was = `${i.missed} ${plural(i.missed, "полный сбор", "полных сбора", "полных сборов")} подряд (последний раз видели ${dtt(i.last_seen)})`;
+  return `Нет в поиске ${SRC[i.source]} ${was}, и открыть страницу объявления не удалось. ` +
+    "Один сбор мог и не доехать до конца, поэтому ссылку пока оставляем — но если объявление не появится и в следующем сборе, " +
+    "программа решит, что на этом сайте его больше нет";
+}
+
+// Объявления на сайте нет совсем: ссылку показывать незачем — она никуда не ведёт
+function offTip(i, alive) {
+  return `На ${SRC[i.source]} этого объявления больше нет: ${i.missed} ${plural(i.missed, "полный сбор", "полных сбора", "полных сборов")} подряд ` +
+    `его нет в поиске, а страницу открыть не удалось — попасть на него нельзя, поэтому ссылка убрана. ` +
+    `Последний раз в поиске: ${dtt(i.last_seen)}, цена ${fmt(i.price)} ₽ — последняя известная.\n\n` +
+    (alive ? "Квартира остаётся в продаже: её показывает другой сайт." :
+      "Квартиры не осталось ни на одном сайте, поэтому она снята с продажи. " +
+      "Если объявление всё же живо — «Настройки → База данных → Перепроверить снятые»");
 }
 
 function tags(o) {
@@ -252,14 +264,20 @@ function offers(o) {
   const list = [...o.items].sort((a, b) => (b.active - a.active) || ((a.price || 0) - (b.price || 0)));
   return `<div class="offers">${list.map(i => {
     const ch = i.active ? lastChange(i) : null;
-    const tip = i.active
-      ? `Открыть объявление на ${SRC[i.source]}.\nЦена ${fmt(i.price)} ₽` + (ch ? `, до ${dtt(ch[2])} было ${fmt(ch[0])} ₽` : ", не менялась") +
-        `.\nВ базе с ${dtt(i.first_seen)}, последний раз в поиске ${dtt(i.last_seen)}` + (i.seller_type ? `.\n${SELLER_TIP[i.seller_type]}` : "") +
-        (i.missed ? `.\n\n${missTip(i)}` : "")
-      : `Перечёркнуто — объявление считается снятым с продажи: ${goneTip(i)}.\nЕсли оно на сайте есть — «Настройки → База данных → Перепроверить снятые»`;
-    return `<a class="offer ${i.active ? "" : "gone"}" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(tip)}">
-    <i class="sdot ${i.source}"></i><span>${SRC[i.source]}${i.active && i.missed ? ` <span class="tag miss" title="${esc(missTip(i))}">нет в поиске</span>` : ""}${i.excluded && !o.excluded ? ` <span class="tag warn" title="${esc(`Это объявление не прошло отсев (${i.excluded}), но другое объявление этой квартиры прошло`)}">!</span>` : ""}</span>
-    <span>${best && i.price === best && i.active ? '<span class="best" title="Здесь цена ниже, чем на других сайтах">дешевле</span> ' : ""}${ch ? `<s class="old-mini">${mln(ch[0])}</s> ` : ""}<b>${fmt(i.price)} ₽</b></span>${ICON.ext}</a>`;
+    const tip = i.off_site ? offTip(i, o.active)
+      : i.active
+        ? `Открыть объявление на ${SRC[i.source]}.\nЦена ${fmt(i.price)} ₽` + (ch ? `, до ${dtt(ch[2])} было ${fmt(ch[0])} ₽` : ", не менялась") +
+          `.\nВ базе с ${dtt(i.first_seen)}, последний раз в поиске ${dtt(i.last_seen)}` + (i.seller_type ? `.\n${SELLER_TIP[i.seller_type]}` : "") +
+          (i.missed ? `.\n\n${missTip(i)}` : "")
+        : `Перечёркнуто — объявление считается снятым с продажи: ${goneTip(i)}.\nЕсли оно на сайте есть — «Настройки → База данных → Перепроверить снятые»`;
+    const mark = i.off_site ? ` <span class="tag miss" title="${esc(offTip(i, o.active))}">нет на сайте</span>`
+      : i.active && i.missed ? ` <span class="tag miss" title="${esc(missTip(i))}">нет в поиске</span>` : "";
+    const body = `<i class="sdot ${i.source}"></i><span>${SRC[i.source]}${mark}${i.excluded && !o.excluded ? ` <span class="tag warn" title="${esc(`Это объявление не прошло отсев (${i.excluded}), но другое объявление этой квартиры прошло`)}">!</span>` : ""}</span>
+    <span>${best && i.price === best && i.active ? '<span class="best" title="Здесь цена ниже, чем на других сайтах">дешевле</span> ' : ""}${ch ? `<s class="old-mini">${mln(ch[0])}</s> ` : ""}<b>${fmt(i.price)} ₽</b></span>`;
+    // ссылки нет: объявление с сайта пропало, открывать нечего
+    return i.off_site
+      ? `<div class="offer off ${i.active ? "" : "gone"}" title="${esc(tip)}">${body}${ICON.noext}</div>`
+      : `<a class="offer ${i.active ? "" : "gone"}" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(tip)}">${body}${ICON.ext}</a>`;
   }).join("")}</div>`;
 }
 
@@ -799,7 +817,7 @@ async function renderSettings() {
       ${field("Авито: пауза между запросами, с", `<span class="pair"><input type="number" step="1" min="1" id="sAvD0" value="${s.avito.delay[0]}"><i>—</i><input type="number" step="1" min="1" id="sAvD1" value="${s.avito.delay[1]}"></span>`,
         "Случайная пауза в этом диапазоне перед каждым запросом. При ограничении IP растёт сама в ~1,5 раза и сохраняется. " +
         `После 3 сборов подряд без капчи и ограничений понемногу возвращается к заданной здесь${s.avito.delay_base && s.avito.delay_base.join() !== s.avito.delay.join() ? ` (задано ${s.avito.delay_base.join("–")} с, сейчас выросла)` : ""}.`)}
-      ${field("Авито: проверок снятых за прогон", `<input type="number" min="0" id="sAvVer" value="${s.avito.max_verify ?? 20}">`, "Сколько пропавших из поиска объявлений Авито открывать за один сбор, чтобы проверить, сняты ли они. Каждая проверка — отдельная страница через браузер с паузой, поэтому много проверок подряд вызывает капчу. Непроверенные остаются в продаже с отметкой «нет в поиске» и проверяются в следующих сборах.")}
+      ${field("Авито: проверок снятых за прогон", `<input type="number" min="0" id="sAvVer" value="${s.avito.max_verify ?? 20}">`, "Сколько пропавших из поиска объявлений Авито открывать за один сбор, чтобы проверить, сняты ли они. Каждая проверка — отдельная страница через браузер с паузой, поэтому много проверок подряд вызывает капчу. Непроверенные получают отметку «нет в поиске»; если их нет в поиске и во втором сборе подряд, программа считает, что на Авито их больше нет — ссылка убирается, а с продажи квартира снимается, только когда её не осталось ни на одном сайте.")}
       ${field("Окно браузера", `<select id="sWin">
         ${[["hidden", "скрытое"], ["visible", "видимое"], ["headless", "без окна (headless)"]]
           .map(([v, t]) => `<option value="${v}" ${(b.window || "hidden") === v ? "selected" : ""}>${t}</option>`).join("")}</select>`,

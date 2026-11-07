@@ -6,7 +6,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import about, alerts, db, dedupe, geo, history, images, paths, purge, rules, runlog, settings, share, transfer
+from . import about, alerts, db, dedupe, geo, history, images, offsale, paths, purge, rules, runlog, settings, share, transfer
 from .paths import EXPORTS, WEB
 from .runner import manager
 from .scrapers import SCRAPERS
@@ -39,6 +39,8 @@ def listings():
         r["liked"] = key in liked
         r["object_id"] = r["object_id"] or f"{r['source']}:{r['source_id']}"
         r["has_img"] = images.local_path(*key) is not None
+        # объявления нет в поиске сайта столько прогонов, что ссылка на него уже никуда не ведёт
+        r["off_site"] = offsale.off_search(r)
     return rows
 
 

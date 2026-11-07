@@ -780,8 +780,16 @@ const slotsLabel = slots => (slots || []).map(s => `${daysLabel(s.days)} в ${s.
 // Окно расписания: время запуска + дни недели у каждого пункта, плюс догонять ли пропущенное
 function schedBox() {
   const slots = JSON.parse(JSON.stringify(AUTO.slots || []));
+  // время — двумя списками: у input[type=time] формат берётся из языка браузера, и в окне
+  // появлялось «09:00 AM», которое не влезало в поле
+  const opts = (n, step, v) => {
+    const vals = Array.from({ length: Math.ceil(n / step) }, (_, i) => i * step);
+    if (!vals.includes(+v)) vals.push(+v);   // время из файла могло быть не кратно шагу
+    return vals.sort((a, b) => a - b).map(x => `<option value="${String(x).padStart(2, "0")}"${+v === x ? " selected" : ""}>${String(x).padStart(2, "0")}</option>`).join("");
+  };
   const row = (s, i) => `<div class="sch-slot" data-i="${i}">
-    <input type="time" value="${s.time}" title="Время запуска, местное">
+    <span class="sch-time" title="Время запуска, местное, 24 часа">
+      <select class="sch-h">${opts(24, 1, s.time.slice(0, 2))}</select><i>:</i><select class="sch-m">${opts(60, 5, s.time.slice(3))}</select></span>
     <span class="sch-days">${DAYS.map((d, n) => `<button class="sch-day ${s.days.includes(n + 1) ? "on" : ""}" data-d="${n + 1}" title="${d}">${d}</button>`).join("")}</span>
     <button class="icon-btn" data-del title="Убрать это время">${ICON.trash}</button></div>`;
   $("#modalBody").innerHTML = `<div class="sched"><h3>Расписание автообновления</h3>
@@ -797,7 +805,7 @@ function schedBox() {
   $("#modal").classList.remove("hidden");
   const list = $("#schList"), note = $("#schNote"), save = $("#schSave");
   const read = () => $$(".sch-slot", list).map(el => ({
-    time: el.querySelector("input[type=time]").value,
+    time: `${el.querySelector(".sch-h").value}:${el.querySelector(".sch-m").value}`,
     days: $$(".sch-day.on", el).map(b => +b.dataset.d),
   }));
   const upd = () => {
@@ -813,7 +821,7 @@ function schedBox() {
     if (day) { day.classList.toggle("on"); upd(); }
     if (del) { del.closest(".sch-slot").remove(); upd(); }
   };
-  list.oninput = upd;
+  list.onchange = upd;
   $("#schAdd").onclick = () => {
     const cur = read(), last = cur[cur.length - 1];
     const h = last ? (+last.time.slice(0, 2) + 3) % 24 : 9;   // новое время — через три часа от последнего
