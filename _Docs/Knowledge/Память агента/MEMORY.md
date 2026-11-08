@@ -8,3 +8,4 @@
 - [First run removes the backlog](first-run-mass-removal.md) — after the 7 Nov 2026 off-sale change the first run writes off everything at once; count on a copy first
 - [Mac CI is the only one](mac-ci-is-the-only-one.md) — mac.yml is the repo's only workflow; since 8 Nov 2026 a push skips the browser tests, so green != they passed
 - [No local numbers in release notes](release-notes-no-local-numbers.md) — a release is installed later, on a clean system those counts do not exist
+- [Handover folder _Docs](handover-docs-folder.md) — the repo's pick-up-the-project folder; both sessions keep it current
