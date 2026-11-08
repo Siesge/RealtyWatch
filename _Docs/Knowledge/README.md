@@ -45,6 +45,27 @@ runtime\python\python.exe -m app.main --server
 ```
 Только сервер, без окна, на http://127.0.0.1:8765/ — для отладки интерфейса.
 
+**На Маке** всё делается из `RealtyWatch_Mac/`:
+
+```
+bash bin/bootstrap.sh      # Python 3.12, библиотеки и Chromium: ~300 МБ качает, ~800 МБ на диске
+./start.command            # запуск из исходников, собирать бандл не нужно
+tests/run_tests.command    # 108 тестов
+./build_app.sh             # dist/RealtyWatch.app
+./build_dmg.sh             # dist/RealtyWatch.dmg — его и пересылают человеку
+```
+
+Всё, что программа пишет, лежит в `~/Library/Application Support/RealtyWatch`; переменная
+`RW_HOME` переносит эту папку куда угодно — ею же пользуются тесты, чтобы не касаться настоящей
+базы. **Релизный образ руками не собирают:** его берут артефактом прогона
+(`gh run download <id> -n RealtyWatch-dmg`) — тогда видно, из какого коммита он собран, и его же
+проверил прогон.
+
+macOS-половину можно гонять и на Windows: `RW_HOME` во временную папку плюс junction `browsers`
+на папку Windows-сборки; порядок в `RealtyWatch_Mac/PORTING.md`, «Уровень 1». Python брать
+`RealtyWatch_Win\runtime\python\python.exe` — в системном нет ни Pillow, ни lxml, ни patchright
+(библиотека называется `patchright`, проверять наличие надо именно её, а не `playwright`).
+
 Сборка macOS и её тесты (108) идут в GitHub Actions, workflow `mac.yml` — единственный в
 репозитории. С 8 ноября 2026 обычный push **не запускает браузерные тесты**: зелёный значок
 после push не означает, что они прошли. Перед релизом или проверкой правки, зависящей от
