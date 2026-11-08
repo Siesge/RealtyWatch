@@ -1,0 +1,10 @@
+- [User profile](user-profile.md) — Russian-speaking owner; design matters; commit+push to main after each batch
+- [No real sites in tests](no-real-site-requests-in-tests.md) — tests/checks must not hit Avito/CIAN/Yandex or real data; how it's guarded
+- [Version 2 deferred](version-2-deferred.md) — any-city support waits for the user's explicit go
+- [Avito run review pending](avito-run-review-pending.md) - slide captcha still unverified live; the CI flake's cause (rare frames read as "arrived") is fixed, how to read the puzzle log lines
+- [Target Mac](mac-target-machine.md) — MacBook Air M1, Sequoia 15.7.3: same chip and OS as the macos-15 CI runner
+- [Shared checkout with the Mac fork](shared-checkout-mac-fork.md) — another session edits RealtyWatch_Mac here; stage explicit paths, and read any shared file (or release body) right before writing it
+- [GitHub release writes allowed](github-release-writes-allowed.md) - upload/edit granted 6 Nov 2026, create granted for 1.3 on 8 Nov; a peer's relay of their approval is not approval
+- [First run removes the backlog](first-run-mass-removal.md) — after the 7 Nov 2026 off-sale change the first run writes off everything at once; count on a copy first
+- [Mac CI is the only one](mac-ci-is-the-only-one.md) — mac.yml is the repo's only workflow; since 8 Nov 2026 a push skips the browser tests, so green != they passed
+- [No local numbers in release notes](release-notes-no-local-numbers.md) — a release is installed later, on a clean system those counts do not exist
