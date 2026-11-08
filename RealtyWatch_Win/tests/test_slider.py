@@ -1,6 +1,8 @@
 """Пазл-капча Авито (GeeTest): поиск выреза на картинке и прохождение «мышью, как человек».
 Сайт — локальная имитация страницы «Доступ ограничен» с окном пазла: кусочек едет медленнее ручки
 (как бывает у GeeTest), первая попытка может быть отклонена — программа берёт новое задание и пробует снова.
+Страница умеет рисовать кадры реже обычного — так бывает, когда машина занята: тогда кусочек сдвигается за
+замер еле-еле, и «почти не двигается» нельзя принимать за «доехал».
 Капча другого вида (иконки) — программа зовёт человека: звук и уведомление, затем ждёт его."""
 import io
 import json
@@ -89,6 +91,8 @@ class GapFinder(unittest.TestCase):
 GT = """
 const RATIO = 0.9;  // кусочек едет медленнее ручки
 const LAG = 0.07;   // и догоняет её с запозданием, как у настоящего GeeTest: на экране кусочек отстаёт от ручки
+const FRAME = FRAME_MS;  // как часто страница рисует кадр: 0 — как обычно, иначе раз в столько мс
+function next(f) { FRAME ? setTimeout(f, FRAME) : requestAnimationFrame(f); }
 let TASK = null, start = null, btnX = 0, sliceX = 0;
 function jsonp(url) { return new Promise(res => { const cb = 'geetest_' + Date.now() + Math.floor(Math.random() * 1000);
   window[cb] = d => { delete window[cb]; res(d); }; const s = document.createElement('script'); s.src = url + '&callback=' + cb; document.head.appendChild(s); }); }
@@ -99,9 +103,9 @@ function place() { document.querySelector('.geetest_btn').style.left = btnX + 'p
 function follow() {  // кусочек подтягивается к ручке не сразу
   const sl = document.querySelector('.geetest_slice');
   if (sl) { sliceX += (btnX * RATIO - sliceX) * LAG; sl.style.left = sliceX + 'px'; }
-  requestAnimationFrame(follow);
+  next(follow);
 }
-requestAnimationFrame(follow);
+next(follow);
 function render(d) {
   let wrap = document.querySelector('.geetest_box_wrap');
   if (!wrap) {
@@ -178,10 +182,11 @@ class Site(BaseHTTPRequestHandler):
         st, u = self.state, urlsplit(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         passed = "st=ok" in (self.headers.get("Cookie") or "")
+        gt = GT.replace("FRAME_MS", str(st.get("frame", 0)))
         if u.path == "/search":
-            return self._send(CONTENT) if passed else self._send(FIREWALL % (GT, "true" if st["auto_open"] else "false"), status=429)
+            return self._send(CONTENT) if passed else self._send(FIREWALL % (gt, "true" if st["auto_open"] else "false"), status=429)
         if u.path == "/search439":
-            return self._send(CONTENT) if passed else self._send(OVERLAY % GT, status=439)
+            return self._send(CONTENT) if passed else self._send(OVERLAY % gt, status=439)
         if u.path == "/clicked":
             st["clicks"] += 1
             return self._send("")
@@ -226,7 +231,7 @@ class SliderCaptcha(unittest.TestCase):
 
     def site(self, **kw):
         Site.state = dict({"type": "slide", "loads": 0, "verifies": 0, "clicks": 0, "fail_first": False, "auto_open": False,
-                           "puzzles": {}, "errors": [], "lags": []}, **kw)
+                           "frame": 0, "puzzles": {}, "errors": [], "lags": []}, **kw)
 
     def browser(self, wait_min=1.0):
         b = LocalBrowser("avito", lambda html, url: "js-firewall-form" in html, self.log.append, None,
@@ -258,6 +263,20 @@ class SliderCaptcha(unittest.TestCase):
         self.assertRegex(note, r"вырез x=\d+ \(уверенность .+?\), довели с ошибкой -?[\d.]+ px")
         self.assertEqual([(r, e) for r, e, _ in self.kept], [("пазл фон", "png"), ("пазл кусочек", "png")],
                          "после отказа картинки задания сохраняются — по ним видно, где был вырез")
+
+    def test_slow_page_is_not_mistaken_for_a_stopped_piece(self):
+        """Страница рисует кадры вдвое реже обычного — так бывает, когда машина занята. Кусочек подтягивается
+        к ручке по кадру, и за один замер сдвигается еле-еле, хотя ехать ему ещё далеко: «почти не двигается»
+        тогда значит «страница не рисовала», а не «доехал». Ползунок нельзя отпускать до того, как доедет."""
+        self.site(frame=33)
+        b = self.browser()
+        html = self.open(b)
+        self.assertIn('data-marker="item"', html, "пазл пройден и на медленной странице")
+        self.assertEqual((b.captchas, b.solved), (1, 1))
+        self.assertLessEqual(max(Site.state["lags"]), 1.5,
+                             f"ползунок отпустили, пока кусочек ещё ехал: {Site.state['lags']}")
+        self.assertLessEqual(abs(Site.state["errors"][-1]), 4, f"кусочек не довели до выреза: {Site.state['errors']}")
+        self.assertEqual(Site.state["loads"], 1, "задание не отклонили — довели с первой попытки")
 
     def test_window_opened_by_site_is_not_reopened(self):
         self.site(auto_open=True)
