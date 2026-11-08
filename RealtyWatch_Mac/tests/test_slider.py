@@ -16,7 +16,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
 
 from app import alerts, captcha
 from app.net import Blocked
-from tests.support import LocalBrowser, fast_timing, has_browser
+from tests.support import LocalBrowser, fast_timing, needs_browser
 
 W, H, P, SHOWN_W = 340, 226, 68, 300  # картинка 340×226, в окне — 300 px шириной
 
@@ -214,7 +214,7 @@ class Site(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-@unittest.skipUnless(has_browser(), "Chromium не установлен (bin/bootstrap.sh)")
+@needs_browser
 class SliderCaptcha(unittest.TestCase):
     def setUp(self):
         fast_timing(self)

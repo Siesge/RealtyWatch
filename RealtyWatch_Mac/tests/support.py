@@ -64,8 +64,25 @@ class LocalBrowser(net.Browser):
         shutil.rmtree(getattr(self, "_profile", ""), ignore_errors=True)
 
 
+SKIP_BROWSER = os.environ.get("RW_SKIP_BROWSER_TESTS", "")
+
+
 def has_browser():
+    """Есть ли чем поднять настоящий браузер — и не велено ли браузерные тесты пропустить.
+    RW_SKIP_BROWSER_TESTS с непустым значением отключает их нарочно: они занимают три четверти
+    времени набора, а минуты macOS на приватном репозитории считаются с коэффициентом 10, поэтому
+    на каждый пуш CI гоняет только быстрый набор. Пустое значение или отсутствие — гоним всё."""
+    if SKIP_BROWSER:
+        return False
     return paths.BROWSERS.exists() and any(paths.BROWSERS.glob("chromium-*"))
+
+
+# Затвор классов, которые поднимают настоящий Chromium. Причина пропуска говорит правду: строка
+# «Chromium не установлен» в прогоне, где он как раз установлен, уводит искать поломку среды.
+needs_browser = unittest.skipUnless(
+    has_browser(),
+    "браузерные тесты отключены переменной RW_SKIP_BROWSER_TESTS"
+    if SKIP_BROWSER else "Chromium не установлен (bin/bootstrap.sh)")
 
 
 def fast_timing(test):

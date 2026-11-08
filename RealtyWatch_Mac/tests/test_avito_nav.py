@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from app import net, runlog, settings
 from app.scrapers import avito
-from tests.support import Case, LocalBrowser, con, fast_timing, has_browser, listings, run
+from tests.support import Case, LocalBrowser, con, fast_timing, listings, needs_browser, run
 
 COUNT = 190                     # заявлено сайтом → 4 страницы по 50
 SIZES = {1: 50, 2: 50, 3: 30, 4: 40}  # на 3-й сервер прислал меньше 50
@@ -80,7 +80,7 @@ class Site(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-@unittest.skipUnless(has_browser(), "Chromium не установлен (bin/bootstrap.sh)")
+@needs_browser
 class AvitoLikeHuman(Case):
     def setUp(self):
         super().setUp()

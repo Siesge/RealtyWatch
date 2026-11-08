@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from app import human
-from tests.support import Case, LocalBrowser, fast_timing, has_browser
+from tests.support import Case, LocalBrowser, fast_timing, needs_browser
 
 PAD = 1200           # высота блока объявлений над ссылкой
 SHIFT = 260          # на столько ссылка уезжает вниз, когда страница перекладывается
@@ -52,7 +52,7 @@ class Site(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-@unittest.skipUnless(has_browser(), "Chromium не установлен (bin/bootstrap.sh)")
+@needs_browser
 class ClickAim(Case):
     def setUp(self):
         super().setUp()

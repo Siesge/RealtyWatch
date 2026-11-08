@@ -9,7 +9,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from app import alerts
-from tests.support import LocalBrowser, has_browser
+from tests.support import LocalBrowser, needs_browser
 
 STATS = {"captchas": 0, "premature": 0}
 CAPTCHA = """<html><body><div id="firewall-container">Доступ ограничен: подтвердите, что вы не робот</div>
@@ -45,7 +45,7 @@ class Site(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-@unittest.skipUnless(has_browser(), "Chromium не установлен (bin/bootstrap.sh)")
+@needs_browser
 class Captcha(unittest.TestCase):
     def test_waits_for_site_redirect(self):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), Site)
