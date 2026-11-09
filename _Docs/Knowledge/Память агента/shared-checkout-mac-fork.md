@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 17ddf4a7-e792-4195-b40e-1d4d01c39edf
-  modified: 2026-11-08T10:21:47.000Z
+  modified: 2026-11-09T06:53:26.166Z
 ---
 
 The Mac fork is developed by a separate Claude session ("Парсер недвижимости Ялта (fork)") that works in the **same working tree**, `D:\Claude\RealtyWatch`, under `RealtyWatch_Mac`. Both sessions commit to `main` in the same repo.
@@ -13,6 +13,23 @@ The Mac fork is developed by a separate Claude session ("Парсер недви
 **Why:** on 2026-11-05 a `git add -A` from the Windows side swept that session's uncommitted port (about.py, share.py, its tests and web files, ~780 lines) into commit d3295f4 and pushed it. Nothing was lost, but the work landed under someone else's commit message.
 
 **How to apply:** stage explicit paths — `git add RealtyWatch_Win README.md` (plus whatever else is mine) — and check `git status --short` for foreign paths before committing. A clean tree at the start of a session says nothing about five minutes later. If it happens anyway: leave the files on disk alone, tell the fork session (SendMessage) and the user; never force-push a shared `main`. See [[user-profile]].
+
+**The index is shared too, not just the files on disk.** `git add` with explicit paths covers only
+half of it: `git commit` without paths commits **everything that is in the index**, including a
+file the other session staged between your `add` and your `commit` — one working tree has one
+index, and both sessions use it. `git commit -- <paths>` commits exactly those paths, with one
+catch: it takes their content from the **working tree**, not from what was staged earlier, which
+differs for a half-prepared edit (`git add -p`).
+
+**Why:** on 9 Nov 2026 it happened twice in one morning, in the narrowest possible form. The
+fork's `git push` reported `302c408..799515b` instead of `3b38db9..` — my commit had landed in the
+shared directory between its `commit` and its `push`, so its commit went on top of mine; an hour
+later the mirror image, its push reporting `2929999..6068011`. Nothing was lost either time, and
+only because both sides committed by paths. The habit is what made the race harmless, not luck.
+
+**How to apply:** commit with paths — `git commit -- RealtyWatch_Win README.md` — never a bare
+`git commit`, however clean `git status` looked a minute earlier. The worked case is in
+`RealtyWatch_Mac/PORTING.md` §12.8.
 
 **The checkout is not the only shared thing.** Release 1.3 (8 Nov 2026) showed two more: the
 GitHub release body and this memory folder. Both sessions edited each almost simultaneously, and
