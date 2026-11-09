@@ -30,20 +30,25 @@
 
 ## Как запускать и проверять
 
+**Из папки `RealtyWatch_Win`** — в корне репозитория этих файлов нет:
+
 ```
 tests\run_tests.bat
 ```
 113 тестов, около трёх с половиной минут, на синтетических данных во временной папке.
-
-```
-"RealtyWatch_Win\runtime\python\python.exe" release\make_release.py --version X.Y
-```
-Сборка переносного архива Windows из последнего коммита.
+Последняя проверка — 9 ноября 2026 на коммите `2e1eec8`: 113 из 113, `OK`, 226 секунд, ни одного
+пропуска (браузерные тесты шли — локально стоит Chromium).
 
 ```
 runtime\python\python.exe -m app.main --server
 ```
 Только сервер, без окна, на http://127.0.0.1:8765/ — для отладки интерфейса.
+
+**Из корня репозитория** — сборка переносного архива Windows из последнего коммита:
+
+```
+"RealtyWatch_Win\runtime\python\python.exe" release\make_release.py --version X.Y
+```
 
 **На Маке** всё делается из `RealtyWatch_Mac/`:
 
