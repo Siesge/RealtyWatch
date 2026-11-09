@@ -21,11 +21,18 @@ index, and both sessions use it. `git commit -- <paths>` commits exactly those p
 catch: it takes their content from the **working tree**, not from what was staged earlier, which
 differs for a half-prepared edit (`git add -p`).
 
-**Why:** on 9 Nov 2026 it happened twice in one morning, in the narrowest possible form. The
-fork's `git push` reported `302c408..799515b` instead of `3b38db9..` — my commit had landed in the
-shared directory between its `commit` and its `push`, so its commit went on top of mine; an hour
-later the mirror image, its push reporting `2929999..6068011`. Nothing was lost either time, and
-only because both sides committed by paths. The habit is what made the race harmless, not luck.
+**Why:** on 9 Nov 2026 it showed twice in one morning, and the first reading of it was wrong —
+that correction matters more than the case. The fork's `git push` reported `302c408..799515b`
+instead of `3b38db9..`, and both sessions wrote that down as "my commit landed between its
+`commit` and its `push`". The parent says otherwise: the parent of `799515b` **is** `302c408`, so
+my commit was already in place when the fork made its own, and its push was an ordinary
+fast-forward. Eleven minutes later the same shape again: `2929999..6068011`, whose parent is
+`2929999`. The real mechanism is milder and more useful: one working tree has one HEAD, and HEAD
+moves under you while you work with nothing changing in your own shell — the commit you create
+sits on a commit you never read, and your push names a base you never saw. It stays harmless only
+because both sides commit by paths, and what proves that is `git show --stat <your commit>`, not
+the push line. And one push line cannot distinguish "the other commit came first" from "it came
+between my commit and my push": `git log -1 --format=%p` and `git reflog` can.
 
 **How to apply:** commit with paths — `git commit -- RealtyWatch_Win README.md` — never a bare
 `git commit`, however clean `git status` looked a minute earlier. The worked case is in
