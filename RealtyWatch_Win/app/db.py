@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS events(
 );
 -- Сводка рынка после каждого запуска сбора (когда отработали все сайты) — точка на графиках дашборда
 CREATE TABLE IF NOT EXISTS snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, run_id INTEGER, data TEXT);
+-- Служебные отметки базы: например, по какой версии правил собраны объекты (dedupe_rules)
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
 # Колонки, добавленные после первой версии (ALTER TABLE для старых баз)

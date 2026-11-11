@@ -133,7 +133,16 @@ def _startup_maintenance():
     from . import history
 
     con = db.connect()
-    if con.execute("SELECT COUNT(*) FROM listings WHERE object_id IS NULL").fetchone()[0]:
+    rules = con.execute("SELECT value FROM meta WHERE key='dedupe_rules'").fetchone()
+    if rules is None or rules[0] != str(dedupe.RULES_VERSION):
+        # правила объединения поменялись — объекты пересобираются, и с ними точки дашборда
+        before = con.execute("SELECT COUNT(DISTINCT object_id) FROM listings").fetchone()[0]
+        n = dedupe.rebuild(con)
+        history.rebuild_snapshots(con)
+        con.execute("INSERT OR REPLACE INTO meta VALUES('dedupe_rules', ?)", (str(dedupe.RULES_VERSION),))
+        con.commit()
+        manager.log("db", f"объединение дублей по новым правилам: было {before} объектов, стало {n}")
+    elif con.execute("SELECT COUNT(*) FROM listings WHERE object_id IS NULL").fetchone()[0]:
         n = dedupe.rebuild(con)
         manager.log("db", f"объединение дублей: {n} объектов")
     con.execute("UPDATE runs SET status='interrupted', message='прервано: программа была закрыта во время сбора' "

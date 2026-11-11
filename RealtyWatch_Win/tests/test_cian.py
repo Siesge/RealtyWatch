@@ -102,6 +102,25 @@ class CianRepair(unittest.TestCase):
         items, _ = self.run_listings({}, [a, a])
         self.assertEqual(len(items), 1)
 
+    def test_one_progress_bar_for_all_queries(self):
+        """Полоса прогресса одна на весь сбор: сначала первые страницы всех выдач, потом страницы
+        считаются подряд от 0 до общего числа — без нового отсчёта на каждую выдачу."""
+        seen = []
+        self.c.progress = lambda **k: seen.append((k["page"], k["pages"]))
+        many = [self.offer() for _ in range(60)]  # основная: 3 страницы
+        calls = []
+
+        def load(page, repair=None):
+            calls.append((page, repair))
+            rows = {1: many[:30]}.get(repair, []) if repair else many  # «без ремонта»: 2 страницы
+            return rows[(page - 1) * 28: page * 28], len(rows)
+        self.c._load = load
+        list(self.c.listings())
+        self.assertEqual(calls[:5], [(1, 1), (1, 2), (1, 3), (1, 4), (1, None)], "сначала первые страницы всех выдач")
+        self.assertEqual({p for _, p in seen}, {2 + 1 + 1 + 1 + 3}, "всего страниц — одно число на весь сбор")
+        self.assertEqual([d for d, _ in seen], list(range(0, 9)), "прогресс идёт подряд, без сброса")
+        self.assertEqual(len(calls), 8, "первая страница каждой выдачи не запрашивается второй раз")
+
     def test_warns_when_repair_queries_empty(self):
         self.run_listings({}, [self.offer(), self.offer()])
         warn = [m for m in self.log if m.startswith("⚠ вид ремонта ЦИАН не определён ни у одного из 2 объявлений")]

@@ -97,41 +97,70 @@ class Cian(Scraper):
 
         return self.fetch(via_http, via_browser)
 
-    def _pages(self, repair=None, label=""):
+    def _pages(self, repair, label, first):
         """Все страницы одной выдачи по очереди: (страница, всего страниц, заявлено сайтом, объявления).
-        После последней в self.last_pages — (следующая страница, всего страниц, ограничение) для finish()."""
-        page, pages, limit = 1, 1, self.site.get("max_pages", 40)
-        while page <= pages and page <= limit:
-            offers, total = self._load(page, repair)
-            pages = max(1, math.ceil((total or 0) / PAGE_SIZE))
+        first — уже загруженная первая страница (объявления, заявлено сайтом). После последней страницы
+        в self.last_pages — (следующая страница, всего страниц, ограничение) для finish()."""
+        page, limit = 1, self.site.get("max_pages", 40)
+        offers, total = first
+        pages = self._count(total)
+        while True:
+            if page > 1:
+                offers, total = self._load(page, repair)
+                pages = self._count(total)
             if not offers and page < pages:
                 self.log(f"{label}страница {page}/{pages} пустая — повторяю")
                 self.wait()
                 offers, total = self._load(page, repair)
                 if not offers:
                     self.empty_page(page, pages)
-            self.progress(page=page, pages=min(pages, limit), total=total)
             self.log(f"{label}страница {page}/{pages}: {len(offers)} объявлений")
+            self.step()
             yield page, pages, total, offers
             page += 1
-            if page <= pages and page <= limit:
-                self.wait()
+            if page > pages or page > limit:
+                break
+            self.wait()
         self.last_pages = (page, pages, limit)
 
+    @staticmethod
+    def _count(total):
+        return max(1, math.ceil((total or 0) / PAGE_SIZE))
+
+    def step(self):
+        """Одна прочитанная страница — шаг общего прогресса по всем выдачам сбора."""
+        self.done += 1
+        self.progress(page=min(self.done, self.planned), pages=self.planned, total=self.declared_main)
+
     def listings(self):
+        limit = self.site.get("max_pages", 40)
+        queries = [(code, f"ремонт «{name}», ") for code, (_, name) in REPAIR.items()] + [(None, "")]
+        # 0. Первые страницы всех выдач — по ним известно, сколько страниц всего, и полоса прогресса
+        # идёт одна на весь сбор, а не заново для каждой выдачи
+        first = {}
+        for n, (code, _) in enumerate(queries):
+            first[code] = self._load(1, code)
+            if n < len(queries) - 1:
+                self.wait()
+        self.declared_main = first[None][1]
+        self.planned = sum(min(self._count(t), limit) for _, t in first.values())
+        self.done = 0
+        self.log(f"выдачи по виду ремонта и основная: страниц всего {self.planned}")
+        self.progress(page=0, pages=self.planned, total=self.declared_main)
         # 1. Вид ремонта — по выдаче на каждый вид; запоминается, у какого объявления какой
         self.repairs = {}   # id → код ремонта ЦИАН
         extra = {}          # id → объявление из этих выдач, если основной выдаче оно вдруг не встретится
-        for code, (_, name) in REPAIR.items():
-            for _page, _pages, _total, offers in self._pages(code, f"ремонт «{name}», "):
+        for code, label in queries[:-1]:
+            self.wait()
+            for _page, _pages, _total, offers in self._pages(code, label, first[code]):
                 for o in offers:
                     sid = str(o.get("cianId") or o.get("id"))
                     self.repairs[sid] = code
                     extra[sid] = o
-            self.wait()
         # 2. Основная выдача — все квартиры, в том числе те, где вид ремонта не указан
+        self.wait()
         ids, total = set(), None
-        for _page, _pages, total, offers in self._pages():
+        for _page, _pages, total, offers in self._pages(None, "", first[None]):
             for o in offers:
                 item = self._normalize(o)
                 if item["source_id"] not in ids:
