@@ -12,18 +12,31 @@ from tests.support import Case
 class FakeWindow:
     def __init__(self):
         self.hidden = 0
+        self.shown = 0
+        self.restored = 0
 
     def hide(self):
         self.hidden += 1
 
+    def show(self):
+        self.shown += 1
+
+    def restore(self):
+        self.restored += 1
+
+    def evaluate_js(self, code):
+        pass
+
 
 class FakeTray:
-    """Значок в трее без pystray: оставлено только то, чем пользуются on_close и hide."""
+    """Значок в трее без pystray: оставлено только то, чем пользуются on_close, hide и show."""
     hide = tray.Tray.hide
     on_close = tray.Tray.on_close
+    show = tray.Tray.show
 
     def __init__(self):
         self.window = FakeWindow()
+        self.title = "RealtyWatch — тест"
         self.quitting = False
         self.hint_shown = False
         self.notified = []
@@ -85,6 +98,21 @@ class CloseButton(Case):
             time.sleep(0.01)
         self.assertEqual(t.notified, ["RealtyWatch свёрнут в трей"], "уведомление — только в первый раз за запуск")
         self.assertEqual(t.window.hidden, 2, "окно уходит в трей каждый раз")
+
+    def test_open_from_tray_keeps_window_as_it_was(self):
+        """Открытие из трея не меняет размер окна: развёрнутое остаётся развёрнутым, обычное — на своём месте.
+        restore() из pywebview ставит обычный размер всегда, поэтому звать его нельзя; свёрнутое в панель
+        задач окно возвращает сама Windows (unminimize), в то состояние, из которого его свернули."""
+        calls = []
+        orig = tray.unminimize
+        tray.unminimize = lambda title: calls.append(title)
+        self.addCleanup(setattr, tray, "unminimize", orig)
+        t = FakeTray()
+        t.hide()
+        t.show()
+        self.assertEqual(t.window.shown, 1, "окно показано")
+        self.assertEqual(t.window.restored, 0, "restore() не вызывается — он сжимал развёрнутое окно")
+        self.assertEqual(calls, [t.title], "свёрнутое окно возвращает Windows, по заголовку окна")
 
     def test_setting_saved_like_the_others(self):
         server.set_settings({"ui": {"tray_on_close": False}})

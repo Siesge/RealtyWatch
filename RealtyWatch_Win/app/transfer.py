@@ -223,6 +223,8 @@ def _merge(imported):
         SELECT source, mode, started, finished, status, pages, found, new, changed, removed, message FROM imp.runs i
         WHERE NOT EXISTS (SELECT 1 FROM runs r WHERE r.source=i.source AND r.started=i.started)""")
     con.execute("INSERT OR IGNORE INTO likes SELECT * FROM imp.likes")
+    if con.execute("SELECT 1 FROM imp.sqlite_master WHERE type='table' AND name='dislikes'").fetchone():
+        con.execute("INSERT OR IGNORE INTO dislikes SELECT * FROM imp.dislikes")  # в старых архивах таблицы нет
     con.commit()
     con.execute("DETACH DATABASE imp")
     con.close()

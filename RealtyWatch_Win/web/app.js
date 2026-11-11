@@ -22,6 +22,8 @@ const ICON = {
   noext: '<svg viewBox="0 0 24 24"><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5M14 4h6v6M4 4l16 16"/></svg>',
   map: '<svg viewBox="0 0 24 24"><circle cx="12" cy="10" r="2.5"/><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/></svg>',
   heart: '<svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z"/></svg>',
+  dislike: '<svg viewBox="0 0 24 24"><path d="M10 14.5v4.3a2.2 2.2 0 0 0 4 1.2l3.6-5.5V4H8.4a2 2 0 0 0-2 1.6l-1.3 6.6a2 2 0 0 0 2 2.3zM17.6 4h2.4v10.5h-2.4"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4.3h-4.3"/></svg>',
   warn: '<svg viewBox="0 0 24 24"><path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4.5M12 17.2v.1"/></svg>',
   ok: '<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
   down: '<svg viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></svg>',
@@ -107,6 +109,8 @@ function buildObjects() {
       sources: [...new Set(items.map(i => i.source))],
       price: prices.length ? Math.min(...prices) : null, priceMax: prices.length ? Math.max(...prices) : null,
       liked: items.some(i => i.liked), active: items.some(i => i.active),
+      // лайк и дизлайк взаимоисключающие; если при слиянии баз квартира оказалась и там, и там — побеждает ♥
+      disliked: !items.some(i => i.liked) && items.some(i => i.disliked),
       excluded: items.every(i => i.excluded) ? p.excluded : null,
       renovation: p.excluded || !reno.length ? p.renovation : reno[0],
       first_seen: items.reduce((m, i) => (i.first_seen < m ? i.first_seen : m), p.first_seen),
@@ -126,6 +130,8 @@ function filtered(ignoreZone = false) {
   const pmin = parseFloat($("#fPmin").value) * 1e6, pmax = parseFloat($("#fPmax").value) * 1e6;
   const amin = parseFloat($("#fAmin").value), reno = $("#fReno").value, nb = $("#fNew").value;
   const st = $("#fState").value, active = $("#fActive").checked, noCoords = $("#fNoCoords").checked, liked = $("#fLiked").checked;
+  // «Скрытые» показывают только квартиры с дизлайком; иначе их убирает галочка «исключить дизлайки»
+  const hiddenOnly = $("#fHidden").checked, noDis = $("#fNoDis").checked;
   const text = $("#fText").value.trim().toLowerCase();
   let rows = OBJS.filter(o =>
     o.sources.some(s => src.includes(s)) && (ignoreZone || zones.includes(o.zone)) &&
@@ -135,6 +141,7 @@ function filtered(ignoreZone = false) {
     (nb === "" || String(o.p.is_new_building ?? 0) === nb) &&
     (st === "all" || (st === "pass" ? !o.excluded : !!o.excluded)) &&
     (!active || o.active) && (!noCoords || o.lat == null) && (!liked || o.liked) &&
+    (hiddenOnly ? o.disliked : !(noDis && o.disliked)) &&
     (!text || o.text.includes(text)));
   if (ignoreZone) return rows;
   const s = $("#fSort").value;
@@ -149,6 +156,8 @@ function renderHeader(rows) {
   for (const z of ["A", "B", "C"]) $(`#zc-${z}`).textContent = zr.filter(o => o.zone === z).length;
   const likes = OBJS.filter(o => o.liked).length;
   $("#likeCount").textContent = likes || "";
+  $("#hideCount").textContent = OBJS.filter(o => o.disliked).length || "";
+  $("#fNoDisBox").classList.toggle("off", $("#fHidden").checked);  // в «Скрытых» галочка ни на что не влияет
   $("#btnShare").disabled = !likes;  // выгружать нечего, пока ничего не отмечено сердечком
   const ppm = median(rows.map(o => o.price_m2).filter(Boolean));
   const pr = median(rows.map(o => o.price).filter(Boolean));
@@ -167,10 +176,13 @@ function renderHeader(rows) {
 
 function render() {
   const rows = filtered();
-  renderHeader(rows);
+  // «Только в видимой области карты» сужает список карточек, а карта рядом показывает всё по фильтрам:
+  // иначе, сдвинув карту, вы увидели бы пустое место там, где квартиры есть
+  const list = view === "cards" ? inArea(rows) : rows;
+  renderHeader(list);
   markFilters();
   fitToolbar();  // счётчики в фильтрах меняют ширину строки
-  if (view === "cards") renderCards(rows);
+  if (view === "cards") renderCards(list, rows);
   if (view === "table") renderTable(rows);
   if (view === "map") renderMap(rows);
 }
@@ -216,7 +228,7 @@ function oldPrice(o) {
 
 function renoTip(o) {
   const r = o.p;
-  if (o.renovation === "any") return "ЦИАН отнёс объявление к «с ремонтом», но вид ремонта не указан";
+  if (o.renovation === "any") return "Прежняя отметка ЦИАН «с ремонтом» без вида ремонта: так помечались объявления, пока программа не читала поле «Ремонт». Уточнится при следующем сборе ЦИАН";
   if (!o.renovation) return "Ни сайт, ни описание не указывают вид ремонта. Объявление не отсеяно — проверьте по фото";
   return `Ремонт: ${RENO[o.renovation]}. ` + (r.renovation_raw ? `На сайте указано «${r.renovation_raw}»` : "Определено по тексту описания");
 }
@@ -243,20 +255,37 @@ function offTip(i, alive) {
       "Если объявление всё же живо — «Настройки → База данных → Перепроверить снятые»");
 }
 
+// Причины отсева объекта по одной: в базе они записаны через «; »
+const reasons = o => o.excluded ? String(o.excluded).split(/;\s*/).filter(Boolean) : [];
+const EXCL_TIP = "Не прошло отсев по параметрам поиска (параметры — в «Настройках»)";
+
 function tags(o) {
-  const t = [], r = o.p;
-  if (o.renovation) t.push(`<span class="tag ${o.renovation === "none" ? "bad" : "good"}" title="${esc(renoTip(o))}">${RENO[o.renovation] || o.renovation}</span>`);
+  const x = [], t = [], r = o.p;  // x — причины отсева (✕), идут первыми и подряд; t — остальные бэджи
+  // Причина отсева, у которой есть свой бэдж (ремонт, обременение, доля, торги), показывается этим же бэджем
+  // с крестиком — а не вторым бэджем рядом: «без ремонта» и «✕ без ремонта» говорили одно и то же дважды
+  const why = reasons(o), shown = new Set();
+  const excl = reason => why.includes(reason) && !shown.has(reason) && shown.add(reason);
+  if (o.renovation === "none" && excl("без ремонта"))
+    x.push(`<span class="tag bad" title="${esc(`${EXCL_TIP}: без ремонта.\n${renoTip(o)}`)}">✕ без ремонта</span>`);
+  else if (!o.renovation && excl("ремонт не указан"))
+    x.push(`<span class="tag bad" title="${esc(`${EXCL_TIP}: ремонт не указан, а в настройках — «только указанный ремонт».\n${renoTip(o)}`)}">✕ ремонт не указан</span>`);
+  else if (o.renovation) t.push(`<span class="tag ${o.renovation === "none" ? "bad" : "good"}" title="${esc(renoTip(o))}">${RENO[o.renovation] || o.renovation}</span>`);
   else t.push(`<span class="tag warn" title="${esc(renoTip(o))}">ремонт не указан</span>`);
   if (r.is_new_building) t.push(`<span class="tag" title="Квартира в новостройке (по данным сайта)">новостройка</span>`);
   if (o.items.some(i => i.raw && i.raw.apartments)) t.push(`<span class="tag warn" title="Юридически апартаменты, а не квартира: нельзя прописаться, выше налог и тарифы ЖКХ">апартаменты</span>`);
   const sellers = [...new Set(o.items.map(i => i.seller_type).filter(Boolean))];
   sellers.forEach(s => t.push(`<span class="tag" title="${esc(SELLER_TIP[s] || s)}">${SELLER[s] || s}</span>`));
   if (o.lat == null) t.push(`<span class="tag warn" title="Сайт не дал координаты: зона определена по адресу, на карте объекта нет">нет координат</span>`);
-  for (const [k, lbl, what] of [["encumbrance", "обременение?", "обременение"], ["share", "доля?", "продажа доли"], ["auction", "торги?", "торги / аукцион"]])
-    if (o.flags[k]) t.push(`<span class="tag warn" title="${esc(`Возможно ${what}. В тексте найдено: «${o.flags[k].join("» … «")}». Проверьте вручную`)}">${lbl}</span>`);
-  if (o.excluded) t.push(`<span class="tag bad" title="${esc(`Не прошло отсев по параметрам поиска: ${o.excluded}. Параметры — в «Настройках»`)}">✕ ${esc(o.excluded)}</span>`);
+  for (const [k, lbl, what, reason] of [["encumbrance", "обременение?", "обременение", "обременение"], ["share", "доля?", "продажа доли", "доля"],
+    ["auction", "торги?", "торги / аукцион", "аукцион/торги"]]) {
+    const found = o.flags[k] ? `В тексте найдено: «${o.flags[k].join("» … «")}».` : "";
+    if (excl(reason)) x.push(`<span class="tag bad" title="${esc(`${EXCL_TIP}: ${what}. ${found}`)}">✕ ${reason}</span>`);
+    else if (o.flags[k]) t.push(`<span class="tag warn" title="${esc(`Возможно ${what}. ${found} Проверьте вручную`)}">${lbl}</span>`);
+  }
+  // остальные причины — каждая отдельным бэджем: длинная строка через «; » не помещалась в карточку
+  why.filter(w => !shown.has(w)).forEach(w => x.push(`<span class="tag bad" title="${esc(`${EXCL_TIP}: ${w}`)}">✕ ${esc(w)}</span>`));
   if (!o.active) t.push(`<span class="tag bad" title="${esc("Снято со всех сайтов:\n" + o.items.map(i => `${SRC[i.source]}: ${goneTip(i)}`).join("\n"))}">снято с продажи</span>`);
-  return t.join("");
+  return x.concat(t).join("");
 }
 
 function offers(o) {
@@ -293,12 +322,13 @@ function card(o) {
   const n = o.items.length;
   const multiTip = `Эта квартира найдена на: ${o.sources.map(s => SRC[s]).join(", ")} — объявления объединены в одну карточку.\n` +
     "Признаки одной квартиры: те же комнаты, этаж и этажность, площадь ±1 м², адрес в пределах 150 м, цена ±10%";
-  return `<article class="card ${o.excluded ? "excl" : ""} ${o.active ? "" : "inactive"} ${o.id === PICK ? "picked" : ""}" data-id="${esc(o.id)}">
+  return `<article class="card ${o.excluded ? "excl" : ""} ${o.active ? "" : "inactive"} ${o.disliked ? "disliked" : ""} ${o.id === PICK ? "picked" : ""}" data-id="${esc(o.id)}">
     ${o.id === PICK ? `<div class="pick-note" title="Подсветка снимется по клику на карточку">${ICON.pin}<span>Вы перешли к этой квартире</span></div>` : ""}
     ${media(o)}
       <div class="media-top"><span class="left"><span class="pill zone-${o.zone}" title="${esc(ZONE_TIP[o.zone] || "")}">${ZONE_SHORT[o.zone] || o.zone}</span>
         ${o.sources.length > 1 ? `<span class="pill multi" title="${esc(multiTip)}">${o.sources.length} ${plural(o.sources.length, "сайт", "сайта", "сайтов")}</span>` : ""}</span>
-        <button class="heart ${o.liked ? "on" : ""}" title="${o.liked ? "В избранном — нажмите, чтобы убрать" : "Добавить в избранное: фильтр «Избранное» и отдельный блок на дашборде"}">${ICON.heart}</button></div>
+        <span class="marks"><button class="heart dis ${o.disliked ? "on" : ""}" title="${o.disliked ? "Скрыта — нажмите, чтобы вернуть в подборку" : "Не нравится — скрыть из подборки, таблицы, карты и дашборда. Сбор по ней продолжится; посмотреть и вернуть — кнопка «Скрытые»"}">${ICON.dislike}</button>
+        <button class="heart ${o.liked ? "on" : ""}" title="${o.liked ? "В избранном — нажмите, чтобы убрать" : "Добавить в избранное: фильтр «Избранное» и отдельный блок на дашборде"}">${ICON.heart}</button></span></div>
       <div class="media-bottom"><div><div class="price" title="${esc(priceTip(o))}">${fmt(o.price)} ₽ ${oldPrice(o)}</div>
         <div class="ppm" title="Цена за квадратный метр общей площади${o.priceMax > o.price ? `; на других сайтах цена до ${fmt(o.priceMax)} ₽` : ""}">${fmt(o.price_m2)} ₽/м²${o.priceMax > o.price ? ` · до ${mln(o.priceMax)} млн` : ""}</div></div>${delta(o)}</div>
     </div>
@@ -319,10 +349,10 @@ function card(o) {
   </article>`;
 }
 
-function renderCards(rows) {
+function renderCards(rows, mapRows = rows) {
   if (sideOn()) {
-    if (!SIDE) SIDE = makeMap("sideMap");
-    drawMap(SIDE, rows);
+    if (!SIDE) { SIDE = makeMap("sideMap"); areaControl(SIDE).addTo(SIDE.map); }
+    drawMap(SIDE, mapRows);
     hl = null;
   }
   const el = $("#cardsList");
@@ -334,10 +364,12 @@ function renderCards(rows) {
     if (p && !shown.includes(p)) rows = [p, ...rows.filter(o => o !== p)];
   }
   if (!rows.length) {
-    const liked = $("#fLiked").checked;
-    el.innerHTML = `<div class="empty"><b>${liked ? "В избранном пока пусто" : ALL.length ? "Ничего не найдено" : "База пока пуста"}</b>${
-      liked ? "Нажмите ♥ на карточке, чтобы добавить объект" : ALL.length ? "Ослабьте фильтры или включите другие зоны" : "Нажмите «Запустить» слева, чтобы собрать объявления"}</div>`
-      + (liked ? "" : aboutTab("cards"));
+    const liked = $("#fLiked").checked, hidden = $("#fHidden").checked, area = areaOn() && mapRows.length;
+    const [head, text] = hidden ? ["Скрытых квартир нет", "Нажмите 👎 на карточке, чтобы убрать квартиру из подборки — она появится здесь"]
+      : liked ? ["В избранном пока пусто", "Нажмите ♥ на карточке, чтобы добавить объект"]
+      : area ? ["В видимой области карты квартир нет", "Сдвиньте или отдалите карту и нажмите «Обновить» на карте — или снимите галочку «Только в видимой области»"]
+      : ALL.length ? ["Ничего не найдено", "Ослабьте фильтры или включите другие зоны"] : ["База пока пуста", "Нажмите «Запустить» слева, чтобы собрать объявления"];
+    el.innerHTML = `<div class="empty"><b>${head}</b>${text}</div>` + (liked || hidden || area ? "" : aboutTab("cards"));
     return;
   }
   if (!groupOn()) {
@@ -355,17 +387,32 @@ function renderCards(rows) {
   }).join("");
 }
 
-async function toggleLike(id, btn) {
+// ♥ и 👎 на карточке. Отметки взаимоисключающие: ♥ снимает 👎 и наоборот (так же и на сервере)
+async function toggleLike(id, btn) { return toggleMark(id, "liked", btn); }
+async function toggleDislike(id, btn) { return toggleMark(id, "disliked", btn); }
+
+async function toggleMark(id, kind, btn) {
   const o = OBJS.find(x => x.id === id);
   if (!o) return;
-  const on = !o.liked;
-  o.liked = on;
-  o.items.forEach(i => { i.liked = on; });
+  const other = kind === "liked" ? "disliked" : "liked";
+  const on = !o[kind];
+  o[kind] = on;
+  if (on) o[other] = false;
+  o.items.forEach(i => { i[kind] = on; if (on) i[other] = false; });
   if (btn) { btn.classList.toggle("on", on); btn.classList.add("pop"); setTimeout(() => btn.classList.remove("pop"), 400); }
   try {
-    await post("/api/like", { keys: o.items.map(key), on });
+    await post(kind === "liked" ? "/api/like" : "/api/dislike", { keys: o.items.map(key), on });
   } catch (e) {
     toast("warn", "Не удалось сохранить", e.message);
+  }
+  if (kind === "disliked") {
+    // квартира уходит из списка (или возвращается из «Скрытых») — список перерисовываем сразу
+    if (view === "cards" || view === "table" || view === "map") render(); else renderHeader(filtered());
+    if (view === "dashboard" && typeof paintDashboard === "function") paintDashboard();
+    if (on) toast("ok", "Квартира скрыта", "Её не видно в подборке, таблице, на карте и в списках дашборда. Сбор по ней продолжается. Вернуть — кнопка «Скрытые»",
+      { label: "Вернуть", fn: () => toggleDislike(id) });
+    else if ($("#fHidden").checked) toast("ok", "Квартира возвращена", "Она снова в подборке");
+    return;
   }
   if ($("#fLiked").checked && !on) render(); else renderHeader(filtered());
 }
@@ -379,7 +426,7 @@ const COLS = [
   ["area", "м²", o => o.area ?? "", 1], ["floor", "Этаж", o => `${o.floor ?? "?"}/${o.floors ?? "?"}`, 1],
   ["renovation", "Ремонт", o => RENO[o.renovation] || ""], ["address", "Адрес", o => esc(o.address || "")],
   ["excluded", "Отсев", o => esc(o.excluded || "")], ["first_seen", "Найдено", o => dt(o.first_seen)],
-  ["liked", "♥", o => o.liked ? "♥" : ""],
+  ["liked", "♥", o => o.liked ? "♥" : o.disliked ? `<span class="dis-mark" title="Скрыта — отмечена «не нравится»">${ICON.dislike}</span>` : ""],
 ];
 
 function renderTable(rows) {
@@ -503,6 +550,43 @@ function drawMap(M, rows) {
 }
 
 function renderMap(rows) { if (!MAIN) MAIN = makeMap("map"); drawMap(MAIN, rows); }
+
+// ---------- подборка: только квартиры в видимой области карты рядом ----------
+// Область запоминается в момент, когда ставят галочку или нажимают «Обновить», — а не на каждый сдвиг карты:
+// карту двигают, чтобы посмотреть, и список не должен прыгать под рукой. Сдвинули — кнопка «Обновить» подсвечивается.
+const AREA = { on: false, bounds: null };
+const areaOn = () => AREA.on && !!AREA.bounds && view === "cards" && sideOn();
+const inArea = rows => areaOn() ? rows.filter(o => o.lat != null && AREA.bounds.contains([o.lat, o.lon])) : rows;
+
+function areaControl(M) {
+  const c = L.control({ position: "topleft" });
+  c.onAdd = () => {
+    const box = L.DomUtil.create("div", "area-ctl");
+    box.innerHTML = `<label class="area-chk" title="Показывать в списке карточек только квартиры, которые сейчас видны на карте. Карта при этом показывает все квартиры по фильтрам — двигайте и приближайте её, а потом нажмите «Обновить»">
+        <input type="checkbox"><span>Только в видимой области</span></label>
+      <button class="area-upd" disabled title="Взять видимую сейчас область карты и пересобрать по ней список карточек">${ICON.refresh}<span>Обновить</span></button>`;
+    L.DomEvent.disableClickPropagation(box);
+    L.DomEvent.disableScrollPropagation(box);
+    const chk = box.querySelector("input"), upd = box.querySelector(".area-upd");
+    const take = () => { AREA.bounds = M.map.getBounds(); upd.classList.remove("stale"); render(); $("#cardsList").scrollTop = 0; };
+    chk.checked = AREA.on;
+    chk.onchange = () => {
+      AREA.on = chk.checked;
+      upd.disabled = !AREA.on;
+      box.classList.toggle("on", AREA.on);
+      if (AREA.on) take(); else { upd.classList.remove("stale"); render(); }
+    };
+    upd.onclick = take;
+    // карту сдвинули или приблизили — список отстал от того, что на экране: подсказываем «Обновить»
+    M.map.on("moveend zoomend", () => {
+      if (!AREA.on || !AREA.bounds) return;
+      const b = M.map.getBounds();
+      upd.classList.toggle("stale", !(b.getSouthWest().equals(AREA.bounds.getSouthWest(), 1e-6) && b.getNorthEast().equals(AREA.bounds.getNorthEast(), 1e-6)));
+    });
+    return box;
+  };
+  return c;
+}
 
 // ---------- круг (зона A) на карте: замок, перенос центра кликом, радиус — за край круга ----------
 const LOCK_ICON = {
@@ -799,7 +883,7 @@ async function renderSettings() {
         <option value="exclude_none" ${f.renovation === "exclude_none" ? "selected" : ""}>без ремонта — отсеять</option>
         <option value="strict" ${f.renovation === "strict" ? "selected" : ""}>только указанный ремонт</option>
         <option value="off" ${f.renovation === "off" ? "selected" : ""}>не учитывать</option></select>`,
-        "<b>без ремонта — отсеять</b>: убираются «требует ремонта», «без отделки», черновая/предчистовая (по полю сайта или тексту); где ремонт не указан — остаётся с жёлтой меткой. <b>только указанный</b>: остаются лишь объявления с явно указанным ремонтом. ЦИАН дополнительно фильтруется по ремонту на своей стороне.")}
+        "<b>без ремонта — отсеять</b>: убираются «требует ремонта», «без отделки», черновая/предчистовая (по полю сайта или тексту); где ремонт не указан — остаётся с жёлтой меткой. <b>только указанный</b>: остаются лишь объявления с явно указанным ремонтом. У ЦИАН вид ремонта берётся из поля «Ремонт» в разделе «О квартире», у Авито и Яндекса — из такого же поля сайта; описание читается, только если поля нет.")}
       ${field("Исключать обременение", sw("sEnc", f.exclude_encumbrance), "Ищет в тексте «обременение», «арест», «в залоге», «залог у банка». Отрицания («без обременений», «аресты сняты») не считаются. Выключено — объявление остаётся с меткой «обременение?».")}
       ${field("Исключать доли", sw("sShare", f.exclude_share), "Категория «доля» на ЦИАН, заголовок «Доля…» на Авито, в тексте «доля», «1/2 доли», «долевая собственность».")}
       ${field("Исключать аукционы и торги", sw("sAuc", f.exclude_auction), "В тексте «аукцион», «торги», «банкротство», «конкурсный управляющий». «Торг уместен» не считается.")}
@@ -1327,7 +1411,8 @@ function setView(v) {
 }
 
 function resetFilters() {
-  $$("#filters input[type=checkbox]").forEach(i => i.checked = !(i.value === "C" || i.id === "fNoCoords" || i.id === "fLiked"));
+  // по умолчанию всё включено, кроме посёлков, «без координат», «Избранного» и «Скрытых»; «исключить дизлайки» — включено
+  $$("#filters input[type=checkbox]").forEach(i => i.checked = !(i.value === "C" || ["fNoCoords", "fLiked", "fHidden"].includes(i.id)));
   $("#fPmin").value = $("#fPmax").value = $("#fAmin").value = $("#fText").value = "";
   $("#fReno").value = $("#fNew").value = ""; $("#fState").value = "pass"; $("#fSort").value = "new";
   render();
@@ -1343,6 +1428,10 @@ function setTheme(t) {
 }
 
 $$(".nav button").forEach(b => b.onclick = () => setView(b.dataset.view));
+// «Скрытые» и «Избранное» не включаются вместе: квартира не бывает и той, и другой. Слушатели на самих
+// переключателях срабатывают раньше общего на панели, поэтому список рисуется уже с одним из них
+$("#fHidden").addEventListener("input", () => { if ($("#fHidden").checked) $("#fLiked").checked = false; });
+$("#fLiked").addEventListener("input", () => { if ($("#fLiked").checked) $("#fHidden").checked = false; });
 $("#filters").addEventListener("input", () => render());
 $("#btnReset").onclick = resetFilters;
 $("#btnRun").onclick = async () => {
@@ -1368,7 +1457,8 @@ $("#cardsList").addEventListener("click", e => {
   const c = e.target.closest(".card");
   if (!c) return;
   if (c.classList.contains("picked")) { PICK = null; c.classList.remove("picked"); c.querySelector(".pick-note")?.remove(); }
-  if (e.target.closest(".heart")) { e.preventDefault(); toggleLike(c.dataset.id, e.target.closest(".heart")); return; }
+  const mark = e.target.closest(".heart");
+  if (mark) { e.preventDefault(); (mark.classList.contains("dis") ? toggleDislike : toggleLike)(c.dataset.id, mark); return; }
   if (e.target.closest(".pin")) {
     if (!sideOn()) setSide(true);
     highlight(c.dataset.id, true);

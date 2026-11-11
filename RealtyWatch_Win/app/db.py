@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS runs(
     status TEXT, pages INTEGER, found INTEGER, new INTEGER, changed INTEGER, removed INTEGER, message TEXT
 );
 CREATE TABLE IF NOT EXISTS likes(source TEXT, source_id TEXT, ts TEXT, PRIMARY KEY(source, source_id));
+-- «Скрытые» (дизлайк): квартира не нравится, и её не надо показывать в подборке. Сбор её не пропускает —
+-- цены и снятие ведутся как у всех, скрыта она только в просмотре и возвращается кнопкой «Скрытые»
+CREATE TABLE IF NOT EXISTS dislikes(source TEXT, source_id TEXT, ts TEXT, PRIMARY KEY(source, source_id));
 -- События рынка для экрана «Изменения»: new | price | removed | returned.
 -- baseline=1 — объявление попало в базу при первичной загрузке сайта (не новое для рынка)
 CREATE TABLE IF NOT EXISTS events(

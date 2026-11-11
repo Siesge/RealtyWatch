@@ -30,6 +30,7 @@ def listings():
     for r in con.execute("SELECT source, source_id, ts, price FROM price_history ORDER BY ts"):
         hist.setdefault((r["source"], r["source_id"]), []).append([r["ts"], r["price"]])
     liked = {(r["source"], r["source_id"]) for r in con.execute("SELECT source, source_id FROM likes")}
+    disliked = {(r["source"], r["source_id"]) for r in con.execute("SELECT source, source_id FROM dislikes")}
     con.close()
     for r in rows:
         key = (r["source"], r["source_id"])
@@ -37,6 +38,7 @@ def listings():
         r["raw"] = json.loads(r["raw"]) if r["raw"] else {}
         r["history"] = hist.get(key, [])
         r["liked"] = key in liked
+        r["disliked"] = key in disliked
         r["object_id"] = r["object_id"] or f"{r['source']}:{r['source_id']}"
         r["has_img"] = images.local_path(*key) is not None
         # объявления нет в поиске сайта столько прогонов, что ссылка на него уже никуда не ведёт
@@ -44,19 +46,32 @@ def listings():
     return rows
 
 
-@app.post("/api/like")
-def like(body: dict = Body(...)):
-    """Избранное хранится по каждому объявлению объекта — так оно переживает пересборку объектов."""
+def _mark(table, other, body):
+    """Отметка по каждому объявлению объекта — так она переживает пересборку объектов. Лайк и дизлайк
+    взаимоисключающие: поставленная отметка снимает противоположную."""
     keys = [k.split(":", 1) for k in body.get("keys", [])]
     con = db.connect()
     for source, sid in keys:
         if body.get("on"):
-            con.execute("INSERT OR IGNORE INTO likes VALUES(?,?,?)", (source, sid, db.now()))
+            con.execute(f"INSERT OR IGNORE INTO {table} VALUES(?,?,?)", (source, sid, db.now()))
+            con.execute(f"DELETE FROM {other} WHERE source=? AND source_id=?", (source, sid))
         else:
-            con.execute("DELETE FROM likes WHERE source=? AND source_id=?", (source, sid))
+            con.execute(f"DELETE FROM {table} WHERE source=? AND source_id=?", (source, sid))
     con.commit()
     con.close()
     return {"ok": True}
+
+
+@app.post("/api/like")
+def like(body: dict = Body(...)):
+    """Избранное (♥)."""
+    return _mark("likes", "dislikes", body)
+
+
+@app.post("/api/dislike")
+def dislike(body: dict = Body(...)):
+    """Скрытые (дизлайк): квартира убирается из просмотра, но собирается и обновляется как все."""
+    return _mark("dislikes", "likes", body)
 
 
 @app.get("/img/{source}/{source_id}")

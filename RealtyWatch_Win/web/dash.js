@@ -130,6 +130,9 @@ const DASH_PERIODS = [["3", "3 дня"], ["7", "Неделя"], ["30", "Меся
 let DASH_PERIOD = store.get("rw.dashPeriod", "all"), DASH_S = [], DASH_D = null;
 // Только внутри круга (зона A): все блоки пересчитываются по квартирам в круге
 let DASH_ZONE = store.get("rw.dashZone", "0") === "1";
+// Скрытые квартиры (👎) не попадают в списки квартир дашборда — «Подешевели» и «Самые выгодные».
+// Медианы и графики рынка считаются по всем: рынок от того, что квартира вам не понравилась, не меняется
+let DASH_NODIS = store.get("rw.dashNoDis", "1") === "1";
 // Движение рынка: по умолчанию столбик — день (неделя, месяц на длинном периоде), по кнопке — проверка
 let DASH_EV_SCANS = store.get("rw.dashEvScans", "0") === "1";
 
@@ -267,6 +270,8 @@ function paintDashboard() {
         <span class="meta" id="dashPeriodNote"></span>
         <label class="zone-only ${Z ? "on" : ""}" title="Пересчитать весь дашборд только по квартирам внутри красного круга (зона A): показатели, графики, срез, источники, самые выгодные, подешевевшие и избранное. Выключено — вся Ялта (зоны A и B)">
           <input type="checkbox" id="dashZone" ${Z ? "checked" : ""}><span class="sw-mini"></span><span>Только внутри круга</span></label>
+        <label class="zone-only ${DASH_NODIS ? "on" : ""}" title="Не показывать в списках «Подешевели» и «Самые выгодные» квартиры, отмеченные «не нравится» (👎). Медианы, графики и срез рынка считаются по всем квартирам: рынок от ваших отметок не меняется">
+          <input type="checkbox" id="dashNoDis" ${DASH_NODIS ? "checked" : ""}><span class="sw-mini"></span><span>Исключить дизлайки</span></label>
       </div>
 
       ${chartCard("chRooms", "span2", "Медианная цена по комнатности", `${scope}, каждая точка — одна проверка рынка`, DASH_TIP.rooms(Z))}
@@ -319,6 +324,13 @@ function paintDashboard() {
   $("#dashZone").onchange = () => {
     DASH_ZONE = $("#dashZone").checked;
     store.set("rw.dashZone", DASH_ZONE ? "1" : "0");
+    const y = $(".main").scrollTop;
+    paintDashboard();
+    $(".main").scrollTop = y;
+  };
+  $("#dashNoDis").onchange = () => {
+    DASH_NODIS = $("#dashNoDis").checked;
+    store.set("rw.dashNoDis", DASH_NODIS ? "1" : "0");
     const y = $(".main").scrollTop;
     paintDashboard();
     $(".main").scrollTop = y;
@@ -462,9 +474,9 @@ function dropsBlock() {
 
 const shortAddr = a => (a || "").replace(/^(Россия,\s*)?(Республика Крым,\s*)?(городской округ Ялта,\s*)?(Ялта,\s*)?/i, "").slice(0, 40);
 
-// Квартиры, по которым считается дашборд: вся Ялта (A+B) или только круг (A)
+// Квартиры для списков дашборда: вся Ялта (A+B) или только круг (A); скрытые (👎) — по галочке
 function scopeObjs() {
-  return cityObjs().filter(o => !DASH_ZONE || o.zone === "A");
+  return cityObjs().filter(o => (!DASH_ZONE || o.zone === "A") && !(DASH_NODIS && o.disliked));
 }
 
 function cityObjs() {
@@ -547,6 +559,7 @@ async function renderChanges() {
   if (view !== "changes") return;
   const kinds = JSON.parse(store.get("rw.chKinds", '["new","down","up","removed","returned"]'));
   const onlyPass = store.get("rw.chPass", "1") === "1";
+  const noDis = store.get("rw.chNoDis", "1") === "1";
   const kindOf = e => e.kind === "price" ? ((e.new_value || 0) < (e.old_value || 0) ? "down" : "up") : e.kind;
   const groups = new Map();
   for (const e of ev) {
@@ -558,11 +571,13 @@ async function renderChanges() {
   }
   let tiles = [...groups.entries()].map(([oid, list]) => ({ oid, list, o: OBJS.find(x => x.id === oid) }));
   if (onlyPass) tiles = tiles.filter(t => t.o && !t.o.excluded);
+  if (noDis) tiles = tiles.filter(t => !(t.o && t.o.disliked));
   const cnt = k => ev.filter(e => kindOf(e) === k).length;
   el.innerHTML = `<div class="ch-bar panel">
       <div class="seg small">${CH_PERIODS.map(([v, l, tip]) => `<label title="${tip}"><input type="radio" name="chPeriod" value="${v}" ${v === CH_PERIOD ? "checked" : ""}><span>${l}</span></label>`).join("")}</div>
       <div class="seg small">${Object.entries(KIND).map(([k, v]) => `<label title="${v.tip}"><input type="checkbox" name="chKind" value="${k}" ${kinds.includes(k) ? "checked" : ""}><span><i class="kdot ${v.cls}"></i>${v.label} <em>${cnt(k)}</em></span></label>`).join("")}</div>
       <label class="check" title="Показывать только квартиры, подходящие под параметры поиска"><input type="checkbox" id="chPass" ${onlyPass ? "checked" : ""}><span>только подходящие</span></label>
+      <label class="check" title="Не показывать квартиры, отмеченные «не нравится» (👎 на карточке). Сбор по ним идёт, изменения записываются — просто не на виду"><input type="checkbox" id="chNoDis" ${noDis ? "checked" : ""}><span>исключить дизлайки</span></label>
       <span class="meta">${tiles.length} ${plural(tiles.length, "объект", "объекта", "объектов")} с изменениями</span>
       ${lastRuns ? `<div class="ch-last" title="Последний законченный сбор каждого сайта: изменения выше найдены именно им">${lastRuns.length
         ? "Последнее обновление: " + lastRuns.map(r => `<span><i class="sdot ${r.source}"></i>${SRC[r.source]} ${dtt(r.finished)}${r.status !== "done" ? ` <em class="st-badge ${r.status}">${STATE[r.status] || r.status}</em>` : ""}</span>`).join("")
@@ -575,6 +590,7 @@ async function renderChanges() {
     store.set("rw.chKinds", JSON.stringify([...el.querySelectorAll("input[name=chKind]:checked")].map(x => x.value))); renderChanges();
   });
   $("#chPass").onchange = () => { store.set("rw.chPass", $("#chPass").checked ? "1" : "0"); renderChanges(); };
+  $("#chNoDis").onchange = () => { store.set("rw.chNoDis", $("#chNoDis").checked ? "1" : "0"); renderChanges(); };
   el.querySelectorAll("[data-card]").forEach(b => b.onclick = () => goToCard(b.dataset.card));
   el.querySelectorAll("[data-open]").forEach(b => b.onclick = () => openObject(b.dataset.open));
 }
@@ -665,7 +681,8 @@ function openObject(id) {
         ${offers(o)}
       </div>
     </div>
-    <div class="m-chart-head"><h3>История цен по сайтам</h3><span class="meta">${changed ? "ступенька — изменение цены" : "цена не менялась с момента появления в базе"}</span></div>
+    <div class="m-chart-head"><h3>История цен по сайтам</h3><span class="meta">${changed ? "ступенька — изменение цены" : "цена не менялась с момента появления в базе"}</span>
+      <button class="link sm" id="chObjScale"></button></div>
     <div class="chart-box tall"><canvas id="chObj"></canvas></div>
     <div class="m-hist">${priceTable(o)}</div>
     ${desc ? `<details class="m-desc"><summary>Описание</summary><p>${esc(desc)}</p></details>` : ""}`;
@@ -688,8 +705,23 @@ function priceTable(o) {
     <td class="num">${r.gone ? "" : fmt(r.price) + " ₽"}</td></tr>`).join("")}</tbody></table>`;
 }
 
+// Шкала графика цен: от нуля (по умолчанию) — изменение цены видно в настоящем масштабе: снижение на 300 тысяч
+// при цене 10 млн выглядит как 3%, а не как обрыв. «По ценам» — ось от меньшей цены до большей, как раньше:
+// видна каждая ступенька. Переключается кликом по графику или кнопкой над ним; выбор запоминается
+let OBJ_ABS = store.get("rw.objChartAbs", "1") !== "0";
+const SCALE_TIP = {
+  abs: ["шкала от нуля", "Шкала от нуля: изменения цены видны в настоящем масштабе. Клик по графику — шкала по ценам, крупнее"],
+  rel: ["шкала по ценам", "Шкала от меньшей цены до большей: видна каждая ступенька, но изменение выглядит крупнее, чем есть. Клик по графику — шкала от нуля"],
+};
+
 function drawObjectChart(o) {
   if (charts.chObj) charts.chObj.destroy();
+  const btn = $("#chObjScale"), [lbl, tip] = SCALE_TIP[OBJ_ABS ? "abs" : "rel"];
+  if (btn) {
+    btn.textContent = lbl;
+    btn.title = tip;
+    btn.onclick = () => { OBJ_ABS = !OBJ_ABS; store.set("rw.objChartAbs", OBJ_ABS ? "1" : "0"); drawObjectChart(o); };
+  }
   const now = Date.now();
   const per = {};
   const ds = o.items.map(i => {
@@ -707,8 +739,15 @@ function drawObjectChart(o) {
   opt.scales.x = { type: "linear", grid: { display: false }, border: { color: css("--line-2") },
     ticks: { color: css("--muted"), font: { family: "Manrope" }, maxTicksLimit: 6, callback: v => short ? tsLabel(v) : new Date(v).toLocaleDateString("ru-RU", { day: "numeric", month: "short" }) } };
   opt.scales.y.ticks.callback = v => `${mln(v)} млн`;
+  if (OBJ_ABS) opt.scales.y.min = 0;
   opt.interaction = { mode: "nearest", intersect: false };
   opt.plugins.tooltip.callbacks = { title: c => tsLabel(c[0].parsed.x), label: c => ` ${c.dataset.label}: ${fmt(c.parsed.y)} ₽` };
+  // клик по полю графика (не по легенде: она прячет линию сайта) переключает шкалу
+  const inPlot = (e, ch) => { const a = ch.chartArea; return e.x >= a.left && e.x <= a.right && e.y >= a.top && e.y <= a.bottom; };
+  // пересоздать график — уже после того, как Chart.js закончит разбирать этот клик: внутри его обработчика
+  // уничтоженный график роняет плагины («reading 'handleEvent'»)
+  opt.onClick = (e, els, ch) => { if (btn && inPlot(e, ch)) setTimeout(() => btn.click(), 0); };
+  opt.onHover = (e, els, ch) => { ch.canvas.style.cursor = inPlot(e, ch) ? "pointer" : "default"; };
   charts.chObj = new Chart($("#chObj"), { type: "line", data: { datasets: ds }, options: opt });
 }
 

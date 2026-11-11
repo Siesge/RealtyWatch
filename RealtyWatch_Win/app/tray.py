@@ -3,6 +3,27 @@ import threading
 
 NIN_BALLOONUSERCLICK = 0x0405  # клик по всплывающему уведомлению
 NIIF_NOSOUND = 0x10            # уведомление без звука
+SW_RESTORE = 9                 # вернуть свёрнутое окно в состояние до сворачивания
+
+
+def unminimize(title):
+    """Окно свёрнуто в панель задач — вернуть его таким, каким его свернули: развёрнутым на весь экран
+    или на прежнем месте прежнего размера. Это помнит сама Windows, и SW_RESTORE возвращает именно туда.
+    Не свёрнутое окно не трогаем. restore() из pywebview для этого не годится: он ставит окну обычный
+    размер всегда, и развёрнутое окно после него становится маленьким."""
+    try:
+        import ctypes
+
+        u = ctypes.windll.user32
+        u.FindWindowW.restype = ctypes.c_void_p
+        hwnd = u.FindWindowW(None, title)
+        if hwnd and u.IsIconic(ctypes.c_void_p(hwnd)):
+            u.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+            u.SetForegroundWindow(ctypes.c_void_p(hwnd))
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def wanted():
@@ -18,6 +39,7 @@ class Tray:
         from PIL import Image
 
         self.window = window
+        self.title = title
         self.click_view = "changes"
         self.hint_shown = False
         self.quitting = False
@@ -49,9 +71,12 @@ class Tray:
         self.icon.run_detached()
 
     def show(self, view=None):
+        """Открыть окно из трея таким, каким его убрали: развёрнутым — развёрнутым, обычным — на том же
+        месте и того же размера. Скрытие и показ этого не меняют (Windows держит положение окна сама),
+        поэтому после show() окно трогаем, только если оно было свёрнуто в панель задач."""
         try:
             self.window.show()
-            self.window.restore()
+            unminimize(self.title)
             if view:
                 self.window.evaluate_js(f"window.openView && openView({view!r})")
         except Exception:

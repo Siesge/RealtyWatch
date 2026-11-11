@@ -11,6 +11,10 @@ API = "https://api.cian.ru/search-offers/v2/search-offers-desktop/"
 PAGE_SIZE = 28
 
 DECORATION = {"without": "none", "rough": "none", "preFine": "none", "fine": "finish"}
+# Поле «Ремонт» в разделе «О квартире» на странице объявления: ему доверяем больше, чем описанию.
+# Значение → (код программы, как написано на сайте)
+REPAIR = {"no": ("none", "без ремонта"), "cosmetic": ("cosmetic", "косметический"),
+          "euro": ("euro", "евроремонт"), "design": ("design", "дизайнерский")}
 # Статусы страницы объявления, которые однозначно означают «не в продаже»
 STATUS = {"deactivated": "снято с публикации", "removed": "удалено", "draft": "черновик", "blocked": "заблокировано",
           "refused": "отклонено модерацией", "sold": "продано"}
@@ -45,8 +49,12 @@ class Cian(Scraper):
             "total_area": {"type": "range", "value": {"gte": f["area_min"]}},
             "page": {"type": "term", "value": page},
         }
-        if f.get("renovation", "off") != "off":
-            q["repair"] = {"type": "terms", "value": [1, 2, 3]}  # косметический, евро, дизайнерский
+        # Ремонт на стороне ЦИАН не фильтруется. Раньше здесь стоял фильтр repair [1, 2, 3] в расчёте на
+        # «косметический, евро, дизайнерский», а база показала другое: найденные с ним квартиры другой сайт
+        # часто называл «без ремонта», а дизайнерских у ЦИАН было в разы меньше, чем у Авито и Яндекса, —
+        # похоже, код 1 у ЦИАН и есть «без ремонта», а дизайнерский (4) не запрашивался. Чтобы не зависеть
+        # от смысла кодов, приходят все квартиры, вид ремонта читается из поля «Ремонт» объявления, а отсев
+        # делает программа — с причиной на карточке, как у Авито и Яндекса.
         return q
 
     def _page_url(self, page):
@@ -54,8 +62,6 @@ class Cian(Scraper):
         p = [("deal_type", "sale"), ("engine_version", 2), ("offer_type", "flat"), ("region", self.site["region"]),
              ("minprice", f["price_min"]), ("maxprice", f["price_max"]), ("mintarea", f["area_min"])]
         p += [(f"room{r}", 1) for r in f["rooms"]]
-        if f.get("renovation", "off") != "off":
-            p += [(f"repair[{i}]", v) for i, v in enumerate([1, 2, 3])]
         if page > 1:
             p.append(("p", page))
         return "https://www.cian.ru/cat.php?" + urlencode(p)
@@ -84,6 +90,7 @@ class Cian(Scraper):
     def listings(self):
         page, pages, limit = 1, 1, self.site.get("max_pages", 40)
         total, ids = None, set()
+        self.repairs = {}  # сколько объявлений с каким значением поля «Ремонт» — итог в журнал прогона
         while page <= pages and page <= limit:
             offers, total = self._load(page)
             pages = max(1, math.ceil((total or 0) / PAGE_SIZE))
@@ -102,7 +109,27 @@ class Cian(Scraper):
             page += 1
             if page <= pages and page <= limit:
                 self.wait()
+        self._log_repairs()
         self.finish(page, pages, limit, len(ids), total)
+
+    def _log_repairs(self):
+        """Итог по полю «Ремонт»: по нему видно, что ЦИАН это поле действительно присылает. Если не пришло
+        ни у одного объявления — ремонт определяется только по описанию, и об этом надо знать."""
+        n = sum(self.repairs.values())
+        if not n:
+            return
+        known = sum(v for k, v in self.repairs.items() if k in REPAIR)
+        parts = [f"{REPAIR[k][1]} {self.repairs[k]}" for k in REPAIR if self.repairs.get(k)]
+        other = {k: v for k, v in self.repairs.items() if k not in REPAIR and k is not None}
+        parts += [f"«{k}» {v}" for k, v in other.items()]
+        if self.repairs.get(None):
+            parts.append(f"не указан {self.repairs[None]}")
+        msg = f"поле «Ремонт»: {', '.join(parts)}"
+        if not known:
+            msg = (f"⚠ поле «Ремонт» ЦИАН не пришло ни в одном из {n} объявлений — вид ремонта берётся только "
+                   "из описания. Если так в каждом сборе, ЦИАН поменял формат данных")
+        self.log(msg)
+        self.runlog.line(msg)
 
     def verify(self, row):
         """Страница объявления: offer.status — published (активно), статус снятия или 404."""
@@ -140,12 +167,18 @@ class Cian(Scraper):
         rooms = 0 if o.get("flatType") == "studio" else o.get("roomsCount")
         area = to_float(o.get("totalArea"))
         price = to_int(bt.get("priceRur") or bt.get("price"))
-        reno = DECORATION.get(o.get("decoration"))
-        text_reno = rules.renovation_from_text(desc)
-        if text_reno == "none" or not reno:
-            reno = text_reno or reno
-        if not reno and self.cfg["filters"].get("renovation", "off") != "off":
-            reno = "any"  # ЦИАН отфильтровал по «есть ремонт», но вид не указан
+        repair = o.get("repairType")
+        if hasattr(self, "repairs"):
+            self.repairs[repair] = self.repairs.get(repair, 0) + 1
+        if repair in REPAIR:
+            # Поле «Ремонт» из «О квартире» — его заполняет продавец, и оно точнее описания:
+            # «хороший ремонт в санузлах» не значит, что ремонт есть во всей квартире
+            reno, reno_raw = REPAIR[repair]
+        else:
+            reno, reno_raw = DECORATION.get(o.get("decoration")), o.get("decoration")
+            text_reno = rules.renovation_from_text(desc)
+            if text_reno == "none" or not reno:
+                reno = text_reno or reno
         address = geo.get("userInput") or ", ".join(a.get("fullName") or a.get("name", "") for a in geo.get("address") or [])
         user = o.get("user") or {}
         seller = "owner" if o.get("isByHomeowner") else ("developer" if o.get("fromDeveloper") else ("agent" if user.get("isAgent") else None))
@@ -167,7 +200,7 @@ class Cian(Scraper):
             "lat": c.get("lat"),
             "lon": c.get("lng"),
             "renovation": reno,
-            "renovation_raw": o.get("decoration") or ("фильтр ЦИАН: с ремонтом" if reno == "any" else None),
+            "renovation_raw": reno_raw,
             "building_type": b.get("materialType"),
             "build_year": b.get("buildYear"),
             "is_new_building": int(o.get("category") == "newBuildingFlatSale"),
@@ -178,5 +211,6 @@ class Cian(Scraper):
             "published_at": ts_to_iso(o.get("addedTimestamp")),
             "fetch_mode": self.last_mode,
             "raw": {"category": o.get("category"), "flatType": o.get("flatType"), "decoration": o.get("decoration"),
+                    "repairType": repair,
                     "isApartments": o.get("isApartments"), "creationDate": o.get("creationDate")},
         }
