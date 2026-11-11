@@ -53,7 +53,8 @@ runtime\python\python.exe -m app.main --server
 **На Маке** всё делается из `RealtyWatch_Mac/`:
 
 ```
-bash bin/bootstrap.sh      # Python 3.12, библиотеки и Chromium: ~300 МБ качает, ~800 МБ на диске
+bash bin/bootstrap.sh      # Python 3.12, библиотеки и Chromium: 768 МБ на диске (браузер 465 + среда 303),
+                           # качает «около 300 МБ» — это оценка; подробно в RealtyWatch_Mac/README.md
 ./start.command            # запуск из исходников, собирать бандл не нужно
 tests/run_tests.command    # 108 тестов
 ./build_app.sh             # dist/RealtyWatch.app
