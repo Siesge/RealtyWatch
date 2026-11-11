@@ -69,6 +69,21 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+def hidden_fresh(con, since=None):
+    """Сколько скрытых квартир (дизлайк, без ♥) получили объявления, которым дизлайк не ставили, — то есть
+    добавившиеся в карточку уже после скрытия. since — считать только объявления, впервые найденные с этого
+    момента (для уведомления о прошедшем сборе); без него — все такие, как кружок на кнопке «Скрытые»."""
+    return con.execute("""
+        WITH hid AS (SELECT DISTINCT l.object_id FROM listings l JOIN dislikes d USING(source, source_id)
+                     WHERE l.object_id IS NOT NULL),
+             fav AS (SELECT DISTINCT l.object_id FROM listings l JOIN likes k USING(source, source_id)
+                     WHERE l.object_id IS NOT NULL)
+        SELECT COUNT(DISTINCT l.object_id) FROM listings l
+        WHERE l.object_id IN hid AND l.object_id NOT IN fav
+          AND NOT EXISTS (SELECT 1 FROM dislikes d WHERE d.source = l.source AND d.source_id = l.source_id)
+          AND (? IS NULL OR l.first_seen >= ?)""", (since, since)).fetchone()[0]
+
+
 _init_lock = threading.Lock()
 _initialized = False
 

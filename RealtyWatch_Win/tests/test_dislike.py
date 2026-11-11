@@ -9,11 +9,11 @@ from tests.support import Case
 KEYS = ["cian:111", "avito:222"]
 
 
-def add(source, sid):
+def add(source, sid, first_seen=None, obj="obj:1"):
     con = db.connect()
     con.execute("INSERT INTO listings(source, source_id, url, title, price, first_seen, last_seen, active, missed, object_id) "
                 "VALUES(?,?,?,?,?,?,?,1,0,?)", (source, sid, f"https://example.test/{sid}", "2-к. квартира", 10_000_000,
-                                               db.now(), db.now(), "obj:1"))
+                                               first_seen or db.now(), db.now(), obj))
     con.commit()
     con.close()
 
@@ -50,6 +50,58 @@ class Dislike(Case):
         con.close()
 
 
+def fresh(since=None):
+    con = db.connect()
+    try:
+        return db.hidden_fresh(con, since)
+    finally:
+        con.close()
+
+
+class FreshInHidden(Case):
+    """В скрытую карточку после скрытия добавилось объявление (новая квартира в том же доме или та же
+    на другом сайте): дизлайка у него нет — по этому его и видно."""
+
+    def setUp(self):
+        super().setUp()
+        add("cian", "111", "2026-11-01T10:00:00")
+        add("avito", "222", "2026-11-01T10:00:00")
+        server.dislike({"keys": KEYS, "on": True})
+
+    def test_new_listing_in_hidden_card_is_counted(self):
+        self.assertEqual(fresh(), 0, "всё, что было в карточке, скрыто вместе с ней")
+        add("cian", "333", "2026-11-11T18:23:00")
+        add("yandex", "444", "2026-11-11T18:23:00", obj="obj:2")
+        self.assertEqual(fresh(), 1, "одна скрытая карточка; объявление в чужой карточке не считается")
+        self.assertEqual(fresh("2026-11-11T18:00:00"), 1, "появилось за этот сбор — для уведомления")
+        self.assertEqual(fresh("2026-11-11T19:00:00"), 0, "в следующем сборе уже не новость")
+
+    def test_keep_hidden_and_like_clear_it(self):
+        add("cian", "333")
+        server.dislike({"keys": ["cian:333"], "on": True})
+        self.assertEqual(fresh(), 0, "«Оставить скрытой» ставит дизлайк новому объявлению")
+        add("domclick", "555")
+        server.like({"keys": ["domclick:555"], "on": True})
+        self.assertEqual(fresh(), 0, "квартира с ♥ не скрытая")
+
+    def test_notification_after_run(self):
+        """Уведомление после сбора называет скрытые квартиры с новыми объявлениями и по клику ведёт в «Скрытые»."""
+        from app import main
+        con = db.connect()
+        rid = con.execute("INSERT INTO runs(source, started, status) VALUES('cian', '2026-11-11T18:22:00', 'done')").lastrowid
+        con.commit()
+        con.close()
+        add("cian", "333", "2026-11-11T18:23:00")
+        sent = []
+
+        class Icon:
+            def notify(self, title, text, view=None):
+                sent.append((title, text, view))
+        main._notify_hook(lambda: Icon())([rid], ["cian"], False)
+        self.assertEqual(len(sent), 1, sent)
+        self.assertIn("в 1 скрытую квартиру добавились объявления", sent[0][1])
+
+
 class HiddenInterface(unittest.TestCase):
     """Проводка в интерфейсе: «Скрытые» слева от «Избранного», «исключить дизлайки» включено по умолчанию
     в подборке, таблице и на карте (общий фильтр), на дашборде и в «Изменениях»."""
@@ -60,6 +112,15 @@ class HiddenInterface(unittest.TestCase):
         cls.js = (paths.WEB / "app.js").read_text(encoding="utf-8")
         cls.dash = (paths.WEB / "dash.js").read_text(encoding="utf-8")
         cls.css = (paths.WEB / "app.css").read_text(encoding="utf-8")
+
+    def test_fresh_badge_and_highlight(self):
+        """Кружок с числом на «Скрытых», подсветка новых объявлений и «Оставить скрытой»."""
+        self.assertIn('<i id="hideNew" class="new-badge" hidden></i>', self.html)
+        self.assertIn("return o.disliked ? o.items.filter(i => !i.disliked) : [];", self.js)
+        self.assertIn('if (hiddenOnly) rows.sort((a, b) => (b.fresh.length > 0) - (a.fresh.length > 0));', self.js)
+        self.assertIn('await post("/api/dislike", { keys, on: true });', self.js)
+        self.assertIn('if (name === "cards" && arg === "hidden")', self.dash, "клик по уведомлению")
+        self.assertIn(".offer.fresh", self.css)
 
     def test_hidden_button_left_of_favourites(self):
         self.assertLess(self.html.index('id="fHidden"'), self.html.index('id="fLiked"'))

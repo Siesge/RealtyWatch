@@ -11,10 +11,17 @@ API = "https://api.cian.ru/search-offers/v2/search-offers-desktop/"
 PAGE_SIZE = 28
 
 DECORATION = {"without": "none", "rough": "none", "preFine": "none", "fine": "finish"}
-# Поле «Ремонт» в разделе «О квартире» на странице объявления: ему доверяем больше, чем описанию.
-# Значение → (код программы, как написано на сайте)
-REPAIR = {"no": ("none", "без ремонта"), "cosmetic": ("cosmetic", "косметический"),
-          "euro": ("euro", "евроремонт"), "design": ("design", "дизайнерский")}
+# Вид ремонта из раздела «О квартире». В выдаче поиска ЦИАН его нет (проверено на ответе API 11 ноября 2026:
+# ни repairType, ни другого поля о ремонте), зато поиск умеет по нему фильтровать. Поэтому вид ремонта
+# узнаётся отдельными выдачами «только без ремонта», «только косметический» и т. д.: всё, что пришло
+# в такой выдаче, этот вид ремонта и имеет. Код фильтра ЦИАН → (код программы, как написано на сайте).
+# Код 1 = «без ремонта» проверен: в этой выдаче была квартира 336007473, у которой на сайте «Без ремонта».
+REPAIR = {1: ("none", "без ремонта"), 2: ("cosmetic", "косметический"),
+          3: ("euro", "евроремонт"), 4: ("design", "дизайнерский")}
+# Порядок выдачи. Без явной сортировки ЦИАН ранжирует объявления моделью и между запросами страниц
+# переставляет их: одни приходят дважды, другие ни разу (11 ноября: заявлено 418, собрано 371).
+# По цене порядок для всех страниц один и тот же.
+SORT = "price_object_order"
 # Статусы страницы объявления, которые однозначно означают «не в продаже»
 STATUS = {"deactivated": "снято с публикации", "removed": "удалено", "draft": "черновик", "blocked": "заблокировано",
           "refused": "отклонено модерацией", "sold": "продано"}
@@ -37,7 +44,7 @@ class Cian(Scraper):
         head = (html or "")[:4000].lower()
         return "/captcha" in url or ("<title" in head and "captcha" in head)
 
-    def _json_query(self, page):
+    def _json_query(self, page, repair=None):
         f = self.cfg["filters"]
         q = {
             "_type": "flatsale",
@@ -48,37 +55,40 @@ class Cian(Scraper):
             "room": {"type": "terms", "value": f["rooms"]},
             "total_area": {"type": "range", "value": {"gte": f["area_min"]}},
             "page": {"type": "term", "value": page},
+            "sort": {"type": "term", "value": SORT},
         }
-        # Ремонт на стороне ЦИАН не фильтруется. Раньше здесь стоял фильтр repair [1, 2, 3] в расчёте на
-        # «косметический, евро, дизайнерский», а база показала другое: найденные с ним квартиры другой сайт
-        # часто называл «без ремонта», а дизайнерских у ЦИАН было в разы меньше, чем у Авито и Яндекса, —
-        # похоже, код 1 у ЦИАН и есть «без ремонта», а дизайнерский (4) не запрашивался. Чтобы не зависеть
-        # от смысла кодов, приходят все квартиры, вид ремонта читается из поля «Ремонт» объявления, а отсев
-        # делает программа — с причиной на карточке, как у Авито и Яндекса.
+        if repair:
+            q["repair"] = {"type": "terms", "value": [repair]}
+        # Основная выдача идёт без фильтра по ремонту: иначе пропали бы квартиры, где вид ремонта не указан.
+        # Раньше здесь стоял постоянный фильтр repair [1, 2, 3] в расчёте на «косметический, евро,
+        # дизайнерский», а код 1 оказался «без ремонта», дизайнерский (4) же не запрашивался вовсе.
         return q
 
-    def _page_url(self, page):
+    def _page_url(self, page, repair=None):
         f = self.cfg["filters"]
         p = [("deal_type", "sale"), ("engine_version", 2), ("offer_type", "flat"), ("region", self.site["region"]),
              ("minprice", f["price_min"]), ("maxprice", f["price_max"]), ("mintarea", f["area_min"])]
         p += [(f"room{r}", 1) for r in f["rooms"]]
+        p.append(("sort", SORT))
+        if repair:
+            p.append(("repair[0]", repair))
         if page > 1:
             p.append(("p", page))
         return "https://www.cian.ru/cat.php?" + urlencode(p)
 
-    def _load(self, page):
+    def _load(self, page, repair=None):
         def via_http():
-            r = self.http.post(API, json={"jsonQuery": self._json_query(page)},
+            r = self.http.post(API, json={"jsonQuery": self._json_query(page, repair)},
                                headers={"Origin": "https://www.cian.ru", "Referer": "https://www.cian.ru/"})
             d = r.json().get("data") or {}
             if "offersSerialized" not in d:
                 self.snapshot_last("нет списка в ответе API")
                 raise IOError("ЦИАН: в ответе API нет списка объявлений")
             # aggregatedCount — уникальные объекты (offerCount включает дубли от разных агентов)
-            return d["offersSerialized"], d.get("aggregatedCount") or d["offerCount"]
+            return d["offersSerialized"], d["aggregatedCount"] if "aggregatedCount" in d else d["offerCount"]
 
         def via_browser(b):
-            b.goto(self._page_url(page))
+            b.goto(self._page_url(page, repair))
             st = b.evaluate(_JS_STATE)
             if not st:
                 self.snapshot_last("нет состояния страницы")
@@ -87,49 +97,71 @@ class Cian(Scraper):
 
         return self.fetch(via_http, via_browser)
 
-    def listings(self):
+    def _pages(self, repair=None, label=""):
+        """Все страницы одной выдачи по очереди: (страница, всего страниц, заявлено сайтом, объявления).
+        После последней в self.last_pages — (следующая страница, всего страниц, ограничение) для finish()."""
         page, pages, limit = 1, 1, self.site.get("max_pages", 40)
-        total, ids = None, set()
-        self.repairs = {}  # сколько объявлений с каким значением поля «Ремонт» — итог в журнал прогона
         while page <= pages and page <= limit:
-            offers, total = self._load(page)
+            offers, total = self._load(page, repair)
             pages = max(1, math.ceil((total or 0) / PAGE_SIZE))
             if not offers and page < pages:
-                self.log(f"страница {page}/{pages} пустая — повторяю")
+                self.log(f"{label}страница {page}/{pages} пустая — повторяю")
                 self.wait()
-                offers, total = self._load(page)
+                offers, total = self._load(page, repair)
                 if not offers:
                     self.empty_page(page, pages)
             self.progress(page=page, pages=min(pages, limit), total=total)
-            self.log(f"страница {page}/{pages}: {len(offers)} объявлений")
-            for o in offers:
-                item = self._normalize(o)
-                ids.add(item["source_id"])
-                yield item
+            self.log(f"{label}страница {page}/{pages}: {len(offers)} объявлений")
+            yield page, pages, total, offers
             page += 1
             if page <= pages and page <= limit:
                 self.wait()
-        self._log_repairs()
-        self.finish(page, pages, limit, len(ids), total)
+        self.last_pages = (page, pages, limit)
 
-    def _log_repairs(self):
-        """Итог по полю «Ремонт»: по нему видно, что ЦИАН это поле действительно присылает. Если не пришло
-        ни у одного объявления — ремонт определяется только по описанию, и об этом надо знать."""
-        n = sum(self.repairs.values())
-        if not n:
+    def listings(self):
+        # 1. Вид ремонта — по выдаче на каждый вид; запоминается, у какого объявления какой
+        self.repairs = {}   # id → код ремонта ЦИАН
+        extra = {}          # id → объявление из этих выдач, если основной выдаче оно вдруг не встретится
+        for code, (_, name) in REPAIR.items():
+            for _page, _pages, _total, offers in self._pages(code, f"ремонт «{name}», "):
+                for o in offers:
+                    sid = str(o.get("cianId") or o.get("id"))
+                    self.repairs[sid] = code
+                    extra[sid] = o
+            self.wait()
+        # 2. Основная выдача — все квартиры, в том числе те, где вид ремонта не указан
+        ids, total = set(), None
+        for _page, _pages, total, offers in self._pages():
+            for o in offers:
+                item = self._normalize(o)
+                if item["source_id"] not in ids:
+                    ids.add(item["source_id"])
+                    yield item
+        last = self.last_pages
+        # Пришло в выдаче по ремонту, но не в основной: в поиске объявление есть, терять его незачем
+        for sid, o in extra.items():
+            if sid not in ids:
+                ids.add(sid)
+                yield self._normalize(o)
+        self._log_repairs(ids)
+        self.finish(*last, len(ids), total)
+
+    def _log_repairs(self, ids):
+        """Итог по виду ремонта — в журнал прогона: по нему видно, что выдачи по ремонту сработали."""
+        counts = {}
+        for sid in ids:
+            code = self.repairs.get(sid)
+            counts[code] = counts.get(code, 0) + 1
+        if not ids:
             return
-        known = sum(v for k, v in self.repairs.items() if k in REPAIR)
-        parts = [f"{REPAIR[k][1]} {self.repairs[k]}" for k in REPAIR if self.repairs.get(k)]
-        other = {k: v for k, v in self.repairs.items() if k not in REPAIR and k is not None}
-        parts += [f"«{k}» {v}" for k, v in other.items()]
-        if self.repairs.get(None):
-            parts.append(f"не указан {self.repairs[None]}")
-        msg = f"поле «Ремонт»: {', '.join(parts)}"
-        if not known:
-            msg = (f"⚠ поле «Ремонт» ЦИАН не пришло ни в одном из {n} объявлений — вид ремонта берётся только "
-                   "из описания. Если так в каждом сборе, ЦИАН поменял формат данных")
-        self.log(msg)
-        self.runlog.line(msg)
+        if set(counts) == {None}:
+            self.log(f"⚠ вид ремонта ЦИАН не определён ни у одного из {len(ids)} объявлений — выдачи по ремонту "
+                     "пришли пустыми, ремонт берётся только из описания")
+            return
+        parts = [f"{name} {counts[code]}" for code, (_, name) in REPAIR.items() if counts.get(code)]
+        if counts.get(None):
+            parts.append(f"не указан {counts[None]}")
+        self.log(f"вид ремонта: {', '.join(parts)}")
 
     def verify(self, row):
         """Страница объявления: offer.status — published (активно), статус снятия или 404."""
@@ -167,11 +199,10 @@ class Cian(Scraper):
         rooms = 0 if o.get("flatType") == "studio" else o.get("roomsCount")
         area = to_float(o.get("totalArea"))
         price = to_int(bt.get("priceRur") or bt.get("price"))
-        repair = o.get("repairType")
-        if hasattr(self, "repairs"):
-            self.repairs[repair] = self.repairs.get(repair, 0) + 1
+        sid = str(o.get("cianId") or o.get("id"))
+        repair = (getattr(self, "repairs", None) or {}).get(sid)
         if repair in REPAIR:
-            # Поле «Ремонт» из «О квартире» — его заполняет продавец, и оно точнее описания:
+            # Вид ремонта из «О квартире» — его указывает продавец, и он точнее описания:
             # «хороший ремонт в санузлах» не значит, что ремонт есть во всей квартире
             reno, reno_raw = REPAIR[repair]
         else:
@@ -185,7 +216,7 @@ class Cian(Scraper):
         photos = o.get("photos") or []
         return {
             "source": self.name,
-            "source_id": str(o.get("cianId") or o.get("id")),
+            "source_id": sid,
             "url": (o.get("fullUrl") or "").split("?")[0],
             "title": f"{'Студия' if rooms == 0 else f'{rooms}-к. квартира'}, {area} м², {o.get('floorNumber')}/{b.get('floorsCount')} эт.",
             "price": price,
@@ -211,6 +242,6 @@ class Cian(Scraper):
             "published_at": ts_to_iso(o.get("addedTimestamp")),
             "fetch_mode": self.last_mode,
             "raw": {"category": o.get("category"), "flatType": o.get("flatType"), "decoration": o.get("decoration"),
-                    "repairType": repair,
+                    "repair": repair,
                     "isApartments": o.get("isApartments"), "creationDate": o.get("creationDate")},
         }

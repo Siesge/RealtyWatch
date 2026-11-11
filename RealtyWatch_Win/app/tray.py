@@ -26,6 +26,19 @@ def unminimize(title):
     return False
 
 
+def window_open(title):
+    """Окно на экране: показано и не свёрнуто в панель задач. Не нашли окно — считаем, что его нет."""
+    try:
+        import ctypes
+
+        u = ctypes.windll.user32
+        u.FindWindowW.restype = ctypes.c_void_p
+        hwnd = u.FindWindowW(None, title)
+        return bool(hwnd) and bool(u.IsWindowVisible(ctypes.c_void_p(hwnd))) and not u.IsIconic(ctypes.c_void_p(hwnd))
+    except Exception:
+        return False
+
+
 def wanted():
     """Нужен ли значок в трее. Он есть только с галочкой «сворачивать в трей по закрытию»:
     без неё «Закрыть» закрывает программу, а значит, и уведомлениям Windows неоткуда взяться."""
@@ -61,7 +74,10 @@ class Tray:
 
         item = pystray.MenuItem
         menu = pystray.Menu(
-            item("Открыть RealtyWatch", lambda icon, it: self.show(), default=True),
+            # Клик левой кнопкой по значку: окно открыто — убрать в трей, нет — открыть. В меню этот пункт
+            # не виден, клик pystray передаёт пункту с default=True
+            item("Показать или скрыть", lambda icon, it: self.toggle(), default=True, visible=False),
+            item("Открыть RealtyWatch", lambda icon, it: self.show()),
             item("Изменения на рынке", lambda icon, it: self.show("changes")),
             item("Обновить сейчас", lambda icon, it: on_update()),
             pystray.Menu.SEPARATOR,
@@ -82,6 +98,13 @@ class Tray:
         except Exception:
             pass
 
+    def toggle(self):
+        """Клик по значку: открытое окно уходит в трей, скрытое или свёрнутое — открывается."""
+        if window_open(self.title):
+            self.hide()
+        else:
+            self.show()
+
     def on_close(self):
         """Нажата кнопка «Закрыть». Пока значок в трее есть, окно уходит в трей, а закрытие
         отменяется (False); без галочки программа закрывается как обычно. Настройку читаем в момент
@@ -98,7 +121,7 @@ class Tray:
             # уведомление — отдельным потоком: по «Закрыть» этот метод держит поток окна
             threading.Thread(target=self.notify, daemon=True, args=(
                 "RealtyWatch свёрнут в трей",
-                "Сбор и автообновление продолжают работать. Двойной клик по значку — открыть.")).start()
+                "Сбор и автообновление продолжают работать. Клик по значку — открыть.")).start()
 
     def notify(self, title, text, view=None):
         self.click_view = view

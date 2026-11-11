@@ -14,7 +14,9 @@ UNKNOWN = (None, None, None)
 
 def cian(rows, total=None, fail_page=None, verify=None, per_page=28):
     class C(Cian):
-        def _load(self, page):
+        def _load(self, page, repair=None):
+            if repair:  # выдачи по виду ремонта в этих тестах пустые
+                return [], 0
             if fail_page == page:
                 raise IOError("timeout: сервер не ответил")
             chunk = rows[(page - 1) * 28: page * 28][:per_page]

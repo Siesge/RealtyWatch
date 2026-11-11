@@ -165,20 +165,33 @@ def _notify_hook(tray=lambda: None):
     tray() — значок в трее на эту минуту или None: без галочки значка нет и уведомлений тоже."""
     from . import db, history
     from .runner import SOURCE_LABEL, manager
+    from .share import plural
 
     def hook(run_ids, sources, auto):
         con = db.connect()
         c = history.runs_summary(con, run_ids)
+        marks = ",".join("?" * len(run_ids))
+        since = con.execute(f"SELECT MIN(started) FROM runs WHERE id IN ({marks})", run_ids).fetchone()[0] if run_ids else None
+        hidden = db.hidden_fresh(con, since) if since else 0
         con.close()
         text = _changes_text(c)
         names = ", ".join(SOURCE_LABEL.get(s, s) for s in sources)
-        if not text:
+        # скрытые квартиры, в карточки которых за этот сбор добавились объявления: может быть, новая квартира
+        hid = (f"в {hidden} {plural(hidden, 'скрытую квартиру', 'скрытые квартиры', 'скрытых квартир')} "
+               "добавились объявления") if hidden else ""
+        if hid:
+            manager.log("db", f"👎 {hid} — кружок на кнопке «Скрытые»")
+        if not text and not hid:
             manager.log("db", f"сбор завершён ({names}) — изменений на рынке нет")
             return
-        manager.log("db", f"🔔 изменения на рынке ({names}): {text}")
+        if text:
+            manager.log("db", f"🔔 изменения на рынке ({names}): {text}")
         icon = tray()
         if icon:
-            icon.notify(f"RealtyWatch: изменения на рынке — {names}", text + "\nНажмите, чтобы посмотреть", view="changes:last")
+            body = " · ".join(x for x in (text, hid) if x)
+            # только новости о скрытых — по клику сразу «Скрытые» в подборке
+            icon.notify(f"RealtyWatch: изменения на рынке — {names}", body + "\nНажмите, чтобы посмотреть",
+                        view="changes:last" if text else "cards:hidden")
 
     return hook
 

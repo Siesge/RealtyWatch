@@ -13,7 +13,9 @@ GOOD, BAD = "2026-10-20T10:00:00", "2026-10-22T10:00:00"
 
 def cian(rows, verify=None):
     class C(Cian):
-        def _load(self, page):
+        def _load(self, page, repair=None):
+            if repair:  # выдачи по виду ремонта в этих тестах пустые
+                return [], 0
             return [cian_offer(r) for r in rows[(page - 1) * 28: page * 28]], len(rows)
 
         def verify(self, row):

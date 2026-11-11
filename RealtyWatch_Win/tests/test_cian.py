@@ -1,12 +1,13 @@
-"""ЦИАН: вид ремонта берётся из поля «Ремонт» объявления (раздел «О квартире»), а не из описания,
-и на стороне ЦИАН по ремонту ничего не фильтруется. Данные синтетические, к сайту не обращаемся."""
+"""ЦИАН: вид ремонта узнаётся отдельными выдачами по каждому виду (в самой выдаче поля о ремонте нет),
+основная выдача идёт без фильтра по ремонту и с сортировкой по цене. Данные синтетические, к сайту
+не обращаемся."""
 import unittest
 
 from app import rules, settings
-from app.scrapers.cian import Cian
+from app.scrapers.cian import Cian, SORT
 from tests.support import cian_offer, isolate, listings
 
-# Описание объявления 333647311 по сути: ремонт сделан только в санузлах, а поле «Ремонт» — «без ремонта»
+# Описание объявления 333647311 по сути: ремонт сделан только в санузлах, а в «О квартире» — «без ремонта»
 BATHROOMS_ONLY = "Вид неописуемый. Внутри сделан хороший ремонт в санузлах (ванная и туалет полностью готовы)."
 
 
@@ -15,68 +16,96 @@ class CianRepair(unittest.TestCase):
         isolate(self)
         self.log = []
         self.c = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        self.c.wait = lambda *a, **k: None
         self.f = settings.load()["filters"]
+        self.n = 1000
 
-    def offer(self, repair=None, decoration=None, description="Квартира в центре"):
+    def offer(self, decoration=None, description="Квартира в центре"):
         o = cian_offer(listings("cian", 1)[0])
+        self.n += 1
+        o["cianId"] = self.n
         o["description"] = description
         o["decoration"] = decoration
-        if repair is not None:
-            o["repairType"] = repair
         return o
 
-    def test_field_wins_over_description(self):
-        """«Хороший ремонт в санузлах» в описании не делает квартиру отремонтированной, если в «О квартире»
-        написано «без ремонта»: такая квартира отсеивается."""
-        item = self.c._normalize(self.offer("no", description=BATHROOMS_ONLY))
+    def norm(self, o, repair=None):
+        self.c.repairs = {str(o["cianId"]): repair} if repair else {}
+        return self.c._normalize(o)
+
+    def test_repair_wins_over_description(self):
+        """«Хороший ремонт в санузлах» в описании не делает квартиру отремонтированной, если ЦИАН отдал её
+        в выдаче «без ремонта»: такая квартира отсеивается."""
+        item = self.norm(self.offer(description=BATHROOMS_ONLY), 1)
         self.assertEqual(item["renovation"], "none")
         self.assertEqual(item["renovation_raw"], "без ремонта", "на карточке видно, что указано на сайте")
         self.assertIn("без ремонта", rules.evaluate(item, self.f))
 
-    def test_field_values(self):
-        for repair, code in (("cosmetic", "cosmetic"), ("euro", "euro"), ("design", "design"), ("no", "none")):
-            with self.subTest(repair=repair):
-                self.assertEqual(self.c._normalize(self.offer(repair, description="требует ремонта"))["renovation"], code,
-                                 "поле сайта важнее описания и в обратную сторону")
+    def test_repair_codes(self):
+        for code, reno in ((1, "none"), (2, "cosmetic"), (3, "euro"), (4, "design")):
+            with self.subTest(code=code):
+                self.assertEqual(self.norm(self.offer(description="требует ремонта"), code)["renovation"], reno,
+                                 "вид ремонта с сайта важнее описания и в обратную сторону")
 
-    def test_without_field_old_rules(self):
-        """Поля нет — как раньше: отделка новостройки, затем описание."""
-        self.assertEqual(self.c._normalize(self.offer(decoration="fine"))["renovation"], "finish")
-        self.assertEqual(self.c._normalize(self.offer(decoration="fine", description="Квартира требует ремонта"))["renovation"], "none")
-        self.assertEqual(self.c._normalize(self.offer(description="Сделан евроремонт"))["renovation"], "euro")
+    def test_without_repair_old_rules(self):
+        """Вид ремонта не указан — как раньше: отделка новостройки, затем описание."""
+        self.assertEqual(self.norm(self.offer(decoration="fine"))["renovation"], "finish")
+        self.assertEqual(self.norm(self.offer(decoration="fine", description="Квартира требует ремонта"))["renovation"], "none")
+        self.assertEqual(self.norm(self.offer(description="Сделан евроремонт"))["renovation"], "euro")
 
     def test_no_guess_without_data(self):
-        """Ни поля, ни описания — ремонт не указан. Раньше такие объявления помечались «с ремонтом» в расчёте
-        на фильтр ЦИАН, а он пропускал и квартиры без ремонта."""
+        """Ни вида ремонта, ни описания — ремонт не указан, а не «с ремонтом»."""
         self.assertNotEqual(self.f.get("renovation"), "off", "фильтр по ремонту включён — ровно тот случай")
-        item = self.c._normalize(self.offer())
+        item = self.norm(self.offer())
         self.assertIsNone(item["renovation"])
         self.assertIsNone(item["renovation_raw"])
 
-    def test_no_repair_filter_on_site(self):
-        """На сайт ремонт не передаётся: ни в API, ни в адресе страницы выдачи."""
-        self.assertNotIn("repair", self.c._json_query(1))
-        self.assertNotIn("repair", self.c._page_url(1))
+    def test_queries(self):
+        """Основная выдача — без фильтра по ремонту; у всех выдач сортировка по цене (без неё ЦИАН
+        перемешивает объявления между страницами)."""
+        q = self.c._json_query(1)
+        self.assertNotIn("repair", q)
+        self.assertEqual(q["sort"]["value"], SORT)
+        self.assertEqual(self.c._json_query(2, 1)["repair"]["value"], [1])
         self.assertNotIn("repair", self.c._page_url(2))
+        self.assertIn("sort=" + SORT, self.c._page_url(2))
+        self.assertIn("repair%5B0%5D=4", self.c._page_url(1, 4))
 
-    def run_listings(self, offers):
-        self.c._load = lambda page: (offers, len(offers))
-        return list(self.c.listings())
+    def run_listings(self, by_repair, main):
+        """by_repair: код → объявления выдачи по этому виду ремонта; main — основная выдача."""
+        calls = []
 
-    def test_run_log_counts_the_field(self):
-        """В журнал прогона пишется, сколько объявлений пришло с каким значением поля — по нему видно, что
-        ЦИАН поле действительно присылает."""
-        offers = [self.offer("no"), self.offer("cosmetic"), self.offer("cosmetic"), self.offer()]
-        for k, o in enumerate(offers):
-            o["cianId"] = 1000 + k
-        self.run_listings(offers)
-        self.assertIn("поле «Ремонт»: без ремонта 1, косметический 2, не указан 1", self.log)
+        def load(page, repair=None):
+            calls.append((page, repair))
+            offers = by_repair.get(repair, []) if repair else main
+            return offers, len(offers)
+        self.c._load = load
+        return list(self.c.listings()), calls
 
-    def test_run_log_warns_when_field_never_comes(self):
-        offers = [self.offer(), self.offer()]
-        offers[1]["cianId"] = 2001
-        self.run_listings(offers)
-        self.assertTrue(any(m.startswith("⚠ поле «Ремонт» ЦИАН не пришло ни в одном из 2 объявлений") for m in self.log), self.log)
+    def test_listings_marks_repair_from_its_query(self):
+        none, cosm, plain = self.offer(description=BATHROOMS_ONLY), self.offer(), self.offer(description="Сделан евроремонт")
+        items, calls = self.run_listings({1: [none], 2: [cosm]}, [none, cosm, plain])
+        self.assertEqual([c[1] for c in calls], [1, 2, 3, 4, None], "сначала выдачи по ремонту, затем основная")
+        reno = {i["source_id"]: i["renovation"] for i in items}
+        self.assertEqual(reno, {str(none["cianId"]): "none", str(cosm["cianId"]): "cosmetic",
+                                str(plain["cianId"]): "euro"})
+        self.assertIn("вид ремонта: без ремонта 1, косметический 1, не указан 1", self.log)
+
+    def test_offer_only_in_repair_query_is_kept(self):
+        """Объявление пришло в выдаче по ремонту, а основной не встретилось — оно всё равно в поиске."""
+        a, b = self.offer(), self.offer()
+        items, _ = self.run_listings({3: [b]}, [a])
+        self.assertEqual(sorted(i["source_id"] for i in items), sorted([str(a["cianId"]), str(b["cianId"])]))
+        self.assertEqual(len(items), 2, "без повторов")
+
+    def test_no_duplicates_from_main(self):
+        a = self.offer()
+        items, _ = self.run_listings({}, [a, a])
+        self.assertEqual(len(items), 1)
+
+    def test_warns_when_repair_queries_empty(self):
+        self.run_listings({}, [self.offer(), self.offer()])
+        warn = [m for m in self.log if m.startswith("⚠ вид ремонта ЦИАН не определён ни у одного из 2 объявлений")]
+        self.assertEqual(len(warn), 1, self.log)
 
 
 if __name__ == "__main__":

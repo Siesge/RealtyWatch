@@ -550,6 +550,11 @@ const chQuery = p => p === "last" ? "last=1" : p.endsWith("h") ? `hours=${parseF
 function openView(v) {
   const [name, arg] = String(v).split(":");
   if (name === "changes" && arg) { CH_PERIOD = arg; store.set("rw.chPeriod", arg); }
+  if (name === "cards" && arg === "hidden") {
+    // уведомление «в скрытые квартиры добавились объявления» — сразу «Скрытые»
+    const h = $("#fHidden");
+    if (!h.checked) { h.checked = true; h.dispatchEvent(new Event("input", { bubbles: true })); }
+  }
   setView(name);
 }
 

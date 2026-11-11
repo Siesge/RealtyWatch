@@ -119,7 +119,14 @@ function buildObjects() {
       text: items.map(i => `${i.title} ${i.address} ${i.description}`).join(" ").toLowerCase(),
     };
   });
-  OBJS.forEach(o => { o.price_m2 = o.price && o.area ? o.price / o.area : null; });
+  OBJS.forEach(o => { o.price_m2 = o.price && o.area ? o.price / o.area : null; o.fresh = freshItems(o); });
+}
+
+// Скрытая квартира: дизлайк ставится каждому её объявлению, поэтому объявление без дизлайка в скрытой
+// карточке добавилось в неё позже — новая квартира в том же доме или та же квартира на другом сайте.
+// Такие объявления подсвечиваются в «Скрытых», а их число стоит кружком на кнопке
+function freshItems(o) {
+  return o.disliked ? o.items.filter(i => !i.disliked) : [];
 }
 
 // ---------- фильтр просмотра ----------
@@ -148,6 +155,8 @@ function filtered(ignoreZone = false) {
   const k = { new: o => o.first_seen, price: o => o.price, "-price": o => o.price, ppm: o => o.price_m2, "-area": o => o.area }[s];
   const dir = s === "new" || s.startsWith("-") ? -1 : 1;
   rows.sort((a, b) => ((k(a) ?? 0) > (k(b) ?? 0) ? 1 : (k(a) ?? 0) < (k(b) ?? 0) ? -1 : 0) * dir);
+  // в «Скрытых» первыми — карточки, в которые после скрытия добавились объявления
+  if (hiddenOnly) rows.sort((a, b) => (b.fresh.length > 0) - (a.fresh.length > 0));
   return rows;
 }
 
@@ -157,6 +166,11 @@ function renderHeader(rows) {
   const likes = OBJS.filter(o => o.liked).length;
   $("#likeCount").textContent = likes || "";
   $("#hideCount").textContent = OBJS.filter(o => o.disliked).length || "";
+  const fresh = OBJS.filter(o => o.fresh.length).length, nb = $("#hideNew");
+  nb.textContent = fresh || "";
+  nb.hidden = !fresh;
+  nb.title = fresh ? `В ${fresh} ${plural(fresh, "скрытую квартиру", "скрытые квартиры", "скрытых квартир")} после скрытия добавились объявления — ` +
+    "это может быть новая квартира в том же доме или та же квартира на другом сайте. Откройте «Скрытые»: эти карточки там первые, новые объявления подсвечены" : "";
   $("#fNoDisBox").classList.toggle("off", $("#fHidden").checked);  // в «Скрытых» галочка ни на что не влияет
   $("#btnShare").disabled = !likes;  // выгружать нечего, пока ничего не отмечено сердечком
   const ppm = median(rows.map(o => o.price_m2).filter(Boolean));
@@ -228,7 +242,7 @@ function oldPrice(o) {
 
 function renoTip(o) {
   const r = o.p;
-  if (o.renovation === "any") return "Прежняя отметка ЦИАН «с ремонтом» без вида ремонта: так помечались объявления, пока программа не читала поле «Ремонт». Уточнится при следующем сборе ЦИАН";
+  if (o.renovation === "any") return "Прежняя отметка ЦИАН «с ремонтом» без вида ремонта: так помечались объявления, пока программа не узнавала у ЦИАН вид ремонта. Уточнится при следующем сборе ЦИАН";
   if (!o.renovation) return "Ни сайт, ни описание не указывают вид ремонта. Объявление не отсеяно — проверьте по фото";
   return `Ремонт: ${RENO[o.renovation]}. ` + (r.renovation_raw ? `На сайте указано «${r.renovation_raw}»` : "Определено по тексту описания");
 }
@@ -299,14 +313,16 @@ function offers(o) {
           `.\nВ базе с ${dtt(i.first_seen)}, последний раз в поиске ${dtt(i.last_seen)}` + (i.seller_type ? `.\n${SELLER_TIP[i.seller_type]}` : "") +
           (i.missed ? `.\n\n${missTip(i)}` : "")
         : `Перечёркнуто — объявление считается снятым с продажи: ${goneTip(i)}.\nЕсли оно на сайте есть — «Настройки → База данных → Перепроверить снятые»`;
-    const mark = i.off_site ? ` <span class="tag miss" title="${esc(offTip(i, o.active))}">нет на сайте</span>`
-      : i.active && i.missed ? ` <span class="tag miss" title="${esc(missTip(i))}">нет в поиске</span>` : "";
+    const isNew = o.fresh.includes(i);
+    const mark = (isNew ? ` <span class="tag miss fresh" title="${esc(`Добавилось в карточку после того, как вы её скрыли. В базе с ${dtt(i.first_seen)}`)}">новое</span>` : "") +
+      (i.off_site ? ` <span class="tag miss" title="${esc(offTip(i, o.active))}">нет на сайте</span>`
+      : i.active && i.missed ? ` <span class="tag miss" title="${esc(missTip(i))}">нет в поиске</span>` : "");
     const body = `<i class="sdot ${i.source}"></i><span>${SRC[i.source]}${mark}${i.excluded && !o.excluded ? ` <span class="tag warn" title="${esc(`Это объявление не прошло отсев (${i.excluded}), но другое объявление этой квартиры прошло`)}">!</span>` : ""}</span>
     <span>${best && i.price === best && i.active ? '<span class="best" title="Здесь цена ниже, чем на других сайтах">дешевле</span> ' : ""}${ch ? `<s class="old-mini">${mln(ch[0])}</s> ` : ""}<b>${fmt(i.price)} ₽</b></span>`;
     // ссылки нет: объявление с сайта пропало, открывать нечего
     return i.off_site
-      ? `<div class="offer off ${i.active ? "" : "gone"}" title="${esc(tip)}">${body}${ICON.noext}</div>`
-      : `<a class="offer ${i.active ? "" : "gone"}" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(tip)}">${body}${ICON.ext}</a>`;
+      ? `<div class="offer off ${i.active ? "" : "gone"} ${isNew ? "fresh" : ""}" title="${esc(tip)}">${body}${ICON.noext}</div>`
+      : `<a class="offer ${i.active ? "" : "gone"} ${isNew ? "fresh" : ""}" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(tip)}">${body}${ICON.ext}</a>`;
   }).join("")}</div>`;
 }
 
@@ -324,6 +340,7 @@ function card(o) {
     "Признаки одной квартиры: те же комнаты, этаж и этажность, площадь ±1 м², адрес в пределах 150 м, цена ±10%";
   return `<article class="card ${o.excluded ? "excl" : ""} ${o.active ? "" : "inactive"} ${o.disliked ? "disliked" : ""} ${o.id === PICK ? "picked" : ""}" data-id="${esc(o.id)}">
     ${o.id === PICK ? `<div class="pick-note" title="Подсветка снимется по клику на карточку">${ICON.pin}<span>Вы перешли к этой квартире</span></div>` : ""}
+    ${o.fresh.length ? freshNote(o) : ""}
     ${media(o)}
       <div class="media-top"><span class="left"><span class="pill zone-${o.zone}" title="${esc(ZONE_TIP[o.zone] || "")}">${ZONE_SHORT[o.zone] || o.zone}</span>
         ${o.sources.length > 1 ? `<span class="pill multi" title="${esc(multiTip)}">${o.sources.length} ${plural(o.sources.length, "сайт", "сайта", "сайтов")}</span>` : ""}</span>
@@ -347,6 +364,30 @@ function card(o) {
     <div class="card-foot"><span title="Когда объект впервые появился в базе; число объявлений на всех сайтах">с ${dt(o.first_seen)} · ${n} ${plural(n, "объявление", "объявления", "объявлений")}</span>
       <span class="acts">${o.lat != null ? `<button class="icon-btn pin" title="Показать на карте рядом">${ICON.map}</button>` : ""}</span></div>
   </article>`;
+}
+
+// Плашка на скрытой карточке, в которую после скрытия добавились объявления
+function freshNote(o) {
+  const n = o.fresh.length, where = [...new Set(o.fresh.map(i => SRC[i.source]))].join(", ");
+  return `<div class="fresh-note" title="${esc("Новые объявления подсвечены ниже. Если это другая квартира, которая вас интересует, — верните карточку в подборку (👎 ещё раз). " +
+    "Если та же квартира на другом сайте или такая же неинтересная — «Оставить скрытой»: кружок на кнопке «Скрытые» погаснет")}">
+    ${ICON.dislike}<span>После скрытия ${plural(n, "добавилось", "добавились", "добавилось")} ${n} ${plural(n, "объявление", "объявления", "объявлений")}: ${esc(where)}</span>
+    <button class="keep-hidden">Оставить скрытой</button></div>`;
+}
+
+// «Оставить скрытой»: дизлайк ставится и новым объявлениям — карточка больше не считается изменившейся
+async function keepHidden(id) {
+  const o = OBJS.find(x => x.id === id);
+  if (!o || !o.fresh.length) return;
+  const keys = o.fresh.map(key);
+  o.fresh.forEach(i => { i.disliked = true; i.liked = false; });
+  o.fresh = [];
+  try {
+    await post("/api/dislike", { keys, on: true });
+  } catch (e) {
+    toast("warn", "Не удалось сохранить", e.message);
+  }
+  render();
 }
 
 function renderCards(rows, mapRows = rows) {
@@ -399,6 +440,7 @@ async function toggleMark(id, kind, btn) {
   o[kind] = on;
   if (on) o[other] = false;
   o.items.forEach(i => { i[kind] = on; if (on) i[other] = false; });
+  o.fresh = freshItems(o);
   if (btn) { btn.classList.toggle("on", on); btn.classList.add("pop"); setTimeout(() => btn.classList.remove("pop"), 400); }
   try {
     await post(kind === "liked" ? "/api/like" : "/api/dislike", { keys: o.items.map(key), on });
@@ -419,7 +461,8 @@ async function toggleMark(id, kind, btn) {
 
 // ---------- таблица ----------
 const COLS = [
-  ["sources", "Сайты", o => o.items.map(i => `<a href="${esc(i.url)}" target="_blank" title="${fmt(i.price)} ₽"><i class="sdot ${i.source}"></i> ${SRC[i.source]}</a>`).join("<br>")],
+  ["sources", "Сайты", o => o.items.map(i => `<a href="${esc(i.url)}" target="_blank" title="${fmt(i.price)} ₽"><i class="sdot ${i.source}"></i> ${SRC[i.source]}</a>` +
+    (o.fresh.includes(i) ? ` <span class="tag miss fresh" title="Добавилось в скрытую карточку после того, как вы её скрыли">новое</span>` : "")).join("<br>")],
   ["zone", "Зона", o => `<i class="zdot ${o.zone}"></i> ${ZONE_SHORT[o.zone]}`],
   ["price", "Цена", o => fmt(o.price) + (o.priceMax > o.price ? `<br><small>до ${fmt(o.priceMax)}</small>` : ""), 1],
   ["price_m2", "₽/м²", o => fmt(o.price_m2), 1], ["rooms", "Комн.", o => o.rooms ?? "", 1],
@@ -883,7 +926,7 @@ async function renderSettings() {
         <option value="exclude_none" ${f.renovation === "exclude_none" ? "selected" : ""}>без ремонта — отсеять</option>
         <option value="strict" ${f.renovation === "strict" ? "selected" : ""}>только указанный ремонт</option>
         <option value="off" ${f.renovation === "off" ? "selected" : ""}>не учитывать</option></select>`,
-        "<b>без ремонта — отсеять</b>: убираются «требует ремонта», «без отделки», черновая/предчистовая (по полю сайта или тексту); где ремонт не указан — остаётся с жёлтой меткой. <b>только указанный</b>: остаются лишь объявления с явно указанным ремонтом. У ЦИАН вид ремонта берётся из поля «Ремонт» в разделе «О квартире», у Авито и Яндекса — из такого же поля сайта; описание читается, только если поля нет.")}
+        "<b>без ремонта — отсеять</b>: убираются «требует ремонта», «без отделки», черновая/предчистовая (по полю сайта или тексту); где ремонт не указан — остаётся с жёлтой меткой. <b>только указанный</b>: остаются лишь объявления с явно указанным ремонтом. У Авито и Яндекса вид ремонта берётся из поля «Ремонт» сайта, у ЦИАН — отдельными выдачами по каждому виду ремонта (в его общей выдаче вида ремонта нет); описание читается, только если сайт вид ремонта не сообщил.")}
       ${field("Исключать обременение", sw("sEnc", f.exclude_encumbrance), "Ищет в тексте «обременение», «арест», «в залоге», «залог у банка». Отрицания («без обременений», «аресты сняты») не считаются. Выключено — объявление остаётся с меткой «обременение?».")}
       ${field("Исключать доли", sw("sShare", f.exclude_share), "Категория «доля» на ЦИАН, заголовок «Доля…» на Авито, в тексте «доля», «1/2 доли», «долевая собственность».")}
       ${field("Исключать аукционы и торги", sw("sAuc", f.exclude_auction), "В тексте «аукцион», «торги», «банкротство», «конкурсный управляющий». «Торг уместен» не считается.")}
@@ -1459,6 +1502,7 @@ $("#cardsList").addEventListener("click", e => {
   if (c.classList.contains("picked")) { PICK = null; c.classList.remove("picked"); c.querySelector(".pick-note")?.remove(); }
   const mark = e.target.closest(".heart");
   if (mark) { e.preventDefault(); (mark.classList.contains("dis") ? toggleDislike : toggleLike)(c.dataset.id, mark); return; }
+  if (e.target.closest(".keep-hidden")) { e.preventDefault(); keepHidden(c.dataset.id); return; }
   if (e.target.closest(".pin")) {
     if (!sideOn()) setSide(true);
     highlight(c.dataset.id, true);

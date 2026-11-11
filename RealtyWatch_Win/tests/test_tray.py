@@ -33,6 +33,7 @@ class FakeTray:
     hide = tray.Tray.hide
     on_close = tray.Tray.on_close
     show = tray.Tray.show
+    toggle = tray.Tray.toggle
 
     def __init__(self):
         self.window = FakeWindow()
@@ -113,6 +114,28 @@ class CloseButton(Case):
         self.assertEqual(t.window.shown, 1, "окно показано")
         self.assertEqual(t.window.restored, 0, "restore() не вызывается — он сжимал развёрнутое окно")
         self.assertEqual(calls, [t.title], "свёрнутое окно возвращает Windows, по заголовку окна")
+
+    def test_click_on_icon_toggles_window(self):
+        """Клик левой кнопкой по значку: открытое окно уходит в трей, скрытое — открывается."""
+        state = {"open": True}
+        orig_open, orig_un = tray.window_open, tray.unminimize
+        tray.window_open = lambda title: state["open"]
+        tray.unminimize = lambda title: None
+        self.addCleanup(setattr, tray, "window_open", orig_open)
+        self.addCleanup(setattr, tray, "unminimize", orig_un)
+        t = FakeTray()
+        t.toggle()
+        self.assertEqual((t.window.hidden, t.window.shown), (1, 0), "открытое окно — в трей")
+        state["open"] = False
+        t.toggle()
+        self.assertEqual((t.window.hidden, t.window.shown), (1, 1), "скрытое или свёрнутое — открыть")
+
+    def test_click_is_the_default_menu_action(self):
+        """pystray передаёт клик по значку пункту меню с default=True — это должен быть невидимый «показать
+        или скрыть», а не «Открыть»: иначе пункт «Открыть» в меню прятал бы открытое окно."""
+        src = (paths.ROOT / "app" / "tray.py").read_text(encoding="utf-8")
+        self.assertIn('self.toggle(), default=True, visible=False)', src)
+        self.assertIn('item("Открыть RealtyWatch", lambda icon, it: self.show()),', src)
 
     def test_setting_saved_like_the_others(self):
         server.set_settings({"ui": {"tray_on_close": False}})
