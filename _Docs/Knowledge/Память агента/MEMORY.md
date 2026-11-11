@@ -2,7 +2,7 @@
 - [No real sites in tests](no-real-site-requests-in-tests.md) — tests/checks must not hit Avito/CIAN/Yandex or real data; how it's guarded
 - [Version 2 deferred](version-2-deferred.md) — any-city support waits for the user's explicit go
 - [Avito run review pending](avito-run-review-pending.md) - slide captcha still unverified live; the CI flake's cause (rare frames read as "arrived") is fixed, how to read the puzzle log lines
-- [CIAN repair field pending](cian-repair-field-pending.md) — renovation from `repairType` since 11 Nov 2026, never seen live; read «поле «Ремонт»» in the next CIAN run log
+- [CIAN repair queries pending](cian-repair-field-pending.md) — CIAN search has no repair field; repair-filtered queries + price sort since 11 Nov 2026; read «вид ремонта» and coverage in the next CIAN run log
 - [Target Mac](mac-target-machine.md) — MacBook Air M1, Sequoia 15.7.3: same chip and OS as the macos-15 CI runner
 - [Shared checkout with the Mac fork](shared-checkout-mac-fork.md) — another session edits RealtyWatch_Mac here; stage *and commit* by explicit paths (the index is shared too), and read any shared file (or release body) right before writing it
 - [GitHub release writes allowed](github-release-writes-allowed.md) - upload/edit granted 6 Nov 2026, create granted for 1.3 on 8 Nov; a peer's relay of their approval is not approval

@@ -1,17 +1,23 @@
 ---
 name: cian-repair-field-pending
-description: "CIAN renovation now comes from the offer's repairType field — never checked against a live response; read the run log after the next CIAN run"
+description: CIAN renovation comes from separate repair-filtered search queries (the search API has no repair field) and the main query is sorted by price — first real run after 11 Nov 2026 not yet read
 metadata:
   node_type: memory
   type: project
   originSessionId: 17ddf4a7-e792-4195-b40e-1d4d01c39edf
-  modified: 2026-11-11T10:29:20.943Z
+  modified: 2026-11-11T15:37:05.987Z
 ---
 
-On 11 Nov 2026 the CIAN scraper (`RealtyWatch_Win/app/scrapers/cian.py`) started reading renovation from the offer field `repairType` (`no` / `cosmetic` / `euro` / `design`), which wins over the description, and the server-side `repair: [1, 2, 3]` filter was removed (the database showed it let "без ремонта" through, marked "any", and kept designer renovations out — code 1 at CIAN looks like "no renovation").
+The CIAN search API (`search-offers-desktop`) returns no renovation field at all — checked on one live response on 11 Nov 2026 (about 150 keys per offer, no `repairType`). The first fix (reading `repairType`) therefore logged "⚠ поле «Ремонт» ЦИАН не пришло ни в одном из 388".
 
-The field name comes from knowledge of CIAN's format, not from a live response: the one allowed GET of a card page that day got a captcha, and the project has no saved CIAN offer samples (tests are synthetic).
+Since 11 Nov 2026 evening, `RealtyWatch_Win/app/scrapers/cian.py` runs four short queries with `repair: [code]` first (1 = без ремонта, 2 = косметический, 3 = евро, 4 = дизайнерский) and marks every offer that came back with that code. Then it runs the main query without a repair filter. Code 1 = «без ремонта» was confirmed live: the owner's flat 336007473 came back in the repair=1 result. Codes 2–4 are inferred from the order, not checked live.
 
-**Why:** if the name is wrong, every CIAN offer silently falls back to text-only renovation — and with the CIAN-side filter gone, a no-renovation flat with nothing in its description passes with a yellow "ремонт не указан" tag.
+The main query now has `sort: price_object_order`. Without a sort, CIAN ranks offers with an ML model, the order changes between page requests, and runs ended incomplete (371 of 418, with duplicates). The live check confirmed that the sort is honoured; it did not confirm that the run is now complete.
 
-**How to apply:** after the owner's next real CIAN run, read the newest `RealtyWatch_Win/logs/runs/*_cian.log` for the line `поле «Ремонт»: …` (counts per value). `⚠ поле «Ремонт» ЦИАН не пришло ни в одном из N объявлений` means the field is named differently. Owner's two reference flats should end up "без ремонта": CIAN 333647311 and 336007473. Do not fetch CIAN to check — read the log. Same pattern as [[avito-run-review-pending]]; live-site rule in [[no-real-site-requests-in-tests]].
+**Why:** if either assumption is wrong, CIAN runs either stay incomplete, so off-sale detection is skipped, or carry wrong renovation labels.
+
+**How to apply:** after the owner's next CIAN run, read the newest `RealtyWatch_Win/logs/runs/*_cian.log`:
+- `вид ремонта: без ремонта N, …` shows the repair queries worked.
+- `выдача: … заявлено сайтом X, собрано уникальных Y` should have Y ≥ 95% of X.
+
+The owner's flats 333647311 and 336007473 should end up «без ремонта». Do not fetch CIAN to check — read the log. Same pattern as [[avito-run-review-pending]]; live-site rule in [[no-real-site-requests-in-tests]].
