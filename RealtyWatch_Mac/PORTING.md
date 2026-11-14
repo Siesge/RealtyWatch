@@ -114,7 +114,7 @@ git status --porcelain -- RealtyWatch_Win
 ## 3. Шаг 1. Создать форк
 
 ```bash
-cd D:/Claude/RealtyWatch
+cd D:/AI Projects/RealtyWatch
 cp -R RealtyWatch_Win RealtyWatch_Mac2          # или новая папка под версию 2
 rm -rf RealtyWatch_Mac2/{runtime,browsers,data,database,exports,profiles,logs,launcher}
 rm -f  RealtyWatch_Mac2/{setup.bat,setup.ps1,start.bat,RealtyWatch.exe}
@@ -486,7 +486,7 @@ def raise_window(self, left=80, top=60):
 
 ```
 # PowerShell; в cmd то же самое делает mklink /J
-New-Item -ItemType Junction -Path "$env:RW_HOME\browsers" -Target "D:\Claude\RealtyWatch\RealtyWatch_Win\browsers"
+New-Item -ItemType Junction -Path "$env:RW_HOME\browsers" -Target "D:\AI Projects\RealtyWatch\RealtyWatch_Win\browsers"
 ```
 
 Что здесь **не** проверяется: ничего из `app/system.py` по ветке macOS, окно, бандл, установщик.
