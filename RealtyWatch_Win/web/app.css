@@ -730,6 +730,9 @@ td.last-run small { display: block; margin-top: 4px; color: var(--muted); font-s
 /* карту сдвинули — список показывает старую область: «Обновить» зовёт нажать */
 .area-upd.stale { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .area-upd.stale:hover { background: var(--accent-2); color: var(--on-accent); }
+/* «Только в видимой области» — в одном ряду с кнопками масштаба, справа от них, по верхнему краю карты:
+   Leaflet кладёт контролы угла друг под другом (clear: both), отменяем это для этой панели */
+.leaflet-top.leaflet-left .area-ctl { clear: none; }
 
 .zone-ctl { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
 .zone-ctl .leaflet-bar a.zone-lock { width: 34px; height: 34px; display: grid; place-items: center; color: #3b3f45; }
