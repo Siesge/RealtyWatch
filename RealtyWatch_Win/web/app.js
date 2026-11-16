@@ -55,7 +55,8 @@ const dt = s => s ? new Date(s).toLocaleDateString("ru-RU", { day: "numeric", mo
 const fileName = p => String(p || "").split(/[\\/]/).pop();   // в уведомлении — имя файла: весь путь в него не влезает
 const bkLabel = n => fileName(n).replace(/_\d{4}-\d{2}-\d{2}_\d{4}\.zip$/, "").replace(/_/g, " ");
 const mbs = v => `${Number(v).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} МБ`;
-const today = () => new Date().toISOString().slice(0, 10);
+const localIso = (ms = Date.now()) => { const d = new Date(ms); return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19); };
+const today = () => localIso().slice(0, 10);
 const key = r => `${r.source}:${r.source_id}`;
 const desktop = () => window.pywebview && window.pywebview.api;
 const store = {
@@ -66,7 +67,7 @@ const store = {
 const TAB_ABOUT = {
   cards: "Карточки найденных квартир: фото, цена и её история по каждому сайту, адрес, этаж, площадь, ремонт. Рядом карта — наведите на карточку, и точка подсветится. Сердечком отмечают то, за чем хочется следить: такие квартиры попадают на дашборд.",
   table: "Те же квартиры одним списком: цена, ₽/м², комнаты, площадь, этаж, ремонт, адрес, дата находки. Клик по заголовку колонки сортирует (порядок запоминается), клик по строке открывает карточку в подборке.",
-  changes: "Что изменилось на рынке между проверками: появилось новое объявление, квартиру сняли с продажи, продавец поднял или снизил цену. Можно выбрать период и типы изменений. Первая загрузка сайта изменением не считается.",
+  changes: "Что изменилось на рынке между проверками: появилось новое объявление, квартиру сняли с продажи, продавец поднял или снизил цену. Можно выбрать период, типы изменений и отфильтровать по зоне, комнатам, цене и другим параметрам. Первичная загрузка сайта изменениями не считается.",
   runs: "История сборов: когда запускался каждый сайт, сколько страниц прочитано и объявлений собрано, сколько новых и снятых. У каждого прогона есть подробный журнал — по нему видно, где сбор споткнулся.",
 };
 const aboutTab = key => ALL.length ? "" : `<div class="about"><b>Краткое описание</b><p>${TAB_ABOUT[key]}</p></div>`;
@@ -82,9 +83,9 @@ const plural = (n, one, few, many) => { const m10 = n % 10, m100 = n % 100; retu
 async function loadData() {
   ALL = await api("/api/listings");
   buildObjects();
+  if (view === "changes") { renderChanges(); return; }
   render();
   if (view === "dashboard") renderDashboard();
-  if (view === "changes") renderChanges();
 }
 async function loadSettings() { SETTINGS = await api("/api/settings"); }
 
@@ -132,36 +133,49 @@ function freshItems(o) {
 // ---------- фильтр просмотра ----------
 const checked = name => $$(`input[name=${name}]:checked`).map(i => i.value);
 
-function filtered(ignoreZone = false) {
-  const src = checked("src"), zones = checked("zone"), rooms = checked("rooms").map(Number);
-  const pmin = parseFloat($("#fPmin").value) * 1e6, pmax = parseFloat($("#fPmax").value) * 1e6;
-  const amin = parseFloat($("#fAmin").value), reno = $("#fReno").value, nb = $("#fNew").value;
-  const st = $("#fState").value, active = $("#fActive").checked, noCoords = $("#fNoCoords").checked, liked = $("#fLiked").checked;
+function readFilters() {
+  return {
+    src: checked("src"), zones: checked("zone"), rooms: checked("rooms").map(Number),
+    pmin: parseFloat($("#fPmin").value) * 1e6, pmax: parseFloat($("#fPmax").value) * 1e6,
+    amin: parseFloat($("#fAmin").value), reno: $("#fReno").value, nb: $("#fNew").value,
+    st: $("#fState").value, active: $("#fActive").checked, noCoords: $("#fNoCoords").checked,
+    liked: $("#fLiked").checked, hiddenOnly: $("#fHidden").checked, noDis: $("#fNoDis").checked,
+    text: $("#fText").value.trim().toLowerCase(), sort: $("#fSort").value,
+  };
+}
+
+function matchObject(o, f, { ignoreZone = false, allowRemoved = false } = {}) {
+  if (!o) return false;
   // «Скрытые» показывают только квартиры с дизлайком; иначе их убирает галочка «исключить дизлайки»
-  const hiddenOnly = $("#fHidden").checked, noDis = $("#fNoDis").checked;
-  const text = $("#fText").value.trim().toLowerCase();
-  let rows = OBJS.filter(o =>
-    o.sources.some(s => src.includes(s)) && (ignoreZone || zones.includes(o.zone)) &&
-    (o.rooms == null || rooms.includes(o.rooms)) &&
-    !(pmin && o.price < pmin) && !(pmax && o.price > pmax) && !(amin && o.area < amin) &&
-    (!reno || (reno === "known" ? o.renovation && o.renovation !== "any" : o.renovation === reno)) &&
-    (nb === "" || String(o.p.is_new_building ?? 0) === nb) &&
-    (st === "all" || (st === "pass" ? !o.excluded : !!o.excluded)) &&
-    (!active || o.active) && (!noCoords || o.lat == null) && (!liked || o.liked) &&
+  const { hiddenOnly, noDis } = f;
+  return o.sources.some(s => f.src.includes(s)) && (ignoreZone || f.zones.includes(o.zone)) &&
+    (o.rooms == null || f.rooms.includes(o.rooms)) &&
+    !(f.pmin && o.price < f.pmin) && !(f.pmax && o.price > f.pmax) && !(f.amin && o.area < f.amin) &&
+    (!f.reno || (f.reno === "known" ? o.renovation && o.renovation !== "any" : o.renovation === f.reno)) &&
+    (f.nb === "" || String(o.p.is_new_building ?? 0) === f.nb) &&
+    (f.st === "all" || (f.st === "pass" ? !o.excluded : !!o.excluded)) &&
+    (!f.active || o.active || allowRemoved) && (!f.noCoords || o.lat == null) && (!f.liked || o.liked) &&
     (hiddenOnly ? o.disliked : !(noDis && o.disliked)) &&
-    (!text || o.text.includes(text)));
+    (!f.text || o.text.includes(f.text));
+}
+
+function sortKey(o, s) {
+  if (!o) return 0;
+  return ({ new: o.first_seen, price: o.price, "-price": o.price, ppm: o.price_m2, "-area": o.area }[s]) ?? 0;
+}
+
+function filtered(ignoreZone = false, f = readFilters()) {
+  const rows = OBJS.filter(o => matchObject(o, f, { ignoreZone }));
   if (ignoreZone) return rows;
-  const s = $("#fSort").value;
-  const k = { new: o => o.first_seen, price: o => o.price, "-price": o => o.price, ppm: o => o.price_m2, "-area": o => o.area }[s];
-  const dir = s === "new" || s.startsWith("-") ? -1 : 1;
-  rows.sort((a, b) => ((k(a) ?? 0) > (k(b) ?? 0) ? 1 : (k(a) ?? 0) < (k(b) ?? 0) ? -1 : 0) * dir);
+  const dir = f.sort === "new" || f.sort.startsWith("-") ? -1 : 1;
+  rows.sort((a, b) => ((sortKey(a, f.sort) > sortKey(b, f.sort)) ? 1 : (sortKey(a, f.sort) < sortKey(b, f.sort)) ? -1 : 0) * dir);
   // в «Скрытых» первыми — карточки, в которые после скрытия добавились объявления
-  if (hiddenOnly) rows.sort((a, b) => (b.fresh.length > 0) - (a.fresh.length > 0));
+  if (f.hiddenOnly) rows.sort((a, b) => (b.fresh.length > 0) - (a.fresh.length > 0));
   return rows;
 }
 
-function renderHeader(rows) {
-  const zr = filtered(true);
+function renderHeader(rows, zoneRows = null) {
+  const zr = zoneRows ?? filtered(true);
   for (const z of ["A", "B", "C"]) $(`#zc-${z}`).textContent = zr.filter(o => o.zone === z).length;
   const likes = OBJS.filter(o => o.liked).length;
   $("#likeCount").textContent = likes || "";
@@ -189,13 +203,18 @@ function renderHeader(rows) {
 }
 
 function render() {
+  markFilters();
+  fitToolbar();  // счётчики в фильтрах меняют ширину строки
+  if (view === "changes") {
+    if (typeof paintChanges === "function") paintChanges();
+    return;
+  }
   const rows = filtered();
   // «Только в видимой области карты» сужает список карточек, а карта рядом показывает всё по фильтрам:
   // иначе, сдвинув карту, вы увидели бы пустое место там, где квартиры есть
   const list = view === "cards" ? inArea(rows) : rows;
   renderHeader(list);
-  markFilters();
-  fitToolbar();  // счётчики в фильтрах меняют ширину строки
+  fitToolbar();
   if (view === "cards") renderCards(list, rows);
   if (view === "table") renderTable(rows);
   if (view === "map") renderMap(rows);
@@ -451,19 +470,21 @@ async function toggleMark(id, kind, btn) {
   }
   if (kind === "disliked") {
     // квартира уходит из списка (или возвращается из «Скрытых») — список перерисовываем сразу
-    if (view === "cards" || view === "table" || view === "map") render(); else renderHeader(filtered());
+    if (["cards", "table", "map", "changes"].includes(view)) render(); else renderHeader(filtered());
     if (view === "dashboard" && typeof paintDashboard === "function") paintDashboard();
     if (on) toast("ok", "Квартира скрыта", "Её не видно в подборке, таблице, на карте и в списках дашборда. Сбор по ней продолжается. Вернуть — кнопка «Скрытые»",
       { label: "Вернуть", fn: () => toggleDislike(id) });
     else if ($("#fHidden").checked) toast("ok", "Квартира возвращена", "Она снова в подборке");
     return;
   }
-  if ($("#fLiked").checked && !on) render(); else renderHeader(filtered());
+  if (($("#fLiked").checked && !on) || view === "changes") render(); else renderHeader(filtered());
 }
 
 // ---------- таблица ----------
 const COLS = [
-  ["sources", "Сайты", o => o.items.map(i => `<a href="${esc(i.url)}" target="_blank" title="${fmt(i.price)} ₽"><i class="sdot ${i.source}"></i> ${SRC[i.source]}</a>` +
+  ["sources", "Сайты", o => o.items.map(i => (i.off_site
+    ? `<span class="off-link" title="${esc(offTip(i, o.active))}"><i class="sdot ${i.source}"></i> ${SRC[i.source]}</span>`
+    : `<a href="${esc(i.url)}" target="_blank" rel="noopener" class="${i.active ? "" : "gone"}" title="${fmt(i.price)} ₽"><i class="sdot ${i.source}"></i> ${SRC[i.source]}</a>`) +
     (o.fresh.includes(i) ? ` <span class="tag miss fresh" title="Добавилось в скрытую карточку после того, как вы её скрыли">новое</span>` : "")).join("<br>")],
   ["zone", "Зона", o => `<i class="zdot ${o.zone}"></i> ${ZONE_SHORT[o.zone]}`],
   ["price", "Цена", o => fmt(o.price) + (o.priceMax > o.price ? `<br><small>до ${fmt(o.priceMax)}</small>` : ""), 1],
@@ -584,7 +605,9 @@ function drawMap(M, rows) {
   M.layer.clearLayers();
   M.markers = {};
   rows.filter(o => o.lat != null).forEach(o => {
-    const links = o.items.map(i => `<a href="${esc(i.url)}" target="_blank">${SRC[i.source]} · ${fmt(i.price)} ₽ →</a>`).join("<br>");
+    const links = o.items.map(i => i.off_site
+      ? `<span class="off-link" title="${esc(offTip(i, o.active))}">${SRC[i.source]} · ${fmt(i.price)} ₽ (нет на сайте)</span>`
+      : `<a href="${esc(i.url)}" target="_blank" rel="noopener">${SRC[i.source]} · ${fmt(i.price)} ₽ →</a>`).join("<br>");
     const mk = L.circleMarker([o.lat, o.lon], markerStyle(o, false))
       .bindPopup(`<b>${fmt(o.price)} ₽</b>${o.liked ? " ♥" : ""}<br>${o.rooms ?? "?"}-к, ${o.area ?? "?"} м², ${o.floor ?? "?"}/${o.floors ?? "?"} эт.<br><span style="opacity:.7">${esc(o.address)}</span><br>${links}`)
       .addTo(M.layer);
@@ -1372,7 +1395,7 @@ async function poll() {
         if (keep) body.scrollTop += body.scrollHeight - h0;
         jAfter = j.n;
         if (j.msg.startsWith("🔔")) {
-          toast("ok", "Изменения на рынке", j.msg.replace(/^🔔\s*изменения на рынке:\s*/, ""), { label: "Показать", fn: () => setView("changes") });
+          toast("ok", "Изменения на рынке", j.msg.replace(/^🔔\s*изменения на рынке\s*(?:\([^)]*\))?:\s*/, ""), { label: "Показать", fn: () => setView("changes") });
           loadData();
           updateChangesBadge();
         }
@@ -1438,11 +1461,11 @@ function setView(v) {
   $$(".view").forEach(el => el.classList.add("hidden"));
   $(`#view-${v}`).classList.remove("hidden");
   $("#viewTitle").textContent = VIEW_TITLE[v];
-  const lists = v === "cards" || v === "table" || v === "map";
+  const lists = ["cards", "table", "map", "changes"].includes(v);
   if (v === "changes") markChangesSeen();
   $("#filters").classList.toggle("hidden", !lists);
   $("#fSortBox").classList.toggle("hidden", v === "table");  // в таблице сортируют кликом по заголовку колонки
-  if (lists) requestAnimationFrame(fitToolbar);  // панель только что показали — теперь её можно измерить
+  if (lists) { markFilters(); requestAnimationFrame(fitToolbar); }  // панель только что показали — теперь её можно измерить
   $("#btnSide").classList.toggle("hidden", v !== "cards");
   $("#btnGroup").classList.toggle("hidden", v !== "cards");
   $(".main").classList.toggle("inner-scroll", v === "cards");
@@ -1456,6 +1479,7 @@ function setView(v) {
 }
 
 function resetFilters() {
+  clearTimeout(_filterTimer);
   // по умолчанию всё включено, кроме посёлков, «без координат», «Избранного» и «Скрытых»; «исключить дизлайки» — включено
   $$("#filters input[type=checkbox]").forEach(i => i.checked = !(i.value === "C" || ["fNoCoords", "fLiked", "fHidden"].includes(i.id)));
   $("#fPmin").value = $("#fPmax").value = $("#fAmin").value = $("#fText").value = "";
@@ -1477,7 +1501,12 @@ $$(".nav button").forEach(b => b.onclick = () => setView(b.dataset.view));
 // переключателях срабатывают раньше общего на панели, поэтому список рисуется уже с одним из них
 $("#fHidden").addEventListener("input", () => { if ($("#fHidden").checked) $("#fLiked").checked = false; });
 $("#fLiked").addEventListener("input", () => { if ($("#fLiked").checked) $("#fHidden").checked = false; });
-$("#filters").addEventListener("input", () => render());
+let _filterTimer = null;
+$("#filters").addEventListener("input", e => {
+  clearTimeout(_filterTimer);
+  if (["text", "search", "number"].includes(e.target.type)) _filterTimer = setTimeout(render, 120);
+  else render();
+});
 $("#btnReset").onclick = resetFilters;
 $("#btnRun").onclick = async () => {
   const sources = $$(".src-run:checked").map(i => i.value);

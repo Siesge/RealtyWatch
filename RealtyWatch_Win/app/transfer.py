@@ -15,7 +15,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from . import db, dedupe, trash
+from . import db, dedupe, history, trash
 from .paths import BACKUPS, DB_DIR, IMAGES
 
 FORMAT = "realtywatch-db"
@@ -178,8 +178,14 @@ def import_zip(path, mode="merge", before="перед_импортом"):
                 result = _merge(imported)
         result["images"] = _extract_images(z, overwrite=mode == "replace")
     con = db.connect()
-    result["objects"] = dedupe.rebuild(con)
-    con.close()
+    try:
+        result["objects"] = dedupe.rebuild(con)
+        history.rebuild_snapshots(con)
+        history.backfill(con)
+        con.execute("INSERT OR REPLACE INTO meta VALUES('dedupe_rules', ?)", (str(dedupe.RULES_VERSION),))
+        con.commit()
+    finally:
+        con.close()
     result.update(backup=saved, mode=mode, exported_at=manifest.get("exported_at"))
     return result
 
@@ -187,45 +193,53 @@ def import_zip(path, mode="merge", before="перед_импортом"):
 def _replace(imported, z):
     src = sqlite3.connect(imported)
     dst = db.connect()
-    src.backup(dst)  # перезаписывает текущую базу содержимым импортируемой
-    dst.close()
-    src.close()
+    try:
+        src.backup(dst)  # перезаписывает текущую базу содержимым импортируемой
+    finally:
+        dst.close()
+        src.close()
     db.reset()
     if "settings.json" in z.namelist():
         (DB_DIR / "settings.json").write_bytes(z.read("settings.json"))
     con = db.connect()
-    n = con.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-    con.close()
+    try:
+        n = con.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    finally:
+        con.close()
     return {"added": n, "updated": 0}
 
 
 def _merge(imported):
     con = db.connect()
-    con.execute("ATTACH DATABASE ? AS imp", (str(imported),))
-    main_cols = [r[1] for r in con.execute("PRAGMA main.table_info(listings)")]
-    imp_cols = {r[1] for r in con.execute("PRAGMA imp.table_info(listings)")}
-    cols = [c for c in main_cols if c in imp_cols and c != "object_id"]
-    col_list = ",".join(cols)
-    added = con.execute(f"""INSERT INTO listings({col_list}) SELECT {col_list} FROM imp.listings i
-        WHERE NOT EXISTS (SELECT 1 FROM listings m WHERE m.source=i.source AND m.source_id=i.source_id)""").rowcount
-    upd_cols = [c for c in cols if c not in ("source", "source_id", "first_seen")]
-    updated = con.execute(f"""UPDATE listings SET ({",".join(upd_cols)}) =
-        (SELECT {",".join("i." + c for c in upd_cols)} FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id)
-        WHERE EXISTS (SELECT 1 FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id
-                      AND i.last_seen > listings.last_seen)""").rowcount
-    con.execute("""UPDATE listings SET first_seen = (SELECT MIN(i.first_seen) FROM imp.listings i
-        WHERE i.source=listings.source AND i.source_id=listings.source_id AND i.first_seen < listings.first_seen)
-        WHERE EXISTS (SELECT 1 FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id
-                      AND i.first_seen < listings.first_seen)""")
-    con.execute("""INSERT INTO price_history SELECT * FROM imp.price_history i WHERE NOT EXISTS
-        (SELECT 1 FROM price_history p WHERE p.source=i.source AND p.source_id=i.source_id AND p.ts=i.ts AND p.price=i.price)""")
-    con.execute("""INSERT INTO runs(source, mode, started, finished, status, pages, found, new, changed, removed, message)
-        SELECT source, mode, started, finished, status, pages, found, new, changed, removed, message FROM imp.runs i
-        WHERE NOT EXISTS (SELECT 1 FROM runs r WHERE r.source=i.source AND r.started=i.started)""")
-    con.execute("INSERT OR IGNORE INTO likes SELECT * FROM imp.likes")
-    if con.execute("SELECT 1 FROM imp.sqlite_master WHERE type='table' AND name='dislikes'").fetchone():
-        con.execute("INSERT OR IGNORE INTO dislikes SELECT * FROM imp.dislikes")  # в старых архивах таблицы нет
-    con.commit()
-    con.execute("DETACH DATABASE imp")
-    con.close()
-    return {"added": added, "updated": updated}
+    try:
+        con.execute("ATTACH DATABASE ? AS imp", (str(imported),))
+        main_cols = [r[1] for r in con.execute("PRAGMA main.table_info(listings)")]
+        imp_cols = {r[1] for r in con.execute("PRAGMA imp.table_info(listings)")}
+        cols = [c for c in main_cols if c in imp_cols and c != "object_id"]
+        col_list = ",".join(cols)
+        added = con.execute(f"""INSERT INTO listings({col_list}) SELECT {col_list} FROM imp.listings i
+            WHERE NOT EXISTS (SELECT 1 FROM listings m WHERE m.source=i.source AND m.source_id=i.source_id)""").rowcount
+        upd_cols = [c for c in cols if c not in ("source", "source_id", "first_seen")]
+        updated = con.execute(f"""UPDATE listings SET ({",".join(upd_cols)}) =
+            (SELECT {",".join("i." + c for c in upd_cols)} FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id)
+            WHERE EXISTS (SELECT 1 FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id
+                          AND i.last_seen > listings.last_seen)""").rowcount
+        con.execute("""UPDATE listings SET first_seen = (SELECT MIN(i.first_seen) FROM imp.listings i
+            WHERE i.source=listings.source AND i.source_id=listings.source_id AND i.first_seen < listings.first_seen)
+            WHERE EXISTS (SELECT 1 FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id
+                          AND i.first_seen < listings.first_seen)""")
+        con.execute("""INSERT INTO price_history SELECT * FROM imp.price_history i WHERE NOT EXISTS
+            (SELECT 1 FROM price_history p WHERE p.source=i.source AND p.source_id=i.source_id AND p.ts=i.ts AND p.price=i.price)""")
+        con.execute("""INSERT INTO runs(source, mode, started, finished, status, pages, found, new, changed, removed, message,
+                                         declared, collected, requests)
+            SELECT source, mode, started, finished, status, pages, found, new, changed, removed, message,
+                   declared, collected, requests FROM imp.runs i
+            WHERE NOT EXISTS (SELECT 1 FROM runs r WHERE r.source=i.source AND r.started=i.started)""")
+        con.execute("INSERT OR IGNORE INTO likes SELECT * FROM imp.likes")
+        if con.execute("SELECT 1 FROM imp.sqlite_master WHERE type='table' AND name='dislikes'").fetchone():
+            con.execute("INSERT OR IGNORE INTO dislikes SELECT * FROM imp.dislikes")  # в старых архивах таблицы нет
+        con.commit()
+        con.execute("DETACH DATABASE imp")
+        return {"added": added, "updated": updated}
+    finally:
+        con.close()

@@ -1,4 +1,5 @@
 """ЦИАН: JSON API поиска (HTTP) или состояние страницы выдачи (браузер)."""
+import json
 import math
 import re
 from urllib.parse import urlencode
@@ -28,11 +29,109 @@ STATUS = {"deactivated": "снято с публикации", "removed": "уд�
 # Временные статусы: объявление может вернуться — это не снятие
 STATUS_PENDING = {"moderate", "onModeration"}
 
+_CONFIG_RE = re.compile(
+    r"_cianConfig\[(['\"])(?P<key>[^'\"]+)\1\]"
+    r"(?:\s*=\s*\(?\s*(?:window\.)?_cianConfig\[[^\]]+\]\s*\|\|\s*\[\]\s*\)?)?"
+    r"\s*(?:\.concat\s*\(|=\s*)"
+)
+
+
+def _find_results(obj, depth=0):
+    """Ищет словарь results со списком объявлений offers в состоянии страницы ЦИАН."""
+    if depth > 4:
+        return None
+    if isinstance(obj, dict):
+        res = obj.get("results")
+        if isinstance(res, dict) and isinstance(res.get("offers"), list):
+            return res
+        for v in obj.values():
+            hit = _find_results(v, depth + 1)
+            if hit is not None:
+                return hit
+    elif isinstance(obj, list):
+        for item in obj:
+            hit = _find_results(item, depth + 1)
+            if hit is not None:
+                return hit
+    return None
+
+
+def _decode_config_arg(html, pos, dec):
+    n = len(html)
+    while pos < n and html[pos].isspace():
+        pos += 1
+    if html.startswith(("[", "{"), pos):
+        data, _ = dec.raw_decode(html, pos)
+        return data
+    if html.startswith("JSON.parse(", pos):
+        p2 = pos + len("JSON.parse(")
+        while p2 < n and html[p2].isspace():
+            p2 += 1
+        if p2 < n and html[p2] == '"':
+            raw_str, _ = dec.raw_decode(html, p2)
+            return json.loads(raw_str)
+    return None
+
+
+def parse_state(html):
+    """Извлекает offers / total / aggregated из HTML страницы поиска ЦИАН или None."""
+    if not html:
+        return None
+    dec = json.JSONDecoder()
+    hits = []
+    for m in _CONFIG_RE.finditer(html):
+        try:
+            data = _decode_config_arg(html, m.end(), dec)
+        except Exception:
+            continue
+        res = _find_results(data) if data is not None else None
+        if res is not None:
+            prio = 0 if m.group("key") == "frontend-serp" else 1
+            hits.append((prio, res))
+    if not hits:
+        nm = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.I | re.S)
+        if nm:
+            try:
+                res = _find_results(json.loads(nm.group(1)))
+                if res is not None:
+                    hits.append((2, res))
+            except Exception:
+                pass
+    if not hits:
+        for m in re.finditer(r'"results"\s*:\s*\{', html):
+            try:
+                res, _ = dec.raw_decode(html, m.end() - 1)
+            except Exception:
+                continue
+            if isinstance(res, dict) and isinstance(res.get("offers"), list):
+                hits.append((3, res))
+                break
+    if not hits:
+        return None
+    hits.sort(key=lambda h: (h[0], not bool(h[1].get("offers")),
+                             "totalOffers" not in h[1] and "aggregatedOffers" not in h[1]))
+    res = hits[0][1]
+    return {"offers": res["offers"], "total": res.get("totalOffers"), "aggregated": res.get("aggregatedOffers")}
+
+
 _JS_STATE = """() => {
-  const cfg = window._cianConfig && window._cianConfig['frontend-serp'];
-  const st = Array.isArray(cfg) ? (cfg.find(x => x.key === 'initialState') || {}).value : null;
-  if (!st || !st.results) return null;
-  return {offers: st.results.offers, total: st.results.totalOffers, aggregated: st.results.aggregatedOffers, jsonQuery: st.results.jsonQuery};
+  const cfg = window._cianConfig;
+  if (!cfg) return null;
+  const findResults = (obj, depth = 0) => {
+    if (!obj || typeof obj !== 'object' || depth > 4) return null;
+    if (obj.results && Array.isArray(obj.results.offers)) return obj.results;
+    for (const v of (Array.isArray(obj) ? obj : Object.values(obj))) {
+      const hit = findResults(v, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const bundles = cfg['frontend-serp'] ? [cfg['frontend-serp'], ...Object.values(cfg)] : Object.values(cfg);
+  for (const b of bundles) {
+    const res = findResults(b);
+    if (res) return {offers: res.offers, total: res.totalOffers, aggregated: res.aggregatedOffers};
+  }
+  return null;
 }"""
 
 
@@ -40,9 +139,21 @@ class Cian(Scraper):
     name = "cian"
     label = "ЦИАН"
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._api_blocked = False
+
     def is_blocked(self, html, url):
-        head = (html or "")[:4000].lower()
-        return "/captcha" in url or ("<title" in head and "captcha" in head)
+        if "captcha" in (url or "").lower():
+            return True
+        head = (html or "")[:16000]
+        m = re.search(r"<title[^>]*>(.*?)</title>", head, re.I | re.S)
+        if m and ("captcha" in m.group(1).lower() or "вы не робот" in m.group(1).lower()):
+            return True
+        return 'id="form_captcha"' in head or 'id="captcha-container"' in head
+
+    def is_ready(self, html, url):
+        return not self.is_blocked(html, url) and parse_state(html) is not None
 
     def _json_query(self, page, repair=None):
         f = self.cfg["filters"]
@@ -78,22 +189,37 @@ class Cian(Scraper):
 
     def _load(self, page, repair=None):
         def via_http():
-            r = self.http.post(API, json={"jsonQuery": self._json_query(page, repair)},
-                               headers={"Origin": "https://www.cian.ru", "Referer": "https://www.cian.ru/"})
-            d = r.json().get("data") or {}
-            if "offersSerialized" not in d:
-                self.snapshot_last("нет списка в ответе API")
-                raise IOError("ЦИАН: в ответе API нет списка объявлений")
-            # aggregatedCount — уникальные объекты (offerCount включает дубли от разных агентов)
-            return d["offersSerialized"], d["aggregatedCount"] if "aggregatedCount" in d else d["offerCount"]
-
-        def via_browser(b):
-            b.goto(self._page_url(page, repair))
-            st = b.evaluate(_JS_STATE)
+            if not self._api_blocked:
+                try:
+                    r = self.http.post(API, json={"jsonQuery": self._json_query(page, repair)},
+                                       headers={"Origin": "https://www.cian.ru", "Referer": "https://www.cian.ru/"})
+                    d = r.json().get("data") or {}
+                    if "offersSerialized" not in d:
+                        self.snapshot_last("нет списка в ответе API")
+                        raise IOError("ЦИАН: в ответе API нет списка объявлений")
+                    # aggregatedCount — уникальные объекты (offerCount включает дубли от разных агентов)
+                    return d["offersSerialized"], d["aggregatedCount"] if "aggregatedCount" in d else d["offerCount"]
+                except Blocked as e:
+                    self._api_blocked = True
+                    self.log(f"API поиска ЦИАН заблокирован ({e}) — пробую страницу поиска по HTTP")
+            r = self.http.get(self._page_url(page, repair), headers={"Referer": "https://www.cian.ru/"})
+            st = parse_state(r.text)
             if not st:
                 self.snapshot_last("нет состояния страницы")
                 raise IOError("ЦИАН: не найдено состояние страницы")
-            return st["offers"], st["aggregated"] or st["total"]
+            agg, tot = st.get("aggregated"), st.get("total")
+            return st["offers"], agg if agg is not None else tot
+
+        def via_browser(b):
+            html = b.goto(self._page_url(page, repair))
+            st = b.evaluate(_JS_STATE)
+            if not st:
+                st = parse_state(b.raw_html()) or parse_state(html)
+            if not st:
+                self.snapshot_last("нет состояния страницы")
+                raise IOError("ЦИАН: не найдено состояние страницы")
+            agg, tot = st.get("aggregated"), st.get("total")
+            return st["offers"], agg if agg is not None else tot
 
         return self.fetch(via_http, via_browser)
 
@@ -151,14 +277,12 @@ class Cian(Scraper):
         self.repairs = {}   # id → код ремонта ЦИАН
         extra = {}          # id → объявление из этих выдач, если основной выдаче оно вдруг не встретится
         for code, label in queries[:-1]:
-            self.wait()
             for _page, _pages, _total, offers in self._pages(code, label, first[code]):
                 for o in offers:
                     sid = str(o.get("cianId") or o.get("id"))
                     self.repairs[sid] = code
                     extra[sid] = o
         # 2. Основная выдача — все квартиры, в том числе те, где вид ремонта не указан
-        self.wait()
         ids, total = set(), None
         for _page, _pages, total, offers in self._pages(None, "", first[None]):
             for o in offers:

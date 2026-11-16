@@ -4,7 +4,7 @@
 import json
 from pathlib import Path
 
-from app import alerts, db, history, purge, runlog, server, transfer, trash
+from app import alerts, db, dedupe, history, images, paths, purge, runlog, server, transfer, trash
 from app.scrapers.cian import Cian
 from tests.support import Case, cian_offer, con, counts, listings, run
 
@@ -306,3 +306,37 @@ class Backups(Case):
     def test_restore_rejects_foreign_name(self):
         with self.assertRaises(ValueError):
             transfer.restore("нет_такой.zip")
+
+
+class ImportAndImagesCache(Case):
+    """Импорт архива сохраняет статистику прогонов и пересчитывает снимки/правила; кэш фото находит файлы."""
+
+    def test_existing_set_matches_server_listings(self):
+        run("cian", cian(listings("cian", 3)))
+        rows = server.listings()
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(not r["has_img"] for r in rows))
+        img_dir = images.IMAGES / "cian"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        first = rows[0]
+        (img_dir / f"{first['source_id']}.webp").write_bytes(b"\x00" * 2048)
+        self.assertIn((first["source"], first["source_id"]), images.existing_set())
+        after = {r["source_id"]: r["has_img"] for r in server.listings()}
+        self.assertTrue(after[first["source_id"]])
+
+    def test_import_merge_keeps_run_metrics_and_rebuilds_snapshots(self):
+        run("cian", cian(listings("cian", 5)))
+        c = con()
+        c.execute("UPDATE runs SET declared=50, collected=5, requests=3")
+        c.commit()
+        zip_path = self.dir / "export.zip"
+        transfer.export_zip(zip_path)
+        purge.clear_all()
+        res = transfer.import_zip(zip_path, mode="merge")
+        self.assertEqual(res["added"], 5)
+        c2 = con()
+        r = c2.execute("SELECT declared, collected, requests FROM runs").fetchone()
+        self.assertEqual((r["declared"], r["collected"], r["requests"]), (50, 5, 3))
+        meta = c2.execute("SELECT value FROM meta WHERE key='dedupe_rules'").fetchone()
+        self.assertEqual(meta["value"], str(dedupe.RULES_VERSION))
+        self.assertGreaterEqual(c2.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 1)

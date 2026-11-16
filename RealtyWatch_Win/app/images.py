@@ -1,5 +1,6 @@
 """Локальные копии главных фото: database/images/<сайт>/<id>.<ext>.
 Неудачные загрузки повторяются (после сбора, при запуске, по кнопке) — до MAX_TRIES попыток на фото."""
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -44,13 +45,33 @@ def download(source, source_id, url, session=None):
     return True
 
 
+def existing_set(sources=None):
+    """Множество (source, source_id), для которых локальное фото уже на месте (один обход папок)."""
+    exts = set(EXTS.values())
+    found = set()
+    if not IMAGES.exists():
+        return found
+    folders = list(sources) if sources else [e.name for e in os.scandir(IMAGES) if e.is_dir()]
+    for src in folders:
+        folder = IMAGES / src
+        if not folder.is_dir():
+            continue
+        with os.scandir(folder) as it:
+            for e in it:
+                stem, _, ext = e.name.rpartition(".")
+                if stem and ext in exts and e.is_file():
+                    found.add((src, stem))
+    return found
+
+
 def missing(con, sources=None):
     q = "SELECT source, source_id, photo FROM listings WHERE photo IS NOT NULL AND COALESCE(img_tries,0) < ?"
     args = [MAX_TRIES]
     if sources:
         q += f" AND source IN ({','.join('?' * len(sources))})"
         args += list(sources)
-    return [r for r in con.execute(q, args) if local_path(r["source"], r["source_id"]) is None]
+    have = existing_set(sources)
+    return [r for r in con.execute(q, args) if (r["source"], str(r["source_id"])) not in have]
 
 
 def repair(connect, sources=None, log=None, stop=None, workers=4):
@@ -60,6 +81,7 @@ def repair(connect, sources=None, log=None, stop=None, workers=4):
         if _running:
             return None
         _running = True
+    con = None
     try:
         con = connect()
         todo = missing(con, sources)
@@ -91,11 +113,12 @@ def repair(connect, sources=None, log=None, stop=None, workers=4):
                     con.execute("UPDATE listings SET img_tries=COALESCE(img_tries,0)+1 WHERE source=? AND source_id=?",
                                 (r["source"], r["source_id"]))
         con.commit()
-        con.close()
         if log:
             log(f"фото: загружено {ok}, не удалось {failed}" + (f", без адреса фото {no_url}" if no_url else ""))
         return {"ok": ok, "failed": failed, "no_url": no_url}
     finally:
+        if con is not None:
+            con.close()
         with _lock:
             _running = False
 

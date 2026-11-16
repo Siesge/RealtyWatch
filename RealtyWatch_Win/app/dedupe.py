@@ -186,9 +186,10 @@ def assign(con, source, source_id):
                            (oid, source, source_id)).fetchall()
 
     group = [me] + (members(me["object_id"]) if me["object_id"] else [])
+    members_map = {o: members(o) for o in cands}
     # сначала объекты, совпавшие строго: мягкое совпадение не должно уводить объявление от его точного дубля
-    for oid_c in sorted(cands, key=lambda o: (not cands[o], -len(members(o)), o)):
-        extra = members(oid_c)
+    for oid_c in sorted(cands, key=lambda o: (not cands[o], -len(members_map[o]), o)):
+        extra = members_map[oid_c]
         if all(compatible(a, b) for a in extra for b in group):
             linked.add(oid_c)
             group += extra

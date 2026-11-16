@@ -558,44 +558,78 @@ function openView(v) {
   setView(name);
 }
 
+let CH_DATA = null;
+
 async function renderChanges() {
-  const el = $("#view-changes");
-  const [ev, lastRuns] = await Promise.all([api(`/api/changes?${chQuery(CH_PERIOD)}`), CH_PERIOD === "last" ? api("/api/last_update") : null]);
+  const reqPeriod = CH_PERIOD;
+  const [ev, lastRuns] = await Promise.all([api(`/api/changes?${chQuery(reqPeriod)}`), reqPeriod === "last" ? api("/api/last_update") : null]);
+  if (CH_PERIOD !== reqPeriod) return;
+  CH_DATA = { period: reqPeriod, ev, lastRuns };
   if (view !== "changes") return;
+  paintChanges();
+}
+
+function paintChanges() {
+  const el = $("#view-changes");
+  if (!CH_DATA) return;
+  const { ev, lastRuns } = CH_DATA;
   const kinds = JSON.parse(store.get("rw.chKinds", '["new","down","up","removed","returned"]'));
-  const onlyPass = store.get("rw.chPass", "1") === "1";
-  const noDis = store.get("rw.chNoDis", "1") === "1";
   const kindOf = e => e.kind === "price" ? ((e.new_value || 0) < (e.old_value || 0) ? "down" : "up") : e.kind;
+  const f = readFilters();
+  const objById = new Map(OBJS.map(o => [o.id, o]));
+  const remObjs = new Set();
+  for (const e of ev) {
+    if (e.kind === "removed") remObjs.add(e.object_id || `${e.source}:${e.source_id}`);
+  }
+  const counts = { new: 0, down: 0, up: 0, removed: 0, returned: 0 };
   const groups = new Map();
+  const zoneMap = new Map();
   for (const e of ev) {
     const k = kindOf(e);
-    if (!kinds.includes(k)) continue;
     const oid = e.object_id || `${e.source}:${e.source_id}`;
+    const o = objById.get(oid);
+    const allowRemoved = k === "removed" || (kinds.includes("removed") && remObjs.has(oid));
+    if (matchObject(o, f, { ignoreZone: true, allowRemoved })) {
+      if (f.zones.includes(o.zone) && k in counts) counts[k]++;
+      if (kinds.includes(k) && o && !zoneMap.has(oid)) zoneMap.set(oid, o);
+    }
+    if (!kinds.includes(k)) continue;
     if (!groups.has(oid)) groups.set(oid, []);
     groups.get(oid).push({ ...e, k });
   }
-  let tiles = [...groups.entries()].map(([oid, list]) => ({ oid, list, o: OBJS.find(x => x.id === oid) }));
-  if (onlyPass) tiles = tiles.filter(t => t.o && !t.o.excluded);
-  if (noDis) tiles = tiles.filter(t => !(t.o && t.o.disliked));
-  const cnt = k => ev.filter(e => kindOf(e) === k).length;
+  const tiles = [];
+  for (const [oid, list] of groups) {
+    const o = objById.get(oid);
+    if (!matchObject(o, f, { allowRemoved: list.some(e => e.k === "removed") })) continue;
+    const lastTs = list.reduce((m, e) => (e.ts > m ? e.ts : m), "");
+    tiles.push({ oid, list, o, lastTs });
+  }
+  if (f.sort === "new") {
+    tiles.sort((a, b) => (b.lastTs > a.lastTs ? 1 : b.lastTs < a.lastTs ? -1 : 0));
+  } else {
+    const dir = f.sort.startsWith("-") ? -1 : 1;
+    tiles.sort((a, b) => ((sortKey(a.o, f.sort) > sortKey(b.o, f.sort)) ? 1 : (sortKey(a.o, f.sort) < sortKey(b.o, f.sort)) ? -1 : 0) * dir);
+  }
+  if (f.hiddenOnly) tiles.sort((a, b) => (b.o.fresh.length > 0) - (a.o.fresh.length > 0));
+  renderHeader([], [...zoneMap.values()]);
+  fitToolbar();
+  const emptyMsg = ev.length
+    ? `<div class="empty"><b>По выбранным фильтрам изменений нет</b>Всего за период событий: ${ev.length} — измените фильтры сверху (зону, комнаты, статус, цену или типы изменений).</div>`
+    : `<div class="empty"><b>Изменений нет</b>${CH_PERIOD === "last" ? "Последнее обновление ничего не изменило" : "За выбранный период"} по выбранным типам. Первичная загрузка сайта изменениями не считается.</div>${aboutTab("changes")}`;
   el.innerHTML = `<div class="ch-bar panel">
       <div class="seg small">${CH_PERIODS.map(([v, l, tip]) => `<label title="${tip}"><input type="radio" name="chPeriod" value="${v}" ${v === CH_PERIOD ? "checked" : ""}><span>${l}</span></label>`).join("")}</div>
-      <div class="seg small">${Object.entries(KIND).map(([k, v]) => `<label title="${v.tip}"><input type="checkbox" name="chKind" value="${k}" ${kinds.includes(k) ? "checked" : ""}><span><i class="kdot ${v.cls}"></i>${v.label} <em>${cnt(k)}</em></span></label>`).join("")}</div>
-      <label class="check" title="Показывать только квартиры, подходящие под параметры поиска"><input type="checkbox" id="chPass" ${onlyPass ? "checked" : ""}><span>только подходящие</span></label>
-      <label class="check" title="Не показывать квартиры, отмеченные «не нравится» (👎 на карточке). Сбор по ним идёт, изменения записываются — просто не на виду"><input type="checkbox" id="chNoDis" ${noDis ? "checked" : ""}><span>исключить дизлайки</span></label>
+      <div class="seg small">${Object.entries(KIND).map(([k, v]) => `<label title="${v.tip}"><input type="checkbox" name="chKind" value="${k}" ${kinds.includes(k) ? "checked" : ""}><span><i class="kdot ${v.cls}"></i>${v.label} <em>${counts[k] || 0}</em></span></label>`).join("")}</div>
       <span class="meta">${tiles.length} ${plural(tiles.length, "объект", "объекта", "объектов")} с изменениями</span>
       ${lastRuns ? `<div class="ch-last" title="Последний законченный сбор каждого сайта: изменения выше найдены именно им">${lastRuns.length
         ? "Последнее обновление: " + lastRuns.map(r => `<span><i class="sdot ${r.source}"></i>${SRC[r.source]} ${dtt(r.finished)}${r.status !== "done" ? ` <em class="st-badge ${r.status}">${STATE[r.status] || r.status}</em>` : ""}</span>`).join("")
         : "Сборов ещё не было"}</div>` : ""}
     </div>
-    ${tiles.length ? `<div class="ch-grid">${tiles.map(changeTile).join("")}</div>` :
-      `<div class="empty"><b>Изменений нет</b>${CH_PERIOD === "last" ? "Последнее обновление ничего не изменило" : "За выбранный период"} по выбранным типам. Первичная загрузка сайта изменениями не считается.</div>${aboutTab("changes")}`}`;
+    ${tiles.length ? `<div class="ch-grid">${tiles.map(changeTile).join("")}</div>` : emptyMsg}`;
   el.querySelectorAll("input[name=chPeriod]").forEach(r => r.onchange = () => { CH_PERIOD = r.value; store.set("rw.chPeriod", r.value); renderChanges(); });
   el.querySelectorAll("input[name=chKind]").forEach(c => c.onchange = () => {
-    store.set("rw.chKinds", JSON.stringify([...el.querySelectorAll("input[name=chKind]:checked")].map(x => x.value))); renderChanges();
+    store.set("rw.chKinds", JSON.stringify([...el.querySelectorAll("input[name=chKind]:checked")].map(x => x.value)));
+    paintChanges();
   });
-  $("#chPass").onchange = () => { store.set("rw.chPass", $("#chPass").checked ? "1" : "0"); renderChanges(); };
-  $("#chNoDis").onchange = () => { store.set("rw.chNoDis", $("#chNoDis").checked ? "1" : "0"); renderChanges(); };
   el.querySelectorAll("[data-card]").forEach(b => b.onclick = () => goToCard(b.dataset.card));
   el.querySelectorAll("[data-open]").forEach(b => b.onclick = () => openObject(b.dataset.open));
 }
@@ -623,9 +657,15 @@ function changeTile(t) {
         <span class="ch-price" title="Текущая цена объекта (минимальная среди активных объявлений)">${o ? `${fmt(o.price)} ₽` : ""}</span></div>
       <div class="addr" title="Адрес">${ICON.pin}<span>${esc((o && o.address) || e0.address || "")}</span></div>
       <div class="ch-sum" title="На каких сайтах были изменения">${sites.length > 1 ? `изменения на ${sites.length} сайтах: ` : ""}${sites.map(s => `<i class="sdot ${s}"></i> ${SRC[s]}`).join(", ")}</div>
-      <ul class="ch-list">${t.list.map(e => `<li title="${esc(KIND[e.k].tip + " — " + tsLabel(e.ts))}"><span class="kbadge ${KIND[e.k].cls}">${KIND[e.k].label}</span>
+      <ul class="ch-list">${t.list.map(e => {
+        const it = o && o.items.find(i => i.source === e.source && i.source_id === e.source_id);
+        const link = it && it.off_site
+          ? `<span class="off-link" title="${esc(offTip(it, o.active))}">${ICON.noext}</span>`
+          : `<a href="${esc(e.url)}" target="_blank" rel="noopener" title="Открыть объявление на ${SRC[e.source]}">${ICON.ext}</a>`;
+        return `<li title="${esc(KIND[e.k].tip + " — " + tsLabel(e.ts))}"><span class="kbadge ${KIND[e.k].cls}">${KIND[e.k].label}</span>
         <span class="ch-when">${tsLabel(e.ts)}</span><i class="sdot ${e.source}" title="${SRC[e.source]}"></i> <span>${SRC[e.source]}: ${eventText(e)}</span>
-        <a href="${esc(e.url)}" target="_blank" rel="noopener" title="Открыть объявление на ${SRC[e.source]}">${ICON.ext}</a></li>`).join("")}</ul>
+        ${link}</li>`;
+      }).join("")}</ul>
       ${o ? `<div class="ch-acts"><button class="btn-sec sm" data-card="${esc(o.id)}" title="Открыть эту квартиру в подборке">В подборке</button>
         <button class="btn-sec sm" data-open="${esc(o.id)}" title="Окно с историей цен по каждому сайту">${ICON.chart}История цен</button></div>` : ""}
     </div></article>`;
@@ -644,7 +684,7 @@ async function updateChangesBadge() {
 }
 
 function markChangesSeen() {
-  store.set("rw.chSeen", new Date(Date.now() + 60000).toISOString().slice(0, 19));
+  store.set("rw.chSeen", localIso(Date.now() + 60000));
   $("#chBadge").classList.add("hidden");
 }
 

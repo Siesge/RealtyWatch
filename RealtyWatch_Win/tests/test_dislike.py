@@ -117,7 +117,7 @@ class HiddenInterface(unittest.TestCase):
         """Кружок с числом на «Скрытых», подсветка новых объявлений и «Оставить скрытой»."""
         self.assertIn('<i id="hideNew" class="new-badge" hidden></i>', self.html)
         self.assertIn("return o.disliked ? o.items.filter(i => !i.disliked) : [];", self.js)
-        self.assertIn('if (hiddenOnly) rows.sort((a, b) => (b.fresh.length > 0) - (a.fresh.length > 0));', self.js)
+        self.assertIn('if (f.hiddenOnly) rows.sort((a, b) => (b.fresh.length > 0) - (a.fresh.length > 0));', self.js)
         self.assertIn('await post("/api/dislike", { keys, on: true });', self.js)
         self.assertIn('if (name === "cards" && arg === "hidden")', self.dash, "клик по уведомлению")
         self.assertIn(".offer.fresh", self.css)
@@ -126,9 +126,19 @@ class HiddenInterface(unittest.TestCase):
         self.assertLess(self.html.index('id="fHidden"'), self.html.index('id="fLiked"'))
 
     def test_exclude_dislikes_on_by_default(self):
-        self.assertIn('id="fNoDis" checked', self.html, "подборка, таблица, карта")
+        self.assertIn('id="fNoDis" checked', self.html, "подборка, таблица, карта и изменения")
         self.assertIn('store.get("rw.dashNoDis", "1")', self.dash, "дашборд")
-        self.assertIn('store.get("rw.chNoDis", "1")', self.dash, "изменения")
+        self.assertIn("matchObject(o, f,", self.dash, "изменения берут общий фильтр дизлайков")
+
+    def test_changes_uses_unified_filters_and_local_time(self):
+        self.assertIn('const lists = ["cards", "table", "map", "changes"].includes(v);', self.js)
+        self.assertIn("readFilters()", self.dash)
+        self.assertIn("allowRemoved", self.dash, "снятые события видны при включённой галочке «активные»")
+        self.assertIn("renderHeader([], [...zoneMap.values()])", self.dash)
+        self.assertNotIn('id="chPass"', self.dash)
+        self.assertNotIn('id="chNoDis"', self.dash)
+        self.assertIn("const today = () => localIso().slice(0, 10);", self.js)
+        self.assertIn('store.set("rw.chSeen", localIso(Date.now() + 60000));', self.dash)
 
     def test_filter_uses_both_switches(self):
         self.assertIn("(hiddenOnly ? o.disliked : !(noDis && o.disliked))", self.js)

@@ -112,7 +112,12 @@ class Scraper:
         body = None
         try:
             if self.last_mode == "browser" and self.browser and self.browser.page:
-                body = self.browser.page.content()
+                try:
+                    body = self.browser.page.content()
+                except Exception:
+                    body = None
+                if not body:
+                    body = self.browser.raw_html()
             else:
                 body = self.http.last_text
         except Exception:
@@ -201,19 +206,18 @@ class Scraper:
         """Загружает данные выбранным способом. В режиме auto при блокировке HTTP переходит на браузер."""
         if not self.use_browser:
             try:
-                res = via_http()
                 self.last_mode = "http"
                 self.progress(mode="http")
-                return res
+                return via_http()
             except Blocked as e:
                 if self.mode == "http":
                     raise
                 self.log(f"HTTP заблокирован ({e}) — переключаюсь на браузер")
                 self.use_browser = True
-        res = via_browser(self.get_browser())
+        b = self.get_browser()
         self.last_mode = "browser"
         self.progress(mode="browser")
-        return res
+        return via_browser(b)
 
     def wait(self):
         pause(self.delay, self.stop)

@@ -133,23 +133,25 @@ def _startup_maintenance():
     from . import history
 
     con = db.connect()
-    rules = con.execute("SELECT value FROM meta WHERE key='dedupe_rules'").fetchone()
-    if rules is None or rules[0] != str(dedupe.RULES_VERSION):
-        # правила объединения поменялись — объекты пересобираются, и с ними точки дашборда
-        before = con.execute("SELECT COUNT(DISTINCT object_id) FROM listings").fetchone()[0]
-        n = dedupe.rebuild(con)
-        history.rebuild_snapshots(con)
-        con.execute("INSERT OR REPLACE INTO meta VALUES('dedupe_rules', ?)", (str(dedupe.RULES_VERSION),))
+    try:
+        rules = con.execute("SELECT value FROM meta WHERE key='dedupe_rules'").fetchone()
+        if rules is None or rules[0] != str(dedupe.RULES_VERSION):
+            # правила объединения поменялись — объекты пересобираются, и с ними точки дашборда
+            before = con.execute("SELECT COUNT(DISTINCT object_id) FROM listings").fetchone()[0]
+            n = dedupe.rebuild(con)
+            history.rebuild_snapshots(con)
+            con.execute("INSERT OR REPLACE INTO meta VALUES('dedupe_rules', ?)", (str(dedupe.RULES_VERSION),))
+            con.commit()
+            manager.log("db", f"объединение дублей по новым правилам: было {before} объектов, стало {n}")
+        elif con.execute("SELECT COUNT(*) FROM listings WHERE object_id IS NULL").fetchone()[0]:
+            n = dedupe.rebuild(con)
+            manager.log("db", f"объединение дублей: {n} объектов")
+        con.execute("UPDATE runs SET status='interrupted', message='прервано: программа была закрыта во время сбора' "
+                    "WHERE status='running'")
         con.commit()
-        manager.log("db", f"объединение дублей по новым правилам: было {before} объектов, стало {n}")
-    elif con.execute("SELECT COUNT(*) FROM listings WHERE object_id IS NULL").fetchone()[0]:
-        n = dedupe.rebuild(con)
-        manager.log("db", f"объединение дублей: {n} объектов")
-    con.execute("UPDATE runs SET status='interrupted', message='прервано: программа была закрыта во время сбора' "
-                "WHERE status='running'")
-    con.commit()
-    history.backfill(con)
-    con.close()
+        history.backfill(con)
+    finally:
+        con.close()
     images.repair_async(db.connect, log=lambda m: manager.log("db", m))
 
 
@@ -178,11 +180,13 @@ def _notify_hook(tray=lambda: None):
 
     def hook(run_ids, sources, auto):
         con = db.connect()
-        c = history.runs_summary(con, run_ids)
-        marks = ",".join("?" * len(run_ids))
-        since = con.execute(f"SELECT MIN(started) FROM runs WHERE id IN ({marks})", run_ids).fetchone()[0] if run_ids else None
-        hidden = db.hidden_fresh(con, since) if since else 0
-        con.close()
+        try:
+            c = history.runs_summary(con, run_ids)
+            marks = ",".join("?" * len(run_ids))
+            since = con.execute(f"SELECT MIN(started) FROM runs WHERE id IN ({marks})", run_ids).fetchone()[0] if run_ids else None
+            hidden = db.hidden_fresh(con, since) if since else 0
+        finally:
+            con.close()
         text = _changes_text(c)
         names = ", ".join(SOURCE_LABEL.get(s, s) for s in sources)
         # скрытые квартиры, в карточки которых за этот сбор добавились объявления: может быть, новая квартира

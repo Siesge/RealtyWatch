@@ -4,6 +4,7 @@ import json
 import random
 import sys
 import time
+from urllib.parse import urlsplit
 
 from curl_cffi import requests as cffi
 
@@ -231,7 +232,7 @@ class Browser:
     def raw_html(self):
         """HTML, который прислал сервер на загрузку текущей страницы (до работы её скриптов), или None."""
         r = self._docs.get(self.page)
-        if r is None or r.status != 200 or r.url.split("#")[0] != self.page.url.split("#")[0]:
+        if r is None or r.status != 200 or urlsplit(r.url).netloc != urlsplit(self.page.url).netloc:
             return None
         try:
             return r.text()
