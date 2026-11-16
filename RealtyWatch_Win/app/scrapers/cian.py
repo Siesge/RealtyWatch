@@ -144,13 +144,19 @@ class Cian(Scraper):
         self._api_blocked = False
 
     def is_blocked(self, html, url):
-        if "captcha" in (url or "").lower():
+        u = (url or "").lower()
+        if "captcha" in u or "/xpvnsulc/" in u:
             return True
         head = (html or "")[:16000]
         m = re.search(r"<title[^>]*>(.*?)</title>", head, re.I | re.S)
         if m and ("captcha" in m.group(1).lower() or "вы не робот" in m.group(1).lower()):
             return True
-        return 'id="form_captcha"' in head or 'id="captcha-container"' in head
+        return ('id="form_captcha"' in head or 'id="captcha-container"' in head
+                or 'id="id_captcha_frame_div"' in head or "<js-challenge-loader" in head)
+
+    def is_ip_banned(self, html, url):
+        head = (html or "")[:8000]
+        return 'id="REQUEST-IP"' in head and "Forbidden" in head
 
     def is_ready(self, html, url):
         return not self.is_blocked(html, url) and parse_state(html) is not None
@@ -175,6 +181,9 @@ class Cian(Scraper):
         # дизайнерский», а код 1 оказался «без ремонта», дизайнерский (4) же не запрашивался вовсе.
         return q
 
+    def _page_host(self):
+        return "krym.cian.ru" if self.site.get("region") == 184739 else "www.cian.ru"
+
     def _page_url(self, page, repair=None):
         f = self.cfg["filters"]
         p = [("deal_type", "sale"), ("engine_version", 2), ("offer_type", "flat"), ("region", self.site["region"]),
@@ -185,9 +194,12 @@ class Cian(Scraper):
             p.append(("repair[0]", repair))
         if page > 1:
             p.append(("p", page))
-        return "https://www.cian.ru/cat.php?" + urlencode(p)
+        return f"https://{self._page_host()}/cat.php?" + urlencode(p)
 
     def _load(self, page, repair=None):
+        url = self._page_url(page, repair)
+        ref = f"https://{self._page_host()}/"
+
         def via_http():
             if not self._api_blocked:
                 try:
@@ -196,25 +208,29 @@ class Cian(Scraper):
                     d = r.json().get("data") or {}
                     if "offersSerialized" not in d:
                         self.snapshot_last("нет списка в ответе API")
-                        raise IOError("ЦИАН: в ответе API нет списка объявлений")
+                        raise Blocked("ЦИАН: в ответе API нет списка объявлений")
                     # aggregatedCount — уникальные объекты (offerCount включает дубли от разных агентов)
                     return d["offersSerialized"], d["aggregatedCount"] if "aggregatedCount" in d else d["offerCount"]
                 except Blocked as e:
                     self._api_blocked = True
                     self.log(f"API поиска ЦИАН заблокирован ({e}) — пробую страницу поиска по HTTP")
-            r = self.http.get(self._page_url(page, repair), headers={"Referer": "https://www.cian.ru/"})
+            r = self.http.get(url, headers={"Referer": ref})
             st = parse_state(r.text)
             if not st:
-                self.snapshot_last("нет состояния страницы")
-                raise IOError("ЦИАН: не найдено состояние страницы")
+                self.snapshot_last("нет состояния страницы (HTTP)")
+                raise Blocked(f"ЦИАН: страница поиска по HTTP без состояния ({len(r.text)} Б)")
             agg, tot = st.get("aggregated"), st.get("total")
             return st["offers"], agg if agg is not None else tot
 
         def via_browser(b):
-            html = b.goto(self._page_url(page, repair))
+            html = b.goto(url)
             st = b.evaluate(_JS_STATE)
             if not st:
                 st = parse_state(b.raw_html()) or parse_state(html)
+            if not st and hasattr(b, "_wait_js"):
+                if b._wait_js("() => !!(window._cianConfig && Object.keys(window._cianConfig).length)", 8):
+                    cur = b.content() if hasattr(b, "content") else html
+                    st = b.evaluate(_JS_STATE) or parse_state(b.raw_html()) or parse_state(cur)
             if not st:
                 self.snapshot_last("нет состояния страницы")
                 raise IOError("ЦИАН: не найдено состояние страницы")

@@ -226,8 +226,21 @@ class Browser:
     def clear_overlay(self, url, settle=(2.5, 5.0)):
         """Если страницу закрыло окно проверки (сайт показывает его и посреди просмотра), пройти его."""
         if self.overlay():
-            self._pass_captcha(url, settle, self.page.content())
+            self._pass_captcha(url, settle, self.content())
             self._cooldown = True
+
+    def content(self):
+        """HTML текущей вкладки; если в этот миг идёт перенаправление — коротко дождаться документа."""
+        for _ in range(6):
+            try:
+                return self.page.content()
+            except Exception:
+                try:
+                    self.page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                pause((0.5, 0.5), self.stop)
+        return self.page.content()
 
     def raw_html(self):
         """HTML, который прислал сервер на загрузку текущей страницы (до работы её скриптов), или None."""
@@ -489,17 +502,19 @@ class Browser:
         """Общее для любой загрузки: дать странице догрузиться, проверить на капчу и ограничение IP."""
         pause(settle, self.stop)
         self._humanize()
-        html = self.page.content()
+        html = self.content()
         moved = "" if self.page.url == url else f"→ {self.page.url}"
         self._trace("browser", "GET", url, self.last_status, round((time.time() - t0) * 1000), len(html),
                     " · ".join(x for x in (how, moved) if x))
         if self._blocked(html, self.page.url) and self.last_status not in (403, 429, 439):
-            # Иногда это «мягкая» проверка, которая проходит сама после перезагрузки (на 403/429/439 — нет: только капча)
-            self.log("проверка безопасности — пробую перезагрузить")
+            # Иногда страница проверки сама открывает выдачу через несколько секунд, а иногда проходит после перезагрузки
             pause((8, 14), self.stop)
-            self._nav(url)
-            pause(settle, self.stop)
-            html = self.page.content()
+            html = self.content()
+            if self._blocked(html, self.page.url) or not self.is_ready(html, self.page.url):
+                self.log("проверка безопасности — пробую перезагрузить")
+                self._nav(url)
+                pause(settle, self.stop)
+                html = self.content()
         if self.is_ip_banned(html, self.page.url) and not self.check_passed():
             # Ограничение IP за частоту запросов: человек тут не поможет, нужна пауза (её делает парсер)
             self._trace("browser", "GET", url, self.last_status, None, len(html), "ограничение IP", html, "ограничение ip")
@@ -548,7 +563,7 @@ class Browser:
             page_html = self._after_solve(url, settle)
             if page_html is not None:
                 return page_html
-            html = self.page.content()
+            html = self.content()
             self.log("сайт снова показал капчу")
         return self._ask_human(url, settle, what)
 
@@ -576,7 +591,7 @@ class Browser:
                 return html
         self.log("сайт не открыл страницу после проверки — открываю её сам")
         self._safe_nav(url, settle)
-        html = self.page.content()
+        html = self.content()
         return None if self._blocked(html, self.page.url) else html
 
     def _ask_human(self, url, settle, what=""):
@@ -648,6 +663,11 @@ class Browser:
             pass
 
     def evaluate(self, js):
+        for _ in range(4):
+            try:
+                return self.page.evaluate(js)
+            except Exception:
+                pause((0.5, 0.5), self.stop)
         return self.page.evaluate(js)
 
     def cookies(self):

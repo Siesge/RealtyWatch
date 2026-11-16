@@ -113,7 +113,7 @@ class Scraper:
         try:
             if self.last_mode == "browser" and self.browser and self.browser.page:
                 try:
-                    body = self.browser.page.content()
+                    body = self.browser.content() if hasattr(self.browser, "content") else self.browser.page.content()
                 except Exception:
                     body = None
                 if not body:

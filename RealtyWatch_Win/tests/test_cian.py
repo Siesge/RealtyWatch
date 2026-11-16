@@ -1,14 +1,17 @@
 """ЦИАН: вид ремонта узнаётся отдельными выдачами по каждому виду (в самой выдаче поля о ремонте нет),
 основная выдача идёт без фильтра по ремонту и с сортировкой по цене. Данные синтетические, к сайту
 не обращаемся."""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import threading
 from types import SimpleNamespace
 import unittest
 
 from app import rules, settings
 from app.net import Blocked, Browser
+import app.scrapers.cian as cian_mod
 from app.scrapers.cian import Cian, SORT, parse_state
-from tests.support import Case, cian_offer, isolate, listings
+from tests.support import Case, LocalBrowser, cian_offer, fast_timing, has_browser, isolate, listings
 
 # Описание объявления 333647311 по сути: ремонт сделан только в санузлах, а в «О квартире» — «без ремонта»
 BATHROOMS_ONLY = "Вид неописуемый. Внутри сделан хороший ремонт в санузлах (ванная и туалет полностью готовы)."
@@ -173,10 +176,18 @@ class CianStateAndFallback(Case):
         ok_html = self._ssr_html()
         self.assertFalse(self.c.is_blocked(ok_html, "https://krym.cian.ru/cat.php?deal_type=sale"))
         self.assertTrue(self.c.is_ready(ok_html, "https://krym.cian.ru/cat.php?deal_type=sale"))
+        self.assertTrue(self.c._page_url(1).startswith("https://krym.cian.ru/cat.php?"))
 
         self.assertTrue(self.c.is_blocked(ok_html, "https://api.cian.ru/cian-captcha/?redirect_url=x"))
+        self.assertTrue(self.c.is_blocked(ok_html, "https://www.cian.ru/xpvnsulc/?back_location=x"))
         self.assertTrue(self.c.is_blocked("<html><head><title>Captcha</title></head></html>", "https://www.cian.ru/"))
         self.assertTrue(self.c.is_blocked('<div id="form_captcha"></div>', "https://www.cian.ru/"))
+        servicepipe = ('<!DOCTYPE html><html><body><div id="id_spinner"><js-challenge-loader class="spinner-loader">'
+                       '</js-challenge-loader></div><div id="id_captcha_frame_div" style="display: none;"></div></body></html>')
+        self.assertTrue(self.c.is_blocked(servicepipe, "https://www.cian.ru/cat.php?deal_type=sale"))
+        self.assertFalse(self.c.is_ready(servicepipe, "https://www.cian.ru/cat.php?deal_type=sale"))
+        self.assertTrue(self.c.is_ip_banned('<html><body><h1>Forbidden</h1><p id="REQUEST-IP">IP: 1.2.3.4</p></body></html>',
+                                            "https://krym.cian.ru/sale/flat/1/"))
         self.assertFalse(self.c.is_ready("<html><head><title>Ок</title></head><body></body></html>", "https://www.cian.ru/cat.php"))
 
     def test_load_falls_back_from_blocked_api_to_http_cat_and_browser(self):
@@ -250,6 +261,76 @@ class CianStateAndFallback(Case):
         self.assertEqual(b.raw_html(), "<html>ok</html>")
         page.url = "https://other.example/cat.php"
         self.assertIsNone(b.raw_html())
+
+    @unittest.skipUnless(has_browser(), "нет установленного Chromium")
+    def test_servicepipe_on_http_switches_to_real_browser_and_parses_multi_state(self):
+        """Реальный сценарий прогона №158: API отдаёт SmartCaptcha, cat.php по HTTP отдаёт 2 КБ ServicePipe
+        (<js-challenge-loader>) или пустую оболочку без состояния — парсер обязан поднять Blocked, переключиться
+        на настоящий Chromium и прочитать второй initialState через _JS_STATE."""
+        fast_timing(self)
+        ssr_bytes = self._ssr_html(aggregated=42, total=95).encode("utf-8")
+        sp_bytes = (
+            '<!DOCTYPE html><html><body><div id="id_spinner"><js-challenge-loader class="spinner-loader">'
+            '</js-challenge-loader></div><div id="id_captcha_frame_div" style="display: none;"></div></body></html>'
+        ).encode("utf-8")
+        state = {"cat_gets": 0, "mode": "servicepipe"}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = b'<html><head><title>Captcha - CIAN</title></head><body><form id="form_captcha"></form></body></html>'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                state["cat_gets"] += 1
+                # Первый GET — от быстрого HTTP-клиента; в режиме browser_soft_challenge и первый запрос Chromium получает заглушку
+                if state["cat_gets"] == 1:
+                    body = sp_bytes if state["mode"] != "empty_shell" else b"<html><body>empty shell</body></html>"
+                elif state["cat_gets"] == 2 and state["mode"] == "browser_soft_challenge":
+                    body = sp_bytes
+                else:
+                    body = ssr_bytes
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        base_url = f"http://127.0.0.1:{srv.server_port}"
+
+        orig_api = cian_mod.API
+        cian_mod.API = f"{base_url}/api"
+        self.addCleanup(setattr, cian_mod, "API", orig_api)
+
+        for mode, expected_gets in (("servicepipe", 2), ("empty_shell", 2), ("browser_soft_challenge", 3)):
+            with self.subTest(mode=mode):
+                state["cat_gets"] = 0
+                state["mode"] = mode
+                c = Cian(settings.load(), self.log.append, None, lambda **k: None)
+                c._page_url = lambda page, repair=None: f"{base_url}/cat.php?p={page}"
+                lb = LocalBrowser("cian", c.is_blocked, self.log.append, None, is_ready=c.is_ready, label="ЦИАН")
+                try:
+                    def get_lb():
+                        c.browser = lb
+                        return lb
+
+                    c.get_browser = get_lb
+                    offers, count = c._load(1)
+                    self.assertTrue(c.use_browser, f"{mode}: после блокировки HTTP должен включиться браузер")
+                    self.assertEqual(c.last_mode, "browser")
+                    self.assertEqual((offers, count), ([self.offer], 42))
+                    self.assertEqual(state["cat_gets"], expected_gets)
+                finally:
+                    lb.close()
 
 
 if __name__ == "__main__":
