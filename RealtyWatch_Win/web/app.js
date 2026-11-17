@@ -955,7 +955,7 @@ async function renderRuns() {
     <th class="num">Новых</th><th class="num">Изм.</th><th class="num">Снято</th><th>Итог</th><th></th></tr></thead><tbody>${runs.map(r => `<tr>
     <td><i class="sdot ${r.source}"></i> ${SRC[r.source]}</td><td><span class="st-badge ${r.status}" title="${esc(STATE_TIP[r.status] || "")}">${STATE[r.status] || r.status}</span></td>
     <td>${t(r.started)}</td><td>${t(r.finished)}</td><td>${r.mode}</td><td class="num">${r.pages ?? ""}</td>
-    <td class="num">${r.declared ?? ""}</td><td class="num ${r.declared && r.collected != null && r.collected < 0.95 * r.declared && r.source !== "avito" ? "bad" : ""}">${r.collected ?? r.found ?? ""}</td>
+    <td class="num">${r.declared ?? ""}</td><td class="num ${r.declared && r.collected != null && r.collected < (r.source === "cian" ? 0.85 : 0.95) * r.declared && r.source !== "avito" ? "bad" : ""}">${r.collected ?? r.found ?? ""}</td>
     <td class="num">${r.new ?? ""}</td><td class="num">${r.changed ?? ""}</td><td class="num">${r.removed ?? ""}</td><td>${esc(r.message || "")}</td>
     <td>${r.has_log ? `<button class="icon-btn" data-log="${r.id}" title="Подробный журнал прогона: каждый запрос, коды ответов, время, страницы выдачи, сохранённые при сбоях страницы">${ICON.list}</button>` : ""}</td></tr>`).join("")}</tbody></table></div>`
     : `<div class="empty"><b>Прогонов ещё не было</b>Запустите сбор данных в панели слева</div>${aboutTab("runs")}`;

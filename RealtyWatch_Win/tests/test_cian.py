@@ -8,7 +8,7 @@ import time
 from types import SimpleNamespace
 import unittest
 
-from app import db, net, rules, runlog, settings
+from app import db, net, rules, runlog, runner, settings
 from app.net import Blocked, Browser
 import app.scrapers.cian as cian_mod
 from app.scrapers.cian import Cian, SORT, parse_state
@@ -231,6 +231,134 @@ class CianRepair(unittest.TestCase):
     def _ssr_html_helper(self):
         return (f"<script>window._cianConfig['frontend-serp'].concat("
                 f"{json.dumps([{'key': 'initialState', 'value': {'results': {'aggregatedOffers': 1, 'totalOffers': 1, 'offers': [self.offer()]}}}])});</script>")
+
+    def test_incremental_coverage_88_percent_is_complete_below_85_is_partial(self):
+        self.c.finish(19, 18, 40, 432, 490)
+        self.assertTrue(self.c.complete)
+        self.assertEqual(self.c.incomplete_reason, "")
+
+        self.c.finish(19, 18, 40, 380, 490)
+        self.assertFalse(self.c.complete)
+        self.assertIn("меньше 85%", self.c.incomplete_reason)
+
+        self.c.finish(10, 18, 40, 450, 490)
+        self.assertFalse(self.c.complete)
+
+    def test_incremental_preserves_repair_only_listings_and_verifies_missing_main(self):
+        """Ускоренный сбор не трогает объявления, пришедшие ранее только из выдач по ремонту (in_main=False),
+        но исправно проверяет и снимает пропавшие из основной выдачи (in_main=True)."""
+        self.addCleanup(runner.SCRAPERS.__setitem__, "cian", Cian)
+        pool = [cian_offer(r) for r in listings("cian", 11)]
+        main_all, m_gone, ex = pool[:10], pool[9], pool[10]
+        main_id_gone, ex_id = str(m_gone["cianId"]), str(ex["cianId"])
+
+        class FullCian(Cian):
+            def _load(self, page, repair=None):
+                if repair == 2:
+                    return [ex], 1
+                if repair is None:
+                    return main_all, len(main_all)
+                return [], 0
+
+        run("cian", FullCian)
+        con = db.connect()
+        rows = {r["source_id"]: (r["active"], r["missed"], json.loads(r["raw"])["in_main"])
+                for r in con.execute("SELECT source_id, active, missed, raw FROM listings WHERE source='cian'")}
+        con.close()
+        self.assertEqual(rows[ex_id], (1, 0, False))
+        self.assertEqual(rows[main_id_gone], (1, 0, True))
+
+        verified = []
+
+        class IncCian(Cian):
+            def _load(self, page, repair=None):
+                if repair is None:
+                    return main_all[:-1], len(main_all) - 1
+                return [], 0
+
+            def verify(self, row):
+                verified.append(row["source_id"])
+                return None, None, None
+
+        for _ in range(3):
+            run("cian", IncCian)
+
+        self.assertNotIn(ex_id, verified, "объявление только из выдачи по ремонту не должно проверяться в ускоренном сборе")
+        self.assertEqual(verified.count(main_id_gone), 2, "пропавшее из основной выдачи проверяется до снятия на 2-й прогон")
+        con = db.connect()
+        ex_row = tuple(con.execute("SELECT active, missed FROM listings WHERE source='cian' AND source_id=?", (ex_id,)).fetchone())
+        gone_row = tuple(con.execute("SELECT active, missed FROM listings WHERE source='cian' AND source_id=?", (main_id_gone,)).fetchone())
+        con.close()
+        self.assertEqual(ex_row, (1, 0))
+        self.assertEqual(gone_row, (0, 2))
+
+    def test_legacy_rows_without_in_main_run_one_full_scan(self):
+        """Старая база без флага in_main в raw один раз проходит полный сбор, после чего работает ускоренно."""
+        a = self.offer()
+        legacy = self.c._normalize(a)
+        legacy["raw"].pop("in_main", None)
+        legacy["raw"]["repair"] = 2
+        con = db.connect()
+        db.upsert(con, legacy)
+        con.execute("INSERT OR REPLACE INTO meta VALUES('cian_repairs_ts', ?)", (str(time.time()),))
+        con.commit()
+        con.close()
+
+        calls1 = []
+        c1 = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        c1.wait = lambda *a, **k: None
+        c1._load = lambda page, repair=None: (calls1.append((page, repair)), ([a], 1) if repair in (2, None) else ([], 0))[1]
+        items1 = list(c1.listings())
+        self.assertEqual([r for _, r in calls1], [1, 2, 3, 4, None])
+        self.assertTrue(items1[0]["raw"]["in_main"])
+        con = db.connect()
+        for it in items1:
+            db.upsert(con, it)
+        con.commit()
+        con.close()
+
+        calls2 = []
+        c2 = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        c2.wait = lambda *a, **k: None
+        c2._load = lambda page, repair=None: (calls2.append((page, repair)), ([a], 1) if repair is None else ([], 0))[1]
+        list(c2.listings())
+        self.assertEqual(calls2, [(1, None)])
+
+    def test_incremental_opportunistic_repair_page_offers_yielded_without_duplicates(self):
+        """Попутные объявления с запрошенной в ускоренном сборе страницы ремонта отдаются без дублей и с in_main=False."""
+        a = self.offer()
+        items0, _ = self.run_listings({2: [a]}, [a])
+        con = db.connect()
+        for it in items0:
+            db.upsert(con, it)
+        con.commit()
+        con.close()
+
+        new_main = self.offer(description=BATHROOMS_ONLY)
+        new_main["bargainTerms"] = {"priceRur": 7_000_000}
+        extra_rep = self.offer()
+        extra_rep["bargainTerms"] = {"priceRur": 7_100_000}
+
+        c = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        c.wait = lambda *a, **k: None
+
+        def load(page, repair=None):
+            if repair is None:
+                return [a, new_main], 2
+            if repair == 1:
+                return [new_main, extra_rep, a], 3
+            return [], 0
+
+        c._load = load
+        items = list(c.listings())
+        self.assertEqual([i["source_id"] for i in items],
+                         [str(a["cianId"]), str(new_main["cianId"]), str(extra_rep["cianId"])])
+        by_id = {i["source_id"]: i for i in items}
+        self.assertTrue(by_id[str(a["cianId"])]["raw"]["in_main"])
+        self.assertTrue(by_id[str(new_main["cianId"])]["raw"]["in_main"])
+        self.assertFalse(by_id[str(extra_rep["cianId"])]["raw"]["in_main"])
+        self.assertEqual(by_id[str(new_main["cianId"])]["renovation"], "none")
+        self.assertEqual(by_id[str(extra_rep["cianId"])]["renovation"], "none")
 
 
 class CianStateAndFallback(Case):

@@ -143,10 +143,14 @@ _JS_STATE = """() => {
 class Cian(Scraper):
     name = "cian"
     label = "ЦИАН"
+    # В основной выдаче ЦИАН постранично схлопывает часть дублей от разных агентов: на 28 слотов
+    # приходится 22–27 карточек, поэтому за все страницы набирается ~88–90% от aggregatedOffers
+    MIN_COVERAGE = 0.85
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._api_blocked = False
+        self._known_extra_ids = set()
 
     def is_blocked(self, html, url):
         u = (url or "").lower()
@@ -329,13 +333,19 @@ class Cian(Scraper):
                 except (TypeError, ValueError):
                     ts = None
             known = {}
-            for r in con.execute("SELECT source_id, raw FROM listings WHERE source='cian'"):
+            extra_ids = set()
+            for r in con.execute("SELECT source_id, active, raw FROM listings WHERE source='cian'"):
                 try:
                     raw = json.loads(r["raw"]) if r["raw"] else None
                 except (TypeError, ValueError):
                     raw = None
+                if r["active"] and (not isinstance(raw, dict) or "repair" not in raw or "in_main" not in raw):
+                    return None  # миграция старой базы: один полный сбор проставит in_main всем активным объявлениям
                 if isinstance(raw, dict) and "repair" in raw:
-                    known[str(r["source_id"])] = raw["repair"]
+                    sid = str(r["source_id"])
+                    known[sid] = raw["repair"]
+                    if raw.get("in_main") is False:
+                        extra_ids.add(sid)
             if ts is None and any(v in REPAIR for v in known.values()):
                 last = con.execute("SELECT finished FROM runs WHERE source='cian' AND status='done' ORDER BY id DESC LIMIT 1").fetchone()
                 if last and last["finished"]:
@@ -345,6 +355,7 @@ class Cian(Scraper):
                         ts = None
             if not known or ts is None or (time.time() - ts) >= REPAIR_TTL:
                 return None
+            self._known_extra_ids = extra_ids
             return known
         except sqlite3.Error:
             return None
@@ -374,6 +385,7 @@ class Cian(Scraper):
             yield from self._listings_full(limit)
 
     def _listings_full(self, limit):
+        self.skip_missing_ids = set()
         queries = [(code, f"ремонт «{name}», ") for code, (_, name) in REPAIR.items()] + [(None, "")]
         # 0. Первые страницы всех выдач — по ним известно, сколько страниц всего, и полоса прогресса
         # идёт одна на весь сбор, а не заново для каждой выдачи
@@ -400,7 +412,7 @@ class Cian(Scraper):
         ids, total = set(), None
         for _page, _pages, total, offers in self._pages(None, "", first[None]):
             for o in offers:
-                item = self._normalize(o)
+                item = self._normalize(o, in_main=True)
                 if item["source_id"] not in ids:
                     ids.add(item["source_id"])
                     yield item
@@ -409,7 +421,7 @@ class Cian(Scraper):
         for sid, o in extra.items():
             if sid not in ids:
                 ids.add(sid)
-                yield self._normalize(o)
+                yield self._normalize(o, in_main=False)
         self._log_repairs(ids)
         self.finish(*last, len(ids), total)
         if self.complete and self.repairs:
@@ -417,6 +429,7 @@ class Cian(Scraper):
 
     def _listings_incremental(self, limit, known):
         """Ускоренный сбор: основная выдача; выдачи по ремонту — только если встретились новые объявления."""
+        self.skip_missing_ids = set()
         first_main = self._load(1, None)
         self.declared_main = first_main[1]
         self.planned = min(self._count(self.declared_main), limit)
@@ -431,6 +444,7 @@ class Cian(Scraper):
                     main_offers.append((sid, o))
         last = self.last_pages
         self.repairs = {sid: code for sid, code in known.items() if code in REPAIR}
+        extra_offers = {}
         unknown = [(sid, o) for sid, o in main_offers if sid not in known]
         if not unknown:
             self.log(f"выдачи по виду ремонта пропущены: все {len(main_offers)} объявлений уже есть в базе")
@@ -453,7 +467,9 @@ class Cian(Scraper):
                     self.log(f"{label}страница {r_page}/{self._count(r_total)}: {len(offers)} объявлений")
                     self.step()
                     for o in offers:
-                        self.repairs[str(o.get("cianId") or o.get("id"))] = code
+                        r_sid = str(o.get("cianId") or o.get("id"))
+                        self.repairs[r_sid] = code
+                        extra_offers[r_sid] = o
                     if unknown_ids <= self.repairs.keys():
                         break
                     if max_price is not None and offers:
@@ -463,7 +479,12 @@ class Cian(Scraper):
                             break
                     r_page += 1
         for _, o in main_offers:
-            yield self._normalize(o)
+            yield self._normalize(o, in_main=True)
+        for sid, o in extra_offers.items():
+            if sid not in seen_ids:
+                seen_ids.add(sid)
+                yield self._normalize(o, in_main=False)
+        self.skip_missing_ids = getattr(self, "_known_extra_ids", set()) - seen_ids
         self._log_repairs(seen_ids)
         self.finish(*last, len(seen_ids), main_total)
 
@@ -511,7 +532,7 @@ class Cian(Scraper):
             return "removed", f"на ЦИАН статус объявления «{STATUS.get(status) or 'в архиве'}»", price
         return None, None, None  # незнакомый статус — не гадаем
 
-    def _normalize(self, o):
+    def _normalize(self, o, in_main=True):
         bt = o.get("bargainTerms") or {}
         geo = o.get("geo") or {}
         c = geo.get("coordinates") or {}
@@ -563,6 +584,6 @@ class Cian(Scraper):
             "published_at": ts_to_iso(o.get("addedTimestamp")),
             "fetch_mode": self.last_mode,
             "raw": {"category": o.get("category"), "flatType": o.get("flatType"), "decoration": o.get("decoration"),
-                    "repair": repair, "apartments": bool(o.get("isApartments")),
+                    "repair": repair, "in_main": bool(in_main), "apartments": bool(o.get("isApartments")),
                     "isApartments": o.get("isApartments"), "creationDate": o.get("creationDate")},
         }

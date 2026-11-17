@@ -235,11 +235,13 @@ class RunManager:
         Снятым считается только то, что сайт явно показывает снятым (статус, закрыто) или не находит (404,
         редирект в каталог). Если проверить не удалось, объявление остаётся в продаже с отметкой «нет в поиске»
         (счётчик missed) и проверяется снова в следующем прогоне. Возвращает (снято, примечания к итогу)."""
-        cand = db.missing(con, scraper.name, seen)
+        skip = {str(x) for x in (getattr(scraper, "skip_missing_ids", None) or ())}
+        cand = [r for r in db.missing(con, scraper.name, seen) if str(r["source_id"]) not in skip]
         if not cand:
             return 0, []
-        limit_n, expected, tau, gap = mass_limit(con, scraper.name, prev_seen, started)
-        active = len(prev_seen)
+        eff_prev = {k: v for k, v in prev_seen.items() if str(k) not in skip} if skip else prev_seen
+        limit_n, expected, tau, gap = mass_limit(con, scraper.name, eff_prev, started)
+        active = len(eff_prev)
         if len(cand) > limit_n:
             scraper.complete = False
             scraper.incomplete_reason = f"пропало {len(cand)} из {active} за {gap:g} дн. — больше допуска {limit_n:.0f}"

@@ -65,13 +65,20 @@ class CianRemoval(Case):
         self.assertEqual(counts("cian"), self.base)
         self.assertEqual(last_run()["status"], "error")
 
-    def test_coverage_below_95_percent_is_partial(self):
-        run("cian", cian(self.rows, per_page=24, verify=lambda r: ("removed", "не должно вызываться", None)))
+    def test_coverage_below_85_percent_is_partial(self):
+        # 21*4 + 8 = 92 из 120 (76.7% < 85%) — неполный прогон, снятие не проверяется
+        run("cian", cian(self.rows, per_page=21, verify=lambda r: ("removed", "не должно вызываться", None)))
         self.assertEqual(counts("cian")["removed"], 0)
         r = last_run()
         self.assertEqual(r["status"], "partial")
         self.assertEqual(r["declared"], len(self.rows))
-        self.assertLess(r["collected"], 0.95 * len(self.rows))
+        self.assertLess(r["collected"], Cian.MIN_COVERAGE * len(self.rows))
+        # 24*4 + 8 = 104 из 120 (86.7% >= 85%) — типичное схлопывание дублей в основной выдаче ЦИАН, прогон полный
+        run("cian", cian(self.rows, per_page=24, verify=lambda r: ("active", "опубликовано", None)))
+        r2 = last_run()
+        self.assertEqual(r2["status"], "done")
+        self.assertEqual(r2["collected"], 104)
+        self.assertGreaterEqual(r2["collected"], Cian.MIN_COVERAGE * len(self.rows))
 
     def test_confirmed_at_once_and_lost_after_two_runs(self):
         miss = self.rows[-10:]

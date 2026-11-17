@@ -61,6 +61,7 @@ class Scraper:
         self.incomplete_reason = "прогон не дошёл до конца выдачи"
         self.declared = None  # сколько объявлений заявил сайт
         self.bans = 0         # ограничений IP за прогон
+        self.skip_missing_ids = set()  # source_id из узких выдач, не ожидаемые в сокращённом сборе
 
     # --- переопределяется в наследниках ---
     def is_blocked(self, html, url):
