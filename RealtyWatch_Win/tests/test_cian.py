@@ -12,7 +12,7 @@ from app import db, net, rules, runlog, runner, settings
 from app.net import Blocked, Browser
 import app.scrapers.cian as cian_mod
 from app.scrapers.cian import Cian, SORT, parse_state
-from tests.support import Case, LocalBrowser, cian_offer, fast_timing, has_browser, isolate, listings, run
+from tests.support import Case, LocalBrowser, cian_offer, fast_timing, has_browser, isolate, last_run, listings, run
 
 # Описание объявления 333647311 по сути: ремонт сделан только в санузлах, а в «О квартире» — «без ремонта»
 BATHROOMS_ONLY = "Вид неописуемый. Внутри сделан хороший ремонт в санузлах (ванная и туалет полностью готовы)."
@@ -359,6 +359,62 @@ class CianRepair(unittest.TestCase):
         self.assertFalse(by_id[str(extra_rep["cianId"])]["raw"]["in_main"])
         self.assertEqual(by_id[str(new_main["cianId"])]["renovation"], "none")
         self.assertEqual(by_id[str(extra_rep["cianId"])]["renovation"], "none")
+
+    def test_incremental_ignores_off_search_active_rows_without_in_main(self):
+        """Старая active=1 запись без in_main и repair (вне поиска, verify -> active) не блокирует
+        ускоренный режим после первого успешного полного сбора."""
+        self.addCleanup(runner.SCRAPERS.__setitem__, "cian", Cian)
+        pool = [cian_offer(r) for r in listings("cian", 11)]
+        off_search, main_pool = pool[0], pool[1:]
+        off_id = str(off_search["cianId"])
+
+        legacy_off = self.c._normalize(off_search)
+        legacy_off["raw"] = {"category": "flatSale", "apartments": False}  # ни "repair", ни "in_main"
+        con = db.connect()
+        db.upsert(con, legacy_off)
+        for o in main_pool:
+            it = self.c._normalize(o)
+            it["raw"].pop("in_main", None)
+            it["raw"]["repair"] = 2
+            db.upsert(con, it)
+        con.execute("INSERT OR REPLACE INTO meta VALUES('cian_repairs_ts', ?)", (str(time.time()),))
+        con.commit()
+        con.close()
+
+        calls = []
+        verified = []
+
+        class ProbeCian(Cian):
+            def _load(self, page, repair=None):
+                calls.append((page, repair))
+                if repair == 2:
+                    return [main_pool[0]], 1
+                if repair is None:
+                    return main_pool, len(main_pool)
+                return [], 0
+
+            def verify(self, row):
+                verified.append(row["source_id"])
+                return "active", "на ЦИАН объявление опубликовано, цена вне фильтра", None
+
+        run("cian", ProbeCian)
+        self.assertEqual(last_run()["status"], "done")
+        self.assertEqual([r for _, r in calls], [1, 2, 3, 4, None])
+        self.assertEqual(verified, [off_id])
+
+        con = db.connect()
+        row = con.execute("SELECT active, missed, raw FROM listings WHERE source='cian' AND source_id=?", (off_id,)).fetchone()
+        con.close()
+        self.assertEqual((row["active"], row["missed"]), (1, 0))
+        self.assertNotIn("in_main", json.loads(row["raw"]))
+        self.assertNotIn("repair", json.loads(row["raw"]))
+
+        calls.clear()
+        verified.clear()
+        run("cian", ProbeCian)
+        self.assertEqual(last_run()["status"], "done")
+        self.assertEqual(calls, [(1, None)], "второй прогон идёт в ускоренном режиме несмотря на внепоисковую active=1 запись")
+        self.assertEqual(verified, [off_id])
 
 
 class CianStateAndFallback(Case):

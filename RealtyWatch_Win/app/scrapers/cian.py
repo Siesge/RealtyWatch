@@ -15,6 +15,7 @@ API = "https://api.cian.ru/search-offers/v2/search-offers-desktop/"
 PAGE_SIZE = 28
 HTTP_BLOCK_TTL = 12 * 3600  # сколько не повторять заведомо заблокированный HTTP-поиск в режиме auto
 REPAIR_TTL = 24 * 3600      # как часто обновлять виды ремонта для всей выдачи (полный проход 1..4)
+IN_MAIN_VER = "1"           # версия разметки raw.in_main в meta.cian_in_main_ver после полного сбора
 
 DECORATION = {"without": "none", "rough": "none", "preFine": "none", "fine": "finish"}
 # Вид ремонта из раздела «О квартире». В выдаче поиска ЦИАН его нет (проверено на ответе API 11 ноября 2026:
@@ -325,6 +326,9 @@ class Cian(Scraper):
         except sqlite3.Error:
             return None
         try:
+            ver_row = con.execute("SELECT value FROM meta WHERE key='cian_in_main_ver'").fetchone()
+            if not ver_row or ver_row["value"] != IN_MAIN_VER:
+                return None  # разметка in_main ещё не завершена успешным полным сбором
             row = con.execute("SELECT value FROM meta WHERE key='cian_repairs_ts'").fetchone()
             ts = None
             if row:
@@ -339,12 +343,12 @@ class Cian(Scraper):
                     raw = json.loads(r["raw"]) if r["raw"] else None
                 except (TypeError, ValueError):
                     raw = None
-                if r["active"] and (not isinstance(raw, dict) or "repair" not in raw or "in_main" not in raw):
-                    return None  # миграция старой базы: один полный сбор проставит in_main всем активным объявлениям
+                # Отдельные active-строки без "repair"/"in_main" (например, ушедшие с поиска или за границу
+                # цены, которые verify() оставляет active=1 без upsert) не должны блокировать ускоренный режим
                 if isinstance(raw, dict) and "repair" in raw:
                     sid = str(r["source_id"])
                     known[sid] = raw["repair"]
-                    if raw.get("in_main") is False:
+                    if r["active"] and raw.get("in_main") is False:
                         extra_ids.add(sid)
             if ts is None and any(v in REPAIR for v in known.values()):
                 last = con.execute("SELECT finished FROM runs WHERE source='cian' AND status='done' ORDER BY id DESC LIMIT 1").fetchone()
@@ -367,6 +371,7 @@ class Cian(Scraper):
             con = db.connect()
             try:
                 con.execute("INSERT OR REPLACE INTO meta VALUES('cian_repairs_ts', ?)", (str(time.time()),))
+                con.execute("INSERT OR REPLACE INTO meta VALUES('cian_in_main_ver', ?)", (IN_MAIN_VER,))
                 con.commit()
             finally:
                 con.close()
