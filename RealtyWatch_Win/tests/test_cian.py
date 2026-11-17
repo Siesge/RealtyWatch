@@ -4,14 +4,15 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 
-from app import rules, settings
+from app import db, net, rules, runlog, settings
 from app.net import Blocked, Browser
 import app.scrapers.cian as cian_mod
 from app.scrapers.cian import Cian, SORT, parse_state
-from tests.support import Case, LocalBrowser, cian_offer, fast_timing, has_browser, isolate, listings
+from tests.support import Case, LocalBrowser, cian_offer, fast_timing, has_browser, isolate, listings, run
 
 # Описание объявления 333647311 по сути: ремонт сделан только в санузлах, а в «О квартире» — «без ремонта»
 BATHROOMS_ONLY = "Вид неописуемый. Внутри сделан хороший ремонт в санузлах (ванная и туалет полностью готовы)."
@@ -131,6 +132,105 @@ class CianRepair(unittest.TestCase):
         self.run_listings({}, [self.offer(), self.offer()])
         warn = [m for m in self.log if m.startswith("⚠ вид ремонта ЦИАН не определён ни у одного из 2 объявлений")]
         self.assertEqual(len(warn), 1, self.log)
+
+    def test_incremental_skips_repair_queries_for_known_offers_and_updates_new(self):
+        """Если виды ремонта недавно собирались: известные объявления не перезапрашиваются (идёт только
+        основная выдача), а для нового дешёвого объявления выдачи по ремонту останавливаются сразу, как оно найдено."""
+        a = self.offer()
+        b = self.offer()
+        items1, calls1 = self.run_listings({2: [a]}, [a, b])
+        self.assertEqual([c[1] for c in calls1], [1, 2, 3, 4, None])
+        con = db.connect()
+        for it in items1:
+            db.upsert(con, it)
+        con.commit()
+        con.close()
+
+        # Повторный запуск сразу после первого: оба объявления уже в базе — идём только в основную выдачу
+        c2 = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        c2.wait = lambda *a, **k: None
+        calls2 = []
+
+        def load2(page, repair=None):
+            calls2.append((page, repair))
+            return ([], 0) if repair else ([a, b], 2)
+
+        c2._load = load2
+        items2 = list(c2.listings())
+        self.assertEqual(calls2, [(1, None)], "выдачи по виду ремонта пропущены")
+        self.assertEqual({i["source_id"]: i["renovation"] for i in items2}[str(a["cianId"])], "cosmetic")
+
+        # Появилось новое дешёвое объявление с кодом ремонта 1 («без ремонта»): проверяется 1-я выдача и стоп
+        cheap = self.offer(description=BATHROOMS_ONLY)
+        cheap["bargainTerms"] = {"priceRur": 7_000_000}
+        calls3 = []
+
+        def load3(page, repair=None):
+            calls3.append((page, repair))
+            return ([cheap], 1) if repair == 1 else ([], 0) if repair else ([a, b, cheap], 3)
+
+        c3 = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        c3.wait = lambda *a, **k: None
+        c3._load = load3
+        items3 = list(c3.listings())
+        self.assertEqual(calls3, [(1, None), (1, 1)], "коды 2..4 не запрашивались — все новые уже нашлись")
+        self.assertEqual({i["source_id"]: i["renovation"] for i in items3}[str(cheap["cianId"])], "none")
+
+    def test_expired_repair_ts_runs_full_repair_scan(self):
+        a = self.offer()
+        items, _ = self.run_listings({3: [a]}, [a])
+        con = db.connect()
+        db.upsert(con, items[0])
+        con.execute("INSERT OR REPLACE INTO meta VALUES('cian_repairs_ts', ?)", (str(time.time() - cian_mod.REPAIR_TTL - 60),))
+        con.commit()
+        con.close()
+        calls = []
+        c = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        c.wait = lambda *a, **k: None
+
+        def load_exp(page, repair=None):
+            calls.append((page, repair))
+            return ([a], 1) if repair in (3, None) else ([], 0)
+
+        c._load = load_exp
+        list(c.listings())
+        self.assertEqual([r for _, r in calls], [1, 2, 3, 4, None])
+        con = db.connect()
+        ts_val = float(con.execute("SELECT value FROM meta WHERE key='cian_repairs_ts'").fetchone()[0])
+        con.close()
+        self.assertLess(time.time() - ts_val, 60)
+
+    def test_cached_http_block_skips_http_probes_and_auto_drops_block_snapshots(self):
+        """В режиме auto: первая HTTP-блокировка пишет кэш на 12 ч и не плодит снимки; следующий прогон сразу идёт в браузер."""
+        cfg = settings.load()
+        cfg["sites"]["cian"]["mode"] = "auto"
+        settings.save(cfg)
+
+        c1 = Cian(cfg, self.log.append, None, lambda **k: None)
+        snaps = []
+        c1.runlog = SimpleNamespace(request=lambda *a: None, line=lambda *a: None,
+                                  snapshot=lambda body, reason, ext="html": snaps.append((reason, ext)))
+        self.assertFalse(c1.http.save_block_snapshots, "в auto снимок HTTP-заглушки не нужен")
+        c1.http.post = lambda *a, **k: (_ for _ in ()).throw(Blocked("HTTP 200 api-captcha"))
+        c1.http.get = lambda *a, **k: (_ for _ in ()).throw(Blocked("HTTP 200 servicepipe"))
+        ssr = self._ssr_html_helper()
+        fake_b = SimpleNamespace(goto=lambda u: ssr, evaluate=lambda js: {"offers": [self.offer()], "total": 1, "aggregated": 1}, raw_html=lambda: ssr)
+        c1.get_browser = lambda: fake_b
+        self.assertEqual(c1._load(1)[1], 1)
+        self.assertEqual(snaps, [], "в auto рутинная HTTP-блокировка не сохраняется в snapshots")
+        self.assertTrue(c1._http_state_file().exists())
+
+        c2 = Cian(cfg, self.log.append, None, lambda **k: None)
+        c2.wait = lambda *a, **k: None
+        c2.http.post = lambda *a, **k: self.fail("при свежем http_state.json HTTP API вызываться не должен")
+        c2.http.get = lambda *a, **k: self.fail("при свежем http_state.json HTTP cat.php вызываться не должен")
+        c2.get_browser = lambda: fake_b
+        list(c2.listings())
+        self.assertTrue(c2.use_browser)
+
+    def _ssr_html_helper(self):
+        return (f"<script>window._cianConfig['frontend-serp'].concat("
+                f"{json.dumps([{'key': 'initialState', 'value': {'results': {'aggregatedOffers': 1, 'totalOffers': 1, 'offers': [self.offer()]}}}])});</script>")
 
 
 class CianStateAndFallback(Case):

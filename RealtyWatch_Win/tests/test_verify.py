@@ -64,6 +64,21 @@ class AvitoVerify(unittest.TestCase):
         with self.assertRaises(Blocked):
             self.a.verify(ROW)
 
+    def test_repeated_unknown_pages_save_one_snapshot_and_abort(self):
+        snaps = []
+        self.a.runlog = type("RL", (), {"snapshot": lambda _s, body, reason, ext="html": snaps.append((body, reason))})()
+        stub = "<html><body><div>Заглушка без карточки</div></body></html>"
+        for _ in range(3):
+            self.assertIsNone(self.check(stub, ROW["url"], 200))
+        self.assertEqual(len(snaps), 1, "диагностический снимок пишется один раз за прогон")
+        # Успешная проверка сбрасывает счётчик неузнанных страниц
+        self.assertEqual(self.check(avito_item(False), ROW["url"], 200), "active")
+        for _ in range(3):
+            self.assertIsNone(self.check(stub, ROW["url"], 200))
+        with self.assertRaises(Blocked):
+            self.check(stub, ROW["url"], 200)
+        self.assertEqual(len(snaps), 1)
+
 
 class CianVerify(unittest.TestCase):
     def setUp(self):

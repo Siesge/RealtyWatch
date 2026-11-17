@@ -201,10 +201,60 @@ def assign(con, source, source_id):
 
 
 def rebuild(con):
-    """Полный пересчёт объектов (после импорта, смены правил)."""
-    con.execute("UPDATE listings SET object_id=NULL")
-    keys = con.execute("SELECT source, source_id FROM listings ORDER BY first_seen, source, source_id").fetchall()
-    for k in keys:
-        assign(con, k["source"], k["source_id"])
+    """Полный пересчёт объектов в памяти (один проход и один пакетный UPDATE вместо тысяч запросов к SQLite)."""
+    rows = [dict(r) for r in con.execute(f"SELECT {COLS} FROM listings ORDER BY first_seen, source, source_id")]
+    if not rows:
+        return 0
+    by_rf = {}       # (rooms, floor) → список уже обработанных объявлений
+    by_ycluster = {} # cluster_key Яндекса → список уже обработанных объявлений Яндекса
+    groups = {}      # object_id → список объявлений группы
+    for me in rows:
+        me["object_id"] = None
+        seen_other = set()
+        cand_rows = []
+        if me["rooms"] is not None and me["floor"]:
+            lat, lon = me["lat"], me["lon"]
+            for o in by_rf.get((me["rooms"], me["floor"]), ()):
+                if lat is None or o["lat"] is None or (
+                    lat - _DEG <= o["lat"] <= lat + _DEG and lon - _DEG * 1.4 <= o["lon"] <= lon + _DEG * 1.4
+                ):
+                    k = (o["source"], o["source_id"])
+                    if k not in seen_other:
+                        seen_other.add(k)
+                        cand_rows.append(o)
+        if me["source"] == "yandex" and me["cluster_key"]:
+            for o in by_ycluster.get(me["cluster_key"], ()):
+                k = (o["source"], o["source_id"])
+                if k not in seen_other:
+                    seen_other.add(k)
+                    cand_rows.append(o)
+        cands = {}
+        for other in cand_rows:
+            oid_o = other["object_id"]
+            if oid_o:
+                if strict_object(me, other):
+                    cands[oid_o] = True
+                elif near_object(me, other):
+                    cands.setdefault(oid_o, False)
+        group = [me]
+        linked = set()
+        for oid_c in sorted(cands, key=lambda o: (not cands[o], -len(groups[o]), o)):
+            extra = groups[oid_c]
+            if all(compatible(a, b) for a in extra for b in group):
+                linked.add(oid_c)
+                group.extend(extra)
+        oid = min(linked) if linked else f"{me['source']}:{me['source_id']}"
+        for old_oid in linked:
+            if old_oid != oid:
+                groups.pop(old_oid, None)
+        for m in group:
+            m["object_id"] = oid
+        groups[oid] = group
+        if me["rooms"] is not None and me["floor"]:
+            by_rf.setdefault((me["rooms"], me["floor"]), []).append(me)
+        if me["source"] == "yandex" and me["cluster_key"]:
+            by_ycluster.setdefault(me["cluster_key"], []).append(me)
+    con.executemany("UPDATE listings SET object_id=? WHERE source=? AND source_id=?",
+                    [(r["object_id"], r["source"], r["source_id"]) for r in rows])
     con.commit()
-    return con.execute("SELECT COUNT(DISTINCT object_id) FROM listings").fetchone()[0]
+    return len(groups)

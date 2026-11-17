@@ -457,17 +457,21 @@ function dropsBlock() {
       const before = h.filter(x => new Date(x[0]).getTime() <= from);
       const p0 = before.length ? before[before.length - 1][1] : h[0][1];
       const d = pct(i.price, p0);
-      if (d < 0 && (!best || d < best.d)) best = { d, p0, p1: i.price, src: i.source };
+      if (d < 0 && (!best || d < best.d)) best = { d, p0, p1: i.price, src: i.source, relisted: false };
+    }
+    if (o.relisted && o.relisted.diff < 0 && new Date(o.relisted.newFirst || 0).getTime() >= from) {
+      if (!best || o.relisted.pct < best.d)
+        best = { d: o.relisted.pct, p0: o.relisted.old, p1: o.relisted.now, src: o.relisted.oldSrc, relisted: true };
     }
     if (best) rows.push({ o, ...best });
   }
   rows.sort((a, b) => a.d - b.d);
   if (!rows.length) return `<div class="empty small"><b>Снижений цены пока нет</b>За выбранный период ни одна подходящая квартира${DASH_ZONE ? " в круге" : ""} не подешевела. Как только продавцы начнут снижать цены, самые сильные снижения появятся здесь — с этими продавцами проще торговаться.</div>`;
   const days = o => Math.max(0, Math.round((now - new Date(o.first_seen).getTime()) / 864e5));
-  return `<div class="drops">${rows.slice(0, 8).map(({ o, d, p0, p1, src }) => `<button class="drop" data-card="${esc(o.id)}" title="${esc(`${o.address || ""}\n${SRC[src]}: ${fmt(p0)} → ${fmt(p1)} ₽ (${signed(d)}). Клик — карточка в подборке`)}">
+  return `<div class="drops">${rows.slice(0, 8).map(({ o, d, p0, p1, src, relisted }) => `<button class="drop" data-card="${esc(o.id)}" title="${esc(`${o.address || ""}\n${relisted ? `Перевыставлено дешевле (ранее ${SRC[src]}): ` : `${SRC[src]}: `}${fmt(p0)} → ${fmt(p1)} ₽ (${signed(d)}). Клик — карточка в подборке`)}">
       <span class="d-main"><b>${o.rooms === 0 ? "студия" : `${o.rooms}-к`}, ${o.area} м²</b> <span class="meta">${esc(shortAddr(o.address))}</span></span>
       <span class="d-price">${mln(p0)} → <b>${mln(p1)}</b> млн</span>
-      <span class="d-pct">${signed(d)}</span>
+      <span class="d-pct">${relisted ? "↻ " : ""}${signed(d)}</span>
       <span class="d-age">${days(o)} дн.</span></button>`).join("")}
     ${rows.length > 8 ? `<div class="meta d-more">ещё ${rows.length - 8} ${plural(rows.length - 8, "квартира", "квартиры", "квартир")} подешевели</div>` : ""}</div>`;
 }
@@ -634,12 +638,20 @@ function paintChanges() {
   el.querySelectorAll("[data-open]").forEach(b => b.onclick = () => openObject(b.dataset.open));
 }
 
-function eventText(e) {
+function eventText(e, o) {
   if (e.k === "down" || e.k === "up") {
     const d = e.new_value - e.old_value;
     return `цена ${mln(e.old_value)} → <b>${mln(e.new_value)} млн</b> <span class="${d < 0 ? "good" : "bad"}">(${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽, ${signed(pct(e.new_value, e.old_value))})</span>`;
   }
-  if (e.k === "new") return `новое объявление, ${fmt(e.new_value)} ₽`;
+  if (e.k === "new") {
+    let tail = "";
+    const it = o && o.items.find(i => i.source === e.source && i.source_id === e.source_id);
+    if (o && o.relisted && (!it || it.active) && e.new_value && Math.abs(e.new_value - o.relisted.old) >= 50000) {
+      const d = e.new_value - o.relisted.old;
+      tail = ` · <span class="${d < 0 ? "good" : "bad"}" title="${esc(`Ранее эта же квартира продавалась на ${SRC[o.relisted.oldSrc]} за ${fmt(o.relisted.old)} ₽`)}">↻ перевыставлено (${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽ к прежним ${mln(o.relisted.old)} млн)</span>`;
+    }
+    return `новое объявление, ${fmt(e.new_value)} ₽${tail}`;
+  }
   if (e.k === "removed") return `снято с продажи: ${esc(e.note || "")}`;
   if (e.k === "returned") return `снова в продаже${e.new_value ? `, ${fmt(e.new_value)} ₽` : ""}`;
   return e.kind;
@@ -663,7 +675,7 @@ function changeTile(t) {
           ? `<span class="off-link" title="${esc(offTip(it, o.active))}">${ICON.noext}</span>`
           : `<a href="${esc(e.url)}" target="_blank" rel="noopener" title="Открыть объявление на ${SRC[e.source]}">${ICON.ext}</a>`;
         return `<li title="${esc(KIND[e.k].tip + " — " + tsLabel(e.ts))}"><span class="kbadge ${KIND[e.k].cls}">${KIND[e.k].label}</span>
-        <span class="ch-when">${tsLabel(e.ts)}</span><i class="sdot ${e.source}" title="${SRC[e.source]}"></i> <span>${SRC[e.source]}: ${eventText(e)}</span>
+        <span class="ch-when">${tsLabel(e.ts)}</span><i class="sdot ${e.source}" title="${SRC[e.source]}"></i> <span>${SRC[e.source]}: ${eventText(e, o)}</span>
         ${link}</li>`;
       }).join("")}</ul>
       ${o ? `<div class="ch-acts"><button class="btn-sec sm" data-card="${esc(o.id)}" title="Открыть эту квартиру в подборке">В подборке</button>
@@ -709,8 +721,33 @@ async function initSound() {
   };
 }
 
-// ---------- окно объекта: история цен ----------
-function openObject(id) {
+// ---------- окно объекта: история цен и личная заметка ----------
+async function saveObjectNote(o, rawText) {
+  const btn = $("#noteSave"), del = $("#noteDel");
+  if (btn) btn.disabled = true;
+  if (del) del.disabled = true;
+  try {
+    const r = await post("/api/note", { keys: o.items.map(key), text: rawText });
+    o.note = r.text;
+    o.note_ts = r.ts;
+    o.items.forEach(i => { i.note = r.text; i.note_ts = r.ts; });
+    o.text = [...o.items.map(i => `${i.title} ${i.address} ${i.description}`), o.note].join(" ").toLowerCase();
+    const ta = $("#objNote");
+    if (ta) ta.value = r.text;
+    const st = $("#noteStatus");
+    if (st) st.textContent = r.ts ? `сохранено ${tsLabel(r.ts)}` : "хранится только у вас, в базе";
+    if (del) del.classList.toggle("hidden", !r.text);
+    if (["cards", "table", "map", "changes"].includes(view)) render();
+    toast("ok", r.text ? "Заметка сохранена" : "Заметка удалена", r.text ? "Она видна на карточке и в выгрузке избранного" : "");
+  } catch (e) {
+    toast("warn", "Не удалось сохранить заметку", e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+    if (del) del.disabled = false;
+  }
+}
+
+function openObject(id, focusNote = false) {
   const o = OBJS.find(x => x.id === id);
   if (!o) return;
   const changed = o.items.some(i => lastChange(i));
@@ -724,6 +761,17 @@ function openObject(id) {
         <div class="m-price" title="Минимальная цена среди активных объявлений">${fmt(o.price)} ₽ <span class="meta">${fmt(o.price_m2)} ₽/м²</span> ${oldPrice(o)}</div>
         <div class="tags">${tags(o)}</div>
         ${offers(o)}
+        <div class="m-note">
+          <label for="objNote">Личная заметка</label>
+          <textarea id="objNote" rows="2" maxlength="2000" placeholder="Впечатления от квартиры, контакты, итог звонка, условия торга…">${esc(o.note || "")}</textarea>
+          <div class="m-note-acts">
+            <span class="meta" id="noteStatus">${o.note_ts ? `сохранено ${tsLabel(o.note_ts)}` : "хранится только у вас, в базе"}</span>
+            <span class="m-note-btns">
+              <button type="button" class="btn-sec sm ${o.note ? "" : "hidden"}" id="noteDel">Очистить</button>
+              <button type="button" class="btn-pri sm" id="noteSave">${ICON.ok}Сохранить заметку</button>
+            </span>
+          </div>
+        </div>
       </div>
     </div>
     <div class="m-chart-head"><h3>История цен по сайтам</h3><span class="meta">${changed ? "ступенька — изменение цены" : "цена не менялась с момента появления в базе"}</span>
@@ -733,6 +781,11 @@ function openObject(id) {
     ${desc ? `<details class="m-desc"><summary>Описание</summary><p>${esc(desc)}</p></details>` : ""}`;
   $("#modal").classList.remove("hidden");
   drawObjectChart(o);
+  const ta = $("#objNote");
+  $("#noteSave").onclick = () => saveObjectNote(o, ta.value);
+  $("#noteDel").onclick = () => saveObjectNote(o, "");
+  ta.onkeydown = e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveObjectNote(o, ta.value); } };
+  if (focusNote) requestAnimationFrame(() => ta.focus());
 }
 
 function priceTable(o) {

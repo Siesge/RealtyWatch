@@ -340,3 +340,49 @@ class ImportAndImagesCache(Case):
         meta = c2.execute("SELECT value FROM meta WHERE key='dedupe_rules'").fetchone()
         self.assertEqual(meta["value"], str(dedupe.RULES_VERSION))
         self.assertGreaterEqual(c2.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 1)
+
+
+class ListingsPayloadAndNotes(Case):
+    """Облегчённый /api/listings (apartments вместо raw) и личные заметки к квартире (API, очистка, перенос)."""
+
+    def test_listings_drops_raw_and_exposes_apartments_and_notes(self):
+        c = con()
+        db.upsert(c, {
+            "source": "cian", "source_id": "101", "url": "https://cian.test/101", "title": "1-к., 40 м²",
+            "price": 9_000_000, "rooms": 1, "area": 40.0, "floor": 2, "floors": 5,
+            "address": "Ялта, ул. Морская, 1", "raw": {"isApartments": True, "repair": 2, "huge": "x" * 500},
+        })
+        db.upsert(c, {
+            "source": "avito", "source_id": "202", "url": "https://avito.test/202", "title": "1-к., 40 м²",
+            "price": 9_100_000, "rooms": 1, "area": 40.0, "floor": 2, "floors": 5,
+            "address": "Ялта, ул. Морская, 1", "raw": {"apartments": False},
+        })
+        c.commit()
+        dedupe.rebuild(c)
+        c.close()
+
+        rows = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertNotIn("raw", rows["cian:101"])
+        self.assertTrue(rows["cian:101"]["apartments"])
+        self.assertFalse(rows["avito:202"]["apartments"])
+
+        # Сохранение и очистка заметки
+        server.note_set({"keys": ["cian:101", "avito:202"], "text": "  Вид во двор, торг до 8,8  "})
+        rows2 = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertEqual(rows2["cian:101"]["note"], "Вид во двор, торг до 8,8")
+        self.assertEqual(rows2["avito:202"]["note"], "Вид во двор, торг до 8,8")
+
+        # Экспорт → полная очистка → слияние сохраняет заметку
+        zip_path = self.dir / "with-note.zip"
+        transfer.export_zip(zip_path, with_images=False)
+        purge.clear_all()
+        c = con()
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM notes").fetchone()[0], 0)
+        c.close()
+        transfer.import_zip(zip_path, mode="merge")
+        rows3 = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertEqual(rows3["cian:101"]["note"], "Вид во двор, торг до 8,8")
+
+        # Пустой текст удаляет заметку
+        server.note_set({"keys": ["cian:101", "avito:202"], "text": ""})
+        self.assertEqual([r["note"] for r in server.listings()], ["", ""])

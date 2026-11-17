@@ -260,7 +260,6 @@ class RunManager:
                 except (Blocked, IpBanned) as e:
                     aborted = f"{type(e).__name__}: {e}"
                     lg(f"⚠ проверка страниц прервана — сайт ограничил доступ ({e}); остальные проверю в следующий раз")
-                pause((1.0, 2.5) if scraper.name != "avito" else scraper.delay, stop)
             if state == "active":
                 con.execute("UPDATE listings SET missed=0 WHERE source=? AND source_id=?", (row["source"], row["source_id"]))
                 if price:
@@ -272,7 +271,10 @@ class RunManager:
                 unknown += 1
                 con.execute("UPDATE listings SET missed=? WHERE source=? AND source_id=?",
                             ((row.get("missed") or 0) + 1, row["source"], row["source_id"]))
-            con.commit()
+            if aborted is None and n < limit:
+                con.commit()  # не держим транзакцию открытой на время сетевой паузы перед следующей проверкой
+                pause((1.0, 2.5) if scraper.name != "avito" else scraper.delay, stop)
+        con.commit()
         if unknown:
             lg(f"статус не подтверждён у {unknown}: проверю в следующем прогоне. Те, кого нет в поиске "
                f"{offsale.GONE_AFTER} прогона подряд, считаются потерянными на этом сайте — ссылка на него убирается, "

@@ -52,6 +52,7 @@ class Scraper:
         self.runlog = NullRunLog()  # подробный журнал прогона (назначает RunManager)
         self.http = Http(self.name, self.is_blocked)
         self.http.trace = self._trace
+        self.http.save_block_snapshots = self.mode != "auto"
         self.browser = None
         self.use_browser = self.mode == "browser" or (self.mode == "auto" and self.AUTO_BROWSER)
         self.last_mode = None

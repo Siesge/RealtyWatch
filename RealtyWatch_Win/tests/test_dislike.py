@@ -154,6 +154,18 @@ class HiddenInterface(unittest.TestCase):
     def test_badge_never_splits(self):
         self.assertRegex(self.css, r"\.tag \{[^}]*white-space: nowrap;")
 
+    def test_notes_relist_poll_and_presets_wiring(self):
+        self.assertIn('id="presetBar"', self.html)
+        self.assertIn("function serializeFilters()", self.js)
+        self.assertIn('store.set("rw.filters"', self.js)
+        self.assertIn('store.get("rw.presets"', self.js)
+        self.assertIn("function relistedInfo(", self.js)
+        self.assertIn("poll.lastSig", self.js)
+        self.assertIn('/api/note', self.dash)
+        self.assertIn('перевыставлено', self.dash)
+        self.assertIn(".card-note", self.css)
+        self.assertIn(".preset-chip", self.css)
+
 
 if __name__ == "__main__":
     unittest.main()

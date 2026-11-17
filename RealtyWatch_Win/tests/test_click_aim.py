@@ -148,6 +148,34 @@ class ClickAim(Case):
         self.assertEqual(got[0]["Sec-Fetch-Site"], "same-origin", "и открыта всё-таки кликом")
         self.assertNotIn("переход по ссылке не открыл нужную страницу — открываю её по адресу", self.log)
 
+    def test_spa_pushstate_pagination_clicks_once(self):
+        """SPA-переход (history.pushState без перезагрузки document) засчитывается с первого нажатия:
+        программа не бьёт по ссылке повторно и не уходит в таймаут."""
+        spa_html = (
+            '<html><head><title>Выдача SPA</title></head><body>'
+            '<div style="height:400px">Объявления</div>'
+            '<div id="pager"><span data-marker="pagination-button/page(1)">1</span> '
+            '<a data-marker="pagination-button/nextPage" href="/?p=2">Следующая</a></div>'
+            '<script>let cur=1;'
+            'document.querySelector(\'a[data-marker="pagination-button/nextPage"]\').addEventListener("click", e => {'
+            '  e.preventDefault(); cur += 1; history.pushState({}, "", "/spa?p=" + cur);'
+            '  document.getElementById("pager").innerHTML = '
+            '    `<span data-marker="pagination-button/page(${cur})">${cur}</span> ` +'
+            '    `<a data-marker="pagination-button/nextPage" href="/?p=${cur + 1}">Следующая</a>`;'
+            '});</script></body></html>'
+        )
+        self.b.goto(self.base + "/", settle=(0, 0))
+        self.b.page.set_content(spa_html)
+        clicks = self._count_clicks()
+        hits_before = len(Site.hits)
+        arrived_2 = "() => !!document.querySelector('[data-marker=\"pagination-button/page(2)\"]:not(a)')"
+        self.b.click_through(LINK, self.base + "/p2", arrived_2, settle=(0, 0), timeout=4)
+        self.assertEqual(len(clicks), 1, "SPA-переход засчитан с первого нажатия")
+        self.assertTrue(self.b.page.url.endswith("/spa?p=2"), self.b.page.url)
+        self.assertEqual(len(Site.hits), hits_before, "лишней загрузки по адресу не было")
+        self.assertNotIn(MISSED, self.log)
+        self.assertNotIn("переход по ссылке не открыл нужную страницу — открываю её по адресу", self.log)
+
 
 if __name__ == "__main__":
     unittest.main()

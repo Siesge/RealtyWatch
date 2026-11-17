@@ -66,7 +66,7 @@ def _delete_window(con, lo, hi, source=None):
     gone = [(r["source"], r["source_id"]) for r in con.execute(
         f"SELECT source, source_id FROM listings WHERE first_seen >= ? AND last_seen <= ?{s}", (lo, hi, *a))]
     for key in gone:
-        for table in ("listings", "price_history", "events", "likes", "dislikes"):
+        for table in ("listings", "price_history", "events", "likes", "dislikes", "notes"):
             con.execute(f"DELETE FROM {table} WHERE source=? AND source_id=?", key)
         p = images.local_path(*key)
         if p:
@@ -235,7 +235,7 @@ def clear_all():
     res = {"backup": transfer.backup("перед_полной_очисткой", with_images=True)}
     con = db.connect()
     res["listings"] = con.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-    for table in ("listings", "price_history", "events", "snapshots", "runs", "likes", "dislikes"):
+    for table in ("listings", "price_history", "events", "snapshots", "runs", "likes", "dislikes", "notes"):
         con.execute(f"DELETE FROM {table}")
     con.commit()
     con.execute("VACUUM")

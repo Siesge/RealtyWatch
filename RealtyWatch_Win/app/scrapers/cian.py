@@ -2,14 +2,19 @@
 import json
 import math
 import re
+import sqlite3
+import time
+from datetime import datetime
 from urllib.parse import urlencode
 
-from .. import rules
+from .. import db, net, rules
 from ..net import Blocked, IpBanned
 from .base import Scraper, to_float, to_int, ts_to_iso
 
 API = "https://api.cian.ru/search-offers/v2/search-offers-desktop/"
 PAGE_SIZE = 28
+HTTP_BLOCK_TTL = 12 * 3600  # сколько не повторять заведомо заблокированный HTTP-поиск в режиме auto
+REPAIR_TTL = 24 * 3600      # как часто обновлять виды ремонта для всей выдачи (полный проход 1..4)
 
 DECORATION = {"without": "none", "rough": "none", "preFine": "none", "fine": "finish"}
 # Вид ремонта из раздела «О квартире». В выдаче поиска ЦИАН его нет (проверено на ответе API 11 ноября 2026:
@@ -207,18 +212,29 @@ class Cian(Scraper):
                                        headers={"Origin": "https://www.cian.ru", "Referer": "https://www.cian.ru/"})
                     d = r.json().get("data") or {}
                     if "offersSerialized" not in d:
-                        self.snapshot_last("нет списка в ответе API")
+                        if self.mode == "http":
+                            self.snapshot_last("нет списка в ответе API")
                         raise Blocked("ЦИАН: в ответе API нет списка объявлений")
+                    self._clear_http_blocked()
                     # aggregatedCount — уникальные объекты (offerCount включает дубли от разных агентов)
                     return d["offersSerialized"], d["aggregatedCount"] if "aggregatedCount" in d else d["offerCount"]
                 except Blocked as e:
                     self._api_blocked = True
                     self.log(f"API поиска ЦИАН заблокирован ({e}) — пробую страницу поиска по HTTP")
-            r = self.http.get(url, headers={"Referer": ref})
+            try:
+                r = self.http.get(url, headers={"Referer": ref})
+            except Blocked:
+                if self.mode == "auto":
+                    self._mark_http_blocked()
+                raise
             st = parse_state(r.text)
             if not st:
-                self.snapshot_last("нет состояния страницы (HTTP)")
+                if self.mode == "http":
+                    self.snapshot_last("нет состояния страницы (HTTP)")
+                else:
+                    self._mark_http_blocked()
                 raise Blocked(f"ЦИАН: страница поиска по HTTP без состояния ({len(r.text)} Б)")
+            self._clear_http_blocked()
             agg, tot = st.get("aggregated"), st.get("total")
             return st["offers"], agg if agg is not None else tot
 
@@ -274,8 +290,90 @@ class Cian(Scraper):
         self.done += 1
         self.progress(page=min(self.done, self.planned), pages=self.planned, total=self.declared_main)
 
+    def _http_state_file(self):
+        return net.PROFILES / self.name / "http_state.json"
+
+    def _http_recently_blocked(self):
+        try:
+            d = json.loads(self._http_state_file().read_text(encoding="utf-8"))
+            return (time.time() - float(d.get("blocked_at", 0))) < HTTP_BLOCK_TTL
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _mark_http_blocked(self):
+        try:
+            p = self._http_state_file()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"blocked_at": time.time()}), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _clear_http_blocked(self):
+        try:
+            self._http_state_file().unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _known_repairs(self):
+        """Виды ремонта из базы, если полное обновление проходило недавно (< REPAIR_TTL), иначе None."""
+        try:
+            con = db.connect()
+        except sqlite3.Error:
+            return None
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key='cian_repairs_ts'").fetchone()
+            ts = None
+            if row:
+                try:
+                    ts = float(row["value"])
+                except (TypeError, ValueError):
+                    ts = None
+            known = {}
+            for r in con.execute("SELECT source_id, raw FROM listings WHERE source='cian'"):
+                try:
+                    raw = json.loads(r["raw"]) if r["raw"] else None
+                except (TypeError, ValueError):
+                    raw = None
+                if isinstance(raw, dict) and "repair" in raw:
+                    known[str(r["source_id"])] = raw["repair"]
+            if ts is None and any(v in REPAIR for v in known.values()):
+                last = con.execute("SELECT finished FROM runs WHERE source='cian' AND status='done' ORDER BY id DESC LIMIT 1").fetchone()
+                if last and last["finished"]:
+                    try:
+                        ts = datetime.fromisoformat(last["finished"]).timestamp()
+                    except ValueError:
+                        ts = None
+            if not known or ts is None or (time.time() - ts) >= REPAIR_TTL:
+                return None
+            return known
+        except sqlite3.Error:
+            return None
+        finally:
+            con.close()
+
+    def _save_repairs_ts(self):
+        try:
+            con = db.connect()
+            try:
+                con.execute("INSERT OR REPLACE INTO meta VALUES('cian_repairs_ts', ?)", (str(time.time()),))
+                con.commit()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+
     def listings(self):
+        if self.mode == "auto" and not self.use_browser and self._http_recently_blocked():
+            self.use_browser = True
+            self.log("HTTP ЦИАН блокировался менее 12 ч назад — сразу открываю браузер")
         limit = self.site.get("max_pages", 40)
+        known = self._known_repairs()
+        if known:
+            yield from self._listings_incremental(limit, known)
+        else:
+            yield from self._listings_full(limit)
+
+    def _listings_full(self, limit):
         queries = [(code, f"ремонт «{name}», ") for code, (_, name) in REPAIR.items()] + [(None, "")]
         # 0. Первые страницы всех выдач — по ним известно, сколько страниц всего, и полоса прогресса
         # идёт одна на весь сбор, а не заново для каждой выдачи
@@ -314,6 +412,60 @@ class Cian(Scraper):
                 yield self._normalize(o)
         self._log_repairs(ids)
         self.finish(*last, len(ids), total)
+        if self.complete and self.repairs:
+            self._save_repairs_ts()
+
+    def _listings_incremental(self, limit, known):
+        """Ускоренный сбор: основная выдача; выдачи по ремонту — только если встретились новые объявления."""
+        first_main = self._load(1, None)
+        self.declared_main = first_main[1]
+        self.planned = min(self._count(self.declared_main), limit)
+        self.done = 0
+        self.progress(page=0, pages=self.planned, total=self.declared_main)
+        main_offers, seen_ids, main_total = [], set(), None
+        for _page, _pages, main_total, offers in self._pages(None, "", first_main):
+            for o in offers:
+                sid = str(o.get("cianId") or o.get("id"))
+                if sid not in seen_ids:
+                    seen_ids.add(sid)
+                    main_offers.append((sid, o))
+        last = self.last_pages
+        self.repairs = {sid: code for sid, code in known.items() if code in REPAIR}
+        unknown = [(sid, o) for sid, o in main_offers if sid not in known]
+        if not unknown:
+            self.log(f"выдачи по виду ремонта пропущены: все {len(main_offers)} объявлений уже есть в базе")
+        else:
+            unknown_ids = {sid for sid, _ in unknown}
+            prices = [to_int((o.get("bargainTerms") or {}).get("priceRur") or (o.get("bargainTerms") or {}).get("price"))
+                      for _, o in unknown]
+            max_price = max(prices) if prices and all(prices) else None
+            self.log(f"новых объявлений ЦИАН без известного ремонта: {len(unknown_ids)} — уточняю вид ремонта")
+            for code, (_, name) in REPAIR.items():
+                if unknown_ids <= self.repairs.keys():
+                    break
+                label = f"ремонт «{name}», "
+                r_page, r_pages = 1, 1
+                while r_page <= r_pages:
+                    self.wait()
+                    offers, r_total = self._load(r_page, code)
+                    r_pages = min(self._count(r_total), limit)
+                    self.planned = max(self.planned, self.done + 1)
+                    self.log(f"{label}страница {r_page}/{self._count(r_total)}: {len(offers)} объявлений")
+                    self.step()
+                    for o in offers:
+                        self.repairs[str(o.get("cianId") or o.get("id"))] = code
+                    if unknown_ids <= self.repairs.keys():
+                        break
+                    if max_price is not None and offers:
+                        page_prices = [to_int((o.get("bargainTerms") or {}).get("priceRur") or (o.get("bargainTerms") or {}).get("price"))
+                                       for o in offers]
+                        if all(page_prices) and min(page_prices) > max_price * 1.05 + 50_000:
+                            break
+                    r_page += 1
+        for _, o in main_offers:
+            yield self._normalize(o)
+        self._log_repairs(seen_ids)
+        self.finish(*last, len(seen_ids), main_total)
 
     def _log_repairs(self, ids):
         """Итог по виду ремонта — в журнал прогона: по нему видно, что выдачи по ремонту сработали."""
@@ -411,6 +563,6 @@ class Cian(Scraper):
             "published_at": ts_to_iso(o.get("addedTimestamp")),
             "fetch_mode": self.last_mode,
             "raw": {"category": o.get("category"), "flatType": o.get("flatType"), "decoration": o.get("decoration"),
-                    "repair": repair,
+                    "repair": repair, "apartments": bool(o.get("isApartments")),
                     "isApartments": o.get("isApartments"), "creationDate": o.get("creationDate")},
         }

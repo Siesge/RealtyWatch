@@ -36,6 +36,7 @@ const ICON = {
   chart: '<svg viewBox="0 0 24 24"><path d="M4 19h16M6 15l4-4 3 3 5-6"/></svg>',
   img: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 5-4.5 4 3.5 3-2.5 4 3.5"/></svg>',
   share: '<svg viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4"/></svg>',
+  note: '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
 };
 
 let LASTRUN = {}, ALL = [], OBJS = [], SETTINGS = null, view = "cards", jAfter = 0, lastStates = {};
@@ -89,6 +90,29 @@ async function loadData() {
 }
 async function loadSettings() { SETTINGS = await api("/api/settings"); }
 
+function relistedInfo(items, price) {
+  const live = items.filter(i => i.active && !i.off_site && i.price);
+  const gone = items.filter(i => (!i.active || i.off_site) && i.price);
+  if (!live.length || !gone.length || !price) return null;
+  const best = live.filter(i => i.price === price);
+  if (!best.length) return null;
+  const goneBefore = gone.filter(g => best.every(l => {
+    const gf = g.first_seen || "", lf = l.first_seen || "";
+    if (gf >= lf) return false;
+    const t0 = Date.parse(gf), t1 = Date.parse(lf);
+    return !isFinite(t0) || !isFinite(t1) || (t1 - t0) >= 6 * 3600e3;
+  }));
+  if (!goneBefore.length) return null;
+  goneBefore.sort((a, b) => ((b.removed_at || b.last_seen || "") > (a.removed_at || a.last_seen || "") ? 1 : -1));
+  const prev = goneBefore[0];
+  const diff = price - prev.price;
+  if (Math.abs(diff) < 50000) return null;
+  return {
+    old: prev.price, now: price, diff, pct: 100 * diff / prev.price,
+    oldSrc: prev.source, oldSeen: prev.removed_at || prev.last_seen, newFirst: best[0].first_seen,
+  };
+}
+
 function buildObjects() {
   const groups = new Map();
   for (const r of ALL) {
@@ -104,20 +128,24 @@ function buildObjects() {
     const reno = items.map(i => i.renovation).filter(Boolean).sort((a, b) => (RENO_RANK[b] || 0) - (RENO_RANK[a] || 0));
     const flags = {};
     items.forEach(i => Object.assign(flags, i.flags || {}));
+    const noted = items.filter(i => i.note).sort((a, b) => ((b.note_ts || "") > (a.note_ts || "") ? 1 : -1))[0];
+    const note = noted ? noted.note : "", note_ts = noted ? (noted.note_ts || "") : "";
+    const price = prices.length ? Math.min(...prices) : null;
     return {
-      id: p.object_id, items, p, flags,
+      id: p.object_id, items, p, flags, note, note_ts,
       img: items.find(i => i.has_img) || items.find(i => i.photo),
       sources: [...new Set(items.map(i => i.source))],
-      price: prices.length ? Math.min(...prices) : null, priceMax: prices.length ? Math.max(...prices) : null,
+      price, priceMax: prices.length ? Math.max(...prices) : null,
       liked: items.some(i => i.liked), active: items.some(i => i.active),
       // лайк и дизлайк взаимоисключающие; если при слиянии баз квартира оказалась и там, и там — побеждает ♥
       disliked: !items.some(i => i.liked) && items.some(i => i.disliked),
       excluded: items.every(i => i.excluded) ? p.excluded : null,
       renovation: p.excluded || !reno.length ? p.renovation : reno[0],
+      relisted: relistedInfo(items, price),
       first_seen: items.reduce((m, i) => (i.first_seen < m ? i.first_seen : m), p.first_seen),
       zone: p.zone, rooms: p.rooms, area: p.area, floor: p.floor, floors: p.floors, lat: p.lat, lon: p.lon,
       address: items.map(i => i.address).filter(Boolean).sort((a, b) => b.length - a.length)[0] || "",
-      text: items.map(i => `${i.title} ${i.address} ${i.description}`).join(" ").toLowerCase(),
+      text: [...items.map(i => `${i.title} ${i.address} ${i.description}`), note].join(" ").toLowerCase(),
     };
   });
   OBJS.forEach(o => { o.price_m2 = o.price && o.area ? o.price / o.area : null; o.fresh = freshItems(o); });
@@ -245,11 +273,25 @@ function priceTip(o) {
   return "Минимальная цена среди активных объявлений объекта.\n" + lines.join("\n") + "\nКлик по карточке — график цен.";
 }
 
+function relistTip(o) {
+  const rl = o.relisted;
+  if (!rl) return "";
+  const d = rl.diff;
+  return `Квартира перевыставлена с изменением цены: раньше на ${SRC[rl.oldSrc]} она продавалась за ${fmt(rl.old)} ₽` +
+    `${rl.oldSeen ? ` (снято ${dtt(rl.oldSeen)})` : ""}, сейчас — ${fmt(rl.now)} ₽ (${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽, ${d > 0 ? "+" : ""}${rl.pct.toFixed(1)}%).`;
+}
+
 function delta(o) {
   const i = o.items.find(x => x.active && x.price === o.price && lastChange(x)) || o.items.find(x => x.active && lastChange(x));
-  if (!i) return "";
-  const [old, now, ts] = lastChange(i), d = now - old;
-  return `<span class="delta ${d < 0 ? "down" : "up"}" title="${SRC[i.source]}: цена ${d < 0 ? "снижена" : "повышена"} ${dtt(ts)} — с ${fmt(old)} до ${fmt(now)} ₽ (${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽, ${(100 * d / old).toFixed(1)}%)">${d < 0 ? "↓" : "↑"} ${mln(Math.abs(d))} млн</span>`;
+  if (i) {
+    const [old, now, ts] = lastChange(i), d = now - old;
+    return `<span class="delta ${d < 0 ? "down" : "up"}" title="${SRC[i.source]}: цена ${d < 0 ? "снижена" : "повышена"} ${dtt(ts)} — с ${fmt(old)} до ${fmt(now)} ₽ (${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽, ${(100 * d / old).toFixed(1)}%)">${d < 0 ? "↓" : "↑"} ${mln(Math.abs(d))} млн</span>`;
+  }
+  if (o.relisted) {
+    const rl = o.relisted, d = rl.diff;
+    return `<span class="delta ${d < 0 ? "down" : "up"}" title="${esc(relistTip(o))}">↻ ${d < 0 ? "↓" : "↑"} ${mln(Math.abs(d))} млн</span>`;
+  }
+  return "";
 }
 
 function oldPrice(o) {
@@ -305,7 +347,11 @@ function tags(o) {
   else if (o.renovation) t.push(`<span class="tag ${o.renovation === "none" ? "bad" : "good"}" title="${esc(renoTip(o))}">${RENO[o.renovation] || o.renovation}</span>`);
   else t.push(`<span class="tag warn" title="${esc(renoTip(o))}">ремонт не указан</span>`);
   if (r.is_new_building) t.push(`<span class="tag" title="Квартира в новостройке (по данным сайта)">новостройка</span>`);
-  if (o.items.some(i => i.raw && i.raw.apartments)) t.push(`<span class="tag warn" title="Юридически апартаменты, а не квартира: нельзя прописаться, выше налог и тарифы ЖКХ">апартаменты</span>`);
+  if (o.items.some(i => i.apartments || (i.raw && (i.raw.apartments || i.raw.isApartments)))) t.push(`<span class="tag warn" title="Юридически апартаменты, а не квартира: нельзя прописаться, выше налог и тарифы ЖКХ">апартаменты</span>`);
+  if (o.relisted) {
+    const rl = o.relisted;
+    t.push(`<span class="tag ${rl.diff < 0 ? "good" : "warn"}" title="${esc(relistTip(o))}">↻ перевыставлено ${rl.diff < 0 ? "↓" : "↑"} ${mln(Math.abs(rl.diff))} млн</span>`);
+  }
   const sellers = [...new Set(o.items.map(i => i.seller_type).filter(Boolean))];
   sellers.forEach(s => t.push(`<span class="tag" title="${esc(SELLER_TIP[s] || s)}">${SELLER[s] || s}</span>`));
   if (o.lat == null) t.push(`<span class="tag warn" title="Сайт не дал координаты: зона определена по адресу, на карте объекта нет">нет координат</span>`);
@@ -379,11 +425,12 @@ function card(o) {
       <div class="addr" title="Адрес (самый подробный из объявлений объекта)">${ICON.pin}<span>${esc(o.address || "адрес не указан")}</span></div>
       ${meta ? `<div class="meta" title="Жилая площадь, кухня, год постройки — со страниц объявлений">${esc(meta)}</div>` : ""}
       <div class="tags">${tags(o)}</div>
+      ${o.note ? `<div class="card-note" title="${esc("Личная заметка (клик по кнопке ✎ или карточке — изменить):\n" + o.note)}">${ICON.note}<span>${esc(o.note)}</span></div>` : ""}
       ${offers(o)}
       <p class="desc" title="Начало описания; полностью — в окне карточки (клик по карточке)">${esc((o.p.description || "").slice(0, 320))}</p>
     </div>
     <div class="card-foot"><span title="Когда объект впервые появился в базе; число объявлений на всех сайтах">с ${dt(o.first_seen)} · ${n} ${plural(n, "объявление", "объявления", "объявлений")}</span>
-      <span class="acts">${o.lat != null ? `<button class="icon-btn pin" title="Показать на карте рядом">${ICON.map}</button>` : ""}</span></div>
+      <span class="acts"><button class="icon-btn note-btn ${o.note ? "on" : ""}" title="${esc(o.note ? "Изменить заметку" : "Добавить заметку к квартире")}">${ICON.note}</button>${o.lat != null ? `<button class="icon-btn pin" title="Показать на карте рядом">${ICON.map}</button>` : ""}</span></div>
   </article>`;
 }
 
@@ -491,6 +538,7 @@ const COLS = [
   ["price_m2", "₽/м²", o => fmt(o.price_m2), 1], ["rooms", "Комн.", o => o.rooms ?? "", 1],
   ["area", "м²", o => o.area ?? "", 1], ["floor", "Этаж", o => `${o.floor ?? "?"}/${o.floors ?? "?"}`, 1],
   ["renovation", "Ремонт", o => RENO[o.renovation] || ""], ["address", "Адрес", o => esc(o.address || "")],
+  ["note", "Заметка", o => o.note ? `<span class="tbl-note" title="${esc(o.note)}">${esc(o.note)}</span>` : ""],
   ["excluded", "Отсев", o => esc(o.excluded || "")], ["first_seen", "Найдено", o => dt(o.first_seen)],
   ["liked", "♥", o => o.liked ? "♥" : o.disliked ? `<span class="dis-mark" title="Скрыта — отмечена «не нравится»">${ICON.dislike}</span>` : ""],
 ];
@@ -1411,7 +1459,17 @@ async function poll() {
       const last = s.journal[s.journal.length - 1];
       $("#jLast").textContent = `${last.t} · ${SRC[last.src] || (last.src === "db" ? "База" : "")}: ${last.msg}`;
     }
-    if (Object.values(s.status).some(v => v.running) && Date.now() - (poll.lastLoad || 0) > 15000) { poll.lastLoad = Date.now(); loadData(); }
+    const running = Object.values(s.status).filter(v => v.running);
+    if (running.length) {
+      const sig = running.map(v => `${v.found || 0}:${v.new || 0}:${v.changed || 0}:${v.details || 0}`).join("|");
+      if (sig !== poll.lastSig && Date.now() - (poll.lastLoad || 0) > 15000) {
+        poll.lastSig = sig;
+        poll.lastLoad = Date.now();
+        loadData();
+      }
+    } else {
+      poll.lastSig = "";
+    }
   } catch (e) { /* сервер ещё стартует */ }
   setTimeout(poll, 2000);
 }
@@ -1478,12 +1536,149 @@ function setView(v) {
   $("#cardsList").scrollTop = 0;
 }
 
+function serializeFilters() {
+  return {
+    src: checked("src"), zones: checked("zone"), rooms: checked("rooms"),
+    pmin: $("#fPmin").value, pmax: $("#fPmax").value, amin: $("#fAmin").value,
+    reno: $("#fReno").value, nb: $("#fNew").value, st: $("#fState").value,
+    active: $("#fActive").checked, noCoords: $("#fNoCoords").checked,
+    liked: $("#fLiked").checked, hiddenOnly: $("#fHidden").checked, noDis: $("#fNoDis").checked,
+    text: $("#fText").value, sort: $("#fSort").value,
+  };
+}
+
+function applyFilterState(s) {
+  if (!s || typeof s !== "object") return;
+  if (Array.isArray(s.src)) $$('input[name="src"]').forEach(i => i.checked = s.src.includes(i.value));
+  if (Array.isArray(s.zones)) $$('input[name="zone"]').forEach(i => i.checked = s.zones.includes(i.value));
+  if (Array.isArray(s.rooms)) $$('input[name="rooms"]').forEach(i => i.checked = s.rooms.includes(i.value));
+  $("#fPmin").value = s.pmin ?? "";
+  $("#fPmax").value = s.pmax ?? "";
+  $("#fAmin").value = s.amin ?? "";
+  $("#fText").value = s.text ?? "";
+  for (const [id, keyName, def] of [["fReno", "reno", ""], ["fNew", "nb", ""], ["fState", "st", "pass"], ["fSort", "sort", "new"]]) {
+    const el = $(`#${id}`), val = s[keyName] ?? def;
+    el.value = [...el.options].some(o => o.value === val) ? val : def;
+  }
+  $("#fActive").checked = s.active !== false;
+  $("#fNoCoords").checked = !!s.noCoords;
+  $("#fHidden").checked = !!s.hiddenOnly;
+  $("#fLiked").checked = !s.hiddenOnly && !!s.liked;
+  $("#fNoDis").checked = s.noDis !== false;
+}
+
+function saveFilterState() {
+  store.set("rw.filters", JSON.stringify(serializeFilters()));
+}
+
+function restoreFilters() {
+  try {
+    const raw = store.get("rw.filters", "");
+    if (raw) applyFilterState(JSON.parse(raw));
+  } catch (e) { /* повреждённый JSON игнорируем */ }
+}
+
+function loadPresets() {
+  try {
+    const raw = store.get("rw.presets", "[]");
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list.filter(p => p && typeof p.name === "string" && p.state && typeof p.state === "object") : [];
+  } catch (e) { return []; }
+}
+
+function savePresetsList(list) {
+  store.set("rw.presets", JSON.stringify(list.slice(0, 8)));
+}
+
+function sameFilterState(a, b) {
+  const norm = s => JSON.stringify({
+    src: [...(s.src || [])].sort(), zones: [...(s.zones || [])].sort(), rooms: [...(s.rooms || [])].sort(),
+    pmin: String(s.pmin || ""), pmax: String(s.pmax || ""), amin: String(s.amin || ""),
+    reno: String(s.reno || ""), nb: String(s.nb || ""), st: String(s.st || "pass"),
+    active: s.active !== false, noCoords: !!s.noCoords, liked: !!s.liked, hiddenOnly: !!s.hiddenOnly,
+    noDis: s.noDis !== false, text: String(s.text || "").trim(), sort: String(s.sort || "new"),
+  });
+  return norm(a) === norm(b);
+}
+
+function suggestPresetName(s) {
+  const parts = [];
+  if (s.liked) parts.push("Избранное");
+  if (s.hiddenOnly) parts.push("Скрытые");
+  if (s.zones && s.zones.length && s.zones.length < 3) parts.push(s.zones.map(z => ZONE_SHORT[z]).join("+"));
+  if (s.rooms && s.rooms.length && s.rooms.length < 3) parts.push(s.rooms.map(r => `${r}к`).join(", "));
+  if (s.pmax) parts.push(`до ${s.pmax} млн`);
+  else if (s.pmin) parts.push(`от ${s.pmin} млн`);
+  if (s.amin) parts.push(`от ${s.amin} м²`);
+  if (s.reno) parts.push($("#fReno").options[$("#fReno").selectedIndex]?.text || "");
+  if (s.text) parts.push(s.text.trim());
+  return (parts.filter(Boolean).join(" · ") || "Мой фильтр").slice(0, 32);
+}
+
+let presetFormOpen = false;
+function renderPresets() {
+  const bar = $("#presetBar");
+  if (!bar) return;
+  const presets = loadPresets(), cur = serializeFilters();
+  const chips = presets.map((p, idx) => {
+    const active = sameFilterState(cur, p.state);
+    return `<span class="preset-chip ${active ? "on" : ""}">
+      <button type="button" class="preset-go" data-apply="${idx}" title="Применить набор фильтров «${esc(p.name)}»">${esc(p.name)}</button>
+      <button type="button" class="preset-x" data-del="${idx}" title="Удалить набор «${esc(p.name)}»">×</button></span>`;
+  }).join("");
+  const right = presetFormOpen
+    ? `<span class="preset-form"><input type="text" id="presetName" maxlength="32" value="${esc(suggestPresetName(cur))}" placeholder="Название набора…">
+      <button type="button" class="chip on" id="presetSave">Сохранить</button>
+      <button type="button" class="link sm" id="presetCancel">Отмена</button></span>`
+    : (presets.length < 8
+      ? `<button type="button" class="chip preset-add" id="btnPresetNew" title="Сохранить текущее сочетание фильтров как быструю кнопку">+ Сохранить фильтр</button>`
+      : `<span class="meta">максимум 8 наборов</span>`);
+  bar.innerHTML = `<span class="preset-lbl">Наборы:</span>${chips}${right}`;
+  bar.querySelectorAll("[data-apply]").forEach(b => b.onclick = () => {
+    const p = loadPresets()[+b.dataset.apply];
+    if (!p) return;
+    applyFilterState(p.state);
+    saveFilterState();
+    renderPresets();
+    render();
+  });
+  bar.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
+    const list = loadPresets(), idx = +b.dataset.del, removed = list.splice(idx, 1)[0];
+    if (!removed) return;
+    savePresetsList(list);
+    renderPresets();
+    toast("ok", "Набор удалён", removed.name, {
+      label: "Вернуть",
+      fn: () => { const curList = loadPresets(); curList.splice(idx, 0, removed); savePresetsList(curList); renderPresets(); },
+    });
+  });
+  const addBtn = $("#btnPresetNew");
+  if (addBtn) addBtn.onclick = () => { presetFormOpen = true; renderPresets(); const inp = $("#presetName"); if (inp) { inp.focus(); inp.select(); } };
+  const saveBtn = $("#presetSave"), cancelBtn = $("#presetCancel"), nameInp = $("#presetName");
+  const commitPreset = () => {
+    const name = (nameInp?.value || "").trim().slice(0, 32) || suggestPresetName(cur);
+    const list = loadPresets().filter(p => p.name !== name);
+    list.push({ name, state: cur });
+    savePresetsList(list);
+    presetFormOpen = false;
+    renderPresets();
+  };
+  if (saveBtn) saveBtn.onclick = commitPreset;
+  if (cancelBtn) cancelBtn.onclick = () => { presetFormOpen = false; renderPresets(); };
+  if (nameInp) nameInp.onkeydown = e => {
+    if (e.key === "Enter") { e.preventDefault(); commitPreset(); }
+    if (e.key === "Escape") { e.preventDefault(); presetFormOpen = false; renderPresets(); }
+  };
+}
+
 function resetFilters() {
   clearTimeout(_filterTimer);
   // по умолчанию всё включено, кроме посёлков, «без координат», «Избранного» и «Скрытых»; «исключить дизлайки» — включено
   $$("#filters input[type=checkbox]").forEach(i => i.checked = !(i.value === "C" || ["fNoCoords", "fLiked", "fHidden"].includes(i.id)));
   $("#fPmin").value = $("#fPmax").value = $("#fAmin").value = $("#fText").value = "";
   $("#fReno").value = $("#fNew").value = ""; $("#fState").value = "pass"; $("#fSort").value = "new";
+  saveFilterState();
+  renderPresets();
   render();
 }
 
@@ -1503,6 +1698,9 @@ $("#fHidden").addEventListener("input", () => { if ($("#fHidden").checked) $("#f
 $("#fLiked").addEventListener("input", () => { if ($("#fLiked").checked) $("#fHidden").checked = false; });
 let _filterTimer = null;
 $("#filters").addEventListener("input", e => {
+  if (e.target.closest("#presetBar")) return;
+  saveFilterState();
+  renderPresets();
   clearTimeout(_filterTimer);
   if (["text", "search", "number"].includes(e.target.type)) _filterTimer = setTimeout(render, 120);
   else render();
@@ -1534,6 +1732,7 @@ $("#cardsList").addEventListener("click", e => {
   const mark = e.target.closest(".heart");
   if (mark) { e.preventDefault(); (mark.classList.contains("dis") ? toggleDislike : toggleLike)(c.dataset.id, mark); return; }
   if (e.target.closest(".keep-hidden")) { e.preventDefault(); keepHidden(c.dataset.id); return; }
+  if (e.target.closest(".note-btn")) { e.preventDefault(); openObject(c.dataset.id, true); return; }
   if (e.target.closest(".pin")) {
     if (!sideOn()) setSide(true);
     highlight(c.dataset.id, true);
@@ -1570,6 +1769,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       LASTRUN[r.source] = { state: r.status, message: r.message, finished: r.finished, running: false };
   } catch (e) { /* нет прогонов */ }
   renderSources({});
+  restoreFilters();
+  renderPresets();
   setView("dashboard");
   await loadData();
   initAuto();

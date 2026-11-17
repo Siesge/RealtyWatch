@@ -238,6 +238,12 @@ def _merge(imported):
         con.execute("INSERT OR IGNORE INTO likes SELECT * FROM imp.likes")
         if con.execute("SELECT 1 FROM imp.sqlite_master WHERE type='table' AND name='dislikes'").fetchone():
             con.execute("INSERT OR IGNORE INTO dislikes SELECT * FROM imp.dislikes")  # в старых архивах таблицы нет
+        if con.execute("SELECT 1 FROM imp.sqlite_master WHERE type='table' AND name='notes'").fetchone():
+            con.execute("""INSERT INTO notes(source, source_id, text, ts) SELECT i.source, i.source_id, i.text, i.ts FROM imp.notes i
+                WHERE COALESCE(i.text, '') != ''
+                  AND (NOT EXISTS (SELECT 1 FROM notes m WHERE m.source=i.source AND m.source_id=i.source_id)
+                       OR COALESCE(i.ts, '') > COALESCE((SELECT m.ts FROM notes m WHERE m.source=i.source AND m.source_id=i.source_id), ''))
+                ON CONFLICT(source, source_id) DO UPDATE SET text=excluded.text, ts=excluded.ts""")
         con.commit()
         con.execute("DETACH DATABASE imp")
         return {"added": added, "updated": updated}

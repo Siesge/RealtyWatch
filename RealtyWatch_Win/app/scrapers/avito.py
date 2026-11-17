@@ -35,6 +35,7 @@ _LD_ID = re.compile(r"_(\d+)/?$")
 # Карточки вне результатов поиска: карусели рекомендаций («Вам может понравиться» и т.п.)
 _SERP_CARDS = '//*[@data-marker="item"][not(ancestor::*[contains(@data-marker, "arousel")])]'
 PER_PAGE = 50
+VERIFY_UNKNOWN_LIMIT = 4  # сколько пустых/неузнанных страниц подряд допускаем при проверке снятия
 # Открыта страница выдачи номер N (текущая страница в переключателе — не ссылка)
 _ON_PAGE_JS = """() => document.readyState !== 'loading' && !!document.querySelector('[data-marker="pagination-button/page(%d)"]:not(a)')"""
 
@@ -111,6 +112,8 @@ class Avito(Scraper):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._sparse_saved = False  # неполная страница выдачи уже сохранена в этом прогоне
+        self._verify_unknown = 0
+        self._verify_snapped = False
         self._last_html = (None, None)
 
     def captcha_solver(self):
@@ -243,6 +246,15 @@ class Avito(Scraper):
                 self.wait()
         self.finish(page, pages, limit, len(seen), declared)
 
+    def _unknown_verify(self, html, sid):
+        if html and not self._verify_snapped:
+            self._verify_snapped = True
+            self.runlog.snapshot(html, f"проверка объявления {sid} — страница не распознана")
+        self._verify_unknown += 1
+        if self._verify_unknown >= VERIFY_UNKNOWN_LIMIT:
+            raise Blocked(f"Авито: {self._verify_unknown} страницы объявлений подряд без данных карточки — проверка остановлена")
+        return None, None, None
+
     def verify(self, row):
         """Страница объявления. Снято — только по явному признаку: closedItem=true на странице,
         404/410 или редирект со страницы объявления в каталог (объявления с таким номером больше нет)."""
@@ -262,22 +274,26 @@ class Avito(Scraper):
             raise
         except IOError as e:
             if "HTTP 404" in str(e) or "HTTP 410" in str(e):
+                self._verify_unknown = 0
                 return "removed", "на Авито страница объявления не найдена (404)", None
             return None, None, None
         except Exception:
             return None, None, None
         if status in (404, 410):
+            self._verify_unknown = 0
             return "removed", f"на Авито страница объявления не найдена ({status})", None
         doc = lxml.html.fromstring(html)
         if sid not in url:
             # Сайт увёл со страницы объявления: в каталог — объявления больше нет; куда-то ещё — неизвестно
             if doc.xpath('//*[@data-marker="page-title/count"]') or doc.xpath('//*[@data-marker="item"]'):
+                self._verify_unknown = 0
                 return "removed", "на Авито объявления больше нет: ссылка ведёт в каталог", None
-            return None, None, None
+            return self._unknown_verify(html, sid)
         id_el = doc.xpath('//*[@data-marker="item-view/item-id"]')
         m = _CLOSED.search(html)
         if not id_el or sid not in _txt(id_el[0]) or not m:
-            return None, None, None  # не распознана страница объявления — статус неизвестен
+            return self._unknown_verify(html, sid)  # не распознана страница объявления — статус неизвестен
+        self._verify_unknown = 0
         if m.group(1) == "true":
             return "removed", "на Авито объявление закрыто (снято с публикации)", None
         price = to_int(re.sub(r"\D", "", _txt(next(iter(doc.xpath('//*[@data-marker="item-view/item-price"]')), None))))

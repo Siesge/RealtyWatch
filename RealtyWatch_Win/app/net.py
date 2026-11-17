@@ -43,6 +43,7 @@ class Http:
         self._load_cookies()
         self.trace = None      # trace(kind, method, url, status, ms, size, note, body, reason) — подробный журнал
         self.last_text = None  # тело последнего ответа (для снимка страницы при сбое)
+        self.save_block_snapshots = True  # в режиме auto переключение на браузер штатно — снимки заглушек не плодим
 
     def _load_cookies(self):
         if self.cookie_file.exists():
@@ -76,7 +77,9 @@ class Http:
         ms, text = round((time.time() - t0) * 1000), r.text
         self.last_text = text
         if r.status_code in (401, 403, 429, 439) or self.is_blocked(text, str(r.url)):
-            self._trace("http", method, url, r.status_code, ms, len(text), "блокировка/капча", text, f"http {r.status_code} блокировка")
+            self._trace("http", method, url, r.status_code, ms, len(text), "блокировка/капча",
+                        text if self.save_block_snapshots else None,
+                        f"http {r.status_code} блокировка" if self.save_block_snapshots else None)
             raise Blocked(f"HTTP {r.status_code} {r.url}")
         if r.status_code >= 400:
             self._trace("http", method, url, r.status_code, ms, len(text), "ошибка сервера", text, f"http {r.status_code}")
@@ -386,20 +389,32 @@ class Browser:
                 return None  # страница как раз меняется
         return now
 
-    def _reacted(self):
-        """Начался ли переход после нажатия (ушёл запрос страницы). Не начался — нажатие ушло в пустоту:
-        цель уехала уже после доводки курсора. Это ожидание страницы, а не человека, — поэтому в тестах
-        оно не ускоряется. Ждём вызовом Playwright, а не сном: события (в том числе наш запрос страницы)
-        он разбирает только во время своих вызовов, и на простом сне мы бы их не увидели вовсе."""
+    def _reacted(self, before_url=None, arrived=None):
+        """Начался ли переход после нажатия: запрос документа, смена URL (SPA) или сработало arrived.
+        Ничего не случилось — нажатие ушло в пустоту: цель уехала уже после доводки курсора. Это ожидание
+        страницы, а не человека, — поэтому в тестах оно не ускоряется. Ждём вызовом Playwright, а не сном:
+        события (в том числе наш запрос страницы) он разбирает только во время своих вызовов."""
+        def hit():
+            if self._navs.get(self.page) is not None:
+                return True
+            try:
+                if before_url and self.page.url != before_url:
+                    return True
+                if arrived and self.page.evaluate(arrived):
+                    return True
+            except Exception:
+                pass  # страница в этот миг перезагружается
+            return False
+
         end = time.time() + self.CLICK_REACT_S
-        while self._navs.get(self.page) is None and time.time() < end:
+        while not hit() and time.time() < end:
             if self.stop is not None and self.stop.is_set():
                 raise Stopped()
             try:
                 self.page.wait_for_timeout(100)
             except Exception:
                 time.sleep(0.1)  # страница как раз меняется
-        return self._navs.get(self.page) is not None
+        return hit()
 
     def _before_request(self):
         self.start()
@@ -425,7 +440,8 @@ class Browser:
         t0 = time.time()
         self._docs.pop(self.page, None)
         self._navs.pop(self.page, None)
-        if not self.mouse.click(b, self._aim(selector)) or not self._reacted():
+        before_url = self.page.url
+        if not self.mouse.click(b, self._aim(selector)) or not self._reacted(before_url=before_url, arrived=arrived):
             # ссылка переложилась, пока рука шла: нажатие или не состоялось, или ушло в пустоту.
             # Человек в этом случае прокрутит к ссылке и нажмёт ещё раз, а не станет набирать адрес
             self.log("ссылка уехала, пока курсор шёл к ней — прицеливаюсь заново")

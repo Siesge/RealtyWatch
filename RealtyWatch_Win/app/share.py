@@ -42,6 +42,7 @@ COLS = [
     ("floor", "Этаж", lambda o: f'{o["floor"] if o["floor"] is not None else "?"}/{o["floors"] if o["floors"] is not None else "?"}', 1),
     ("reno", "Ремонт", lambda o: RENO.get(o["renovation"], ""), 0),
     ("address", "Адрес", lambda o: e(o["address"]), 0),
+    ("note", "Заметка", lambda o: e(o.get("note") or ""), 0),
     ("excluded", "Отсев", lambda o: e(o["excluded"] or ""), 0),
     ("first", "Найдено", lambda o: dt(o["first_seen"]), 0),
 ]
@@ -89,6 +90,38 @@ def _last_change(item):
     return None
 
 
+def _relisted(items, price):
+    live = [i for i in items if i["active"] and i["price"]]
+    gone = [i for i in items if not i["active"] and i["price"]]
+    if not live or not gone or not price:
+        return None
+    best = [i for i in live if i["price"] == price]
+    if not best:
+        return None
+
+    def earlier(g):
+        gf = g.get("first_seen") or ""
+        for l in best:
+            lf = l.get("first_seen") or ""
+            if gf >= lf:
+                return False
+            try:
+                if (datetime.datetime.fromisoformat(lf[:19]) - datetime.datetime.fromisoformat(gf[:19])).total_seconds() < 6 * 3600:
+                    return False
+            except ValueError:
+                pass
+        return True
+
+    before = [g for g in gone if earlier(g)]
+    if not before:
+        return None
+    prev = max(before, key=lambda g: g.get("removed_at") or g.get("last_seen") or "")
+    diff = price - prev["price"]
+    if abs(diff) < 50_000:
+        return None
+    return {"old": prev["price"], "now": price, "diff": diff, "old_src": prev["source"]}
+
+
 def liked_objects(con):
     """Объекты, у которых хотя бы одно объявление в избранном, — со всеми объявлениями объекта.
 
@@ -106,11 +139,14 @@ def liked_objects(con):
     hist = {}
     for h in con.execute("SELECT source, source_id, ts, price FROM price_history ORDER BY ts"):
         hist.setdefault((h["source"], h["source_id"]), []).append((h["ts"], h["price"]))
+    notes = {(r["source"], r["source_id"]): (r["text"] or "", r["ts"] or "")
+             for r in con.execute("SELECT source, source_id, text, ts FROM notes")}
     groups = {}
     for r in rows:
         r["flags"] = json.loads(r["flags"]) if r["flags"] else {}
         r["raw"] = json.loads(r["raw"]) if r["raw"] else {}
         r["history"] = hist.get((r["source"], r["source_id"]), [])
+        r["note"], r["note_ts"] = notes.get((r["source"], r["source_id"]), ("", ""))
         r["file"] = images.local_path(r["source"], r["source_id"])
         groups.setdefault(r["object_id"], []).append(r)
     objs = []
@@ -124,6 +160,7 @@ def liked_objects(con):
         flags = {}
         for i in items:
             flags.update(i["flags"] or {})
+        note = max(((i["note_ts"], i["note"]) for i in items if i["note"]), default=("", ""))[1]
         area = p["area"]
         price = min(prices) if prices else None
         objs.append({
@@ -135,10 +172,14 @@ def liked_objects(con):
             "active": any(i["active"] for i in items),
             "excluded": p["excluded"] if all(i["excluded"] for i in items) else None,
             "renovation": p["renovation"] if (p["excluded"] or not reno) else reno[0],
+            "relisted": _relisted(items, price),
+            "note": note,
             "first_seen": min(i["first_seen"] for i in items),
             "zone": p["zone"], "rooms": p["rooms"], "area": area, "floor": p["floor"], "floors": p["floors"],
             "address": sorted((i["address"] for i in items if i["address"]), key=len, reverse=True)[0] if any(i["address"] for i in items) else "",
-            "text": " ".join(f'{i["title"] or ""} {i["address"] or ""} {i["description"] or ""}' for i in items).lower(),
+            "text": " ".join(
+                [*(f'{i["title"] or ""} {i["address"] or ""} {i["description"] or ""}' for i in items), note]
+            ).lower(),
         })
     objs.sort(key=lambda o: o["first_seen"], reverse=True)
     return objs
@@ -174,8 +215,11 @@ def _tags(o):
         t.append('<span class="tag warn">ремонт не указан</span>')
     if o["p"]["is_new_building"]:
         t.append('<span class="tag">новостройка</span>')
-    if any((i["raw"] or {}).get("apartments") for i in o["items"]):
+    if any((i["raw"] or {}).get("apartments") or (i["raw"] or {}).get("isApartments") for i in o["items"]):
         t.append('<span class="tag warn">апартаменты</span>')
+    rl = o.get("relisted")
+    if rl:
+        t.append(f'<span class="tag {"good" if rl["diff"] < 0 else "warn"}">↻ перевыставлено {"↓" if rl["diff"] < 0 else "↑"} {mln(abs(rl["diff"]))} млн</span>')
     for s in sorted({i["seller_type"] for i in o["items"] if i["seller_type"]}):
         t.append(f'<span class="tag">{SELLER.get(s, e(s))}</span>')
     for k, lbl in (("encumbrance", "обременение?"), ("share", "доля?"), ("auction", "торги?")):
@@ -206,11 +250,15 @@ def _delta(o):
     """Значок «цена снижена/повышена» — как на карточке в программе."""
     with_change = [i for i in o["items"] if i["active"] and _last_change(i)]
     i = next((x for x in with_change if x["price"] == o["price"]), None) or (with_change[0] if with_change else None)
-    if i is None:
-        return ""
-    old, now, _ = _last_change(i)
-    d = now - old
-    return f'<span class="delta {"down" if d < 0 else "up"}">{"↓" if d < 0 else "↑"} {mln(abs(d))} млн</span>'
+    if i is not None:
+        old, now, _ = _last_change(i)
+        d = now - old
+        return f'<span class="delta {"down" if d < 0 else "up"}">{"↓" if d < 0 else "↑"} {mln(abs(d))} млн</span>'
+    rl = o.get("relisted")
+    if rl:
+        d = rl["diff"]
+        return f'<span class="delta {"down" if d < 0 else "up"}">↻ {"↓" if d < 0 else "↑"} {mln(abs(d))} млн</span>'
+    return ""
 
 
 def _old_price(o):
@@ -251,6 +299,7 @@ def _card(o, n):
       <div class="addr"><span>{e(o["address"]) or "адрес не указан"}</span></div>
       {f'<div class="meta">{e(meta)}</div>' if meta else ""}
       <div class="tags">{_tags(o)}</div>
+      {f'<div class="card-note">✎ {e(o["note"])}</div>' if o.get("note") else ""}
       {_offers(o)}
       <p class="desc">{e((o["p"]["description"] or "")[:320])}</p>
     </div>

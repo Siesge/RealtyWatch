@@ -1,7 +1,7 @@
 """Объединение объявлений одной квартиры в карточку. Строгие правила прежние; мягкое совпадение — для
 вторичного жилья на разных сайтах, которые расходятся в площади (с балконом и без) или в этажности дома.
 База — во временной папке, данные синтетические (по образцу квартиры на Украинской, 1 из базы владельца)."""
-from app import db, dedupe
+from app import db, dedupe, geo
 from tests.support import Case
 
 N = [0]
@@ -114,3 +114,34 @@ class RulesVersion(Case):
         self.assertEqual(con.execute("SELECT COUNT(DISTINCT object_id) FROM listings").fetchone()[0], 1,
                          "объекты пересобраны по новым правилам")
         con.close()
+
+    def test_fast_rebuild_matches_sequential_assign(self):
+        """Быстрый пересчёт в памяти даёт точно те же object_id, что и последовательный assign()."""
+        for i in range(15):
+            base_lat, base_lon = 44.4883 + i * 0.003, 34.1387 + (i % 4) * 0.003
+            add("cian", 50.0 + i, 10_000_000 + i * 100_000, floors=5, floor=2, rooms=2, lat=base_lat, lon=base_lon)
+            add("avito", 51.8 + i, 10_050_000 + i * 100_000, floors=5, floor=2, rooms=2, lat=base_lat, lon=base_lon)
+            add("yandex", 50.0 + i, 10_000_000 + i * 100_000, floors=6, floor=2, rooms=2, lat=base_lat, lon=base_lon)
+            add("avito", 40.0 + i, 9_000_000, floors=9, floor=1, rooms=1, new=1, year=2022, lat=base_lat, lon=base_lon)
+        con = db.connect()
+        con.execute("UPDATE listings SET object_id=NULL")
+        for r in con.execute("SELECT source, source_id FROM listings ORDER BY first_seen, source, source_id").fetchall():
+            dedupe.assign(con, r["source"], r["source_id"])
+        con.commit()
+        seq = {(r["source"], r["source_id"]): r["object_id"]
+               for r in con.execute("SELECT source, source_id, object_id FROM listings")}
+        n_obj = dedupe.rebuild(con)
+        fast = {(r["source"], r["source_id"]): r["object_id"]
+                for r in con.execute("SELECT source, source_id, object_id FROM listings")}
+        con.close()
+        self.assertEqual(fast, seq)
+        self.assertEqual(n_obj, len(set(fast.values())))
+
+    def test_geo_polygon_bbox_matches_full_raycast(self):
+        """Быстрое отсечение по ограничивающему прямоугольнику не меняет результат классификации полигона."""
+        poly = geo._polygon("yalta_city.json")
+        self.assertIsNotNone(poly)
+        pts = [(44.495, 34.165), (44.45, 34.12), (44.40, 33.90), (45.0, 35.0), (44.51, 34.20)]
+        pb = geo._polygon_with_bbox("yalta_city.json")
+        for lat, lon in pts:
+            self.assertEqual(geo._in_polygon(lat, lon, poly), geo._in_polygon(lat, lon, *pb))

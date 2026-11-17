@@ -30,6 +30,17 @@ def _polygon(name):
         return None
 
 
+@lru_cache(maxsize=None)
+def _polygon_with_bbox(name):
+    """Полигон и его ограничивающий прямоугольник (min_lat, max_lat, min_lon, max_lon)."""
+    poly = _polygon(name)
+    if not poly:
+        return None
+    lats = [p[0] for p in poly]
+    lons = [p[1] for p in poly]
+    return poly, (min(lats), max(lats), min(lons), max(lons))
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     r = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -38,7 +49,9 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
-def _in_polygon(lat, lon, poly):
+def _in_polygon(lat, lon, poly, bbox=None):
+    if bbox is not None and (lat < bbox[0] or lat > bbox[1] or lon < bbox[2] or lon > bbox[3]):
+        return False
     inside = False
     j = len(poly) - 1
     for i in range(len(poly)):
@@ -70,10 +83,10 @@ def other_settlement(address):
 def outside_district(item):
     """True, если координаты вне Ялтинского округа (сайты иногда подмешивают Алушту и др.)."""
     lat, lon = item.get("lat"), item.get("lon")
-    poly = _polygon("yalta_district.json")
-    if lat is None or lon is None or not poly:
+    pb = _polygon_with_bbox("yalta_district.json")
+    if lat is None or lon is None or not pb:
         return "алушта" in (item.get("address") or "").lower()
-    return not _in_polygon(lat, lon, poly)
+    return not _in_polygon(lat, lon, *pb)
 
 
 def classify(item, zone):
@@ -85,7 +98,7 @@ def classify(item, zone):
     if _CITY_RE.search(address):
         return "B"
     lat, lon = item.get("lat"), item.get("lon")
-    city = _polygon("yalta_city.json")
-    if lat is not None and lon is not None and city:
-        return "B" if _in_polygon(lat, lon, city) else "C"
+    pb = _polygon_with_bbox("yalta_city.json")
+    if lat is not None and lon is not None and pb:
+        return "B" if _in_polygon(lat, lon, *pb) else "C"
     return "B"

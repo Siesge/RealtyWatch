@@ -44,6 +44,12 @@ class LikedPage(Case):
         self.obj2 = c.execute("SELECT object_id FROM listings WHERE source='cian' AND source_id='1'").fetchone()[0]
         for source, sid in (("cian", "1"), ("cian", "3")):
             c.execute("INSERT INTO likes VALUES(?,?,?)", (source, sid, db.now()))
+        c.execute("INSERT INTO notes VALUES('cian','1',?,?)", ("Позвонили: 5 этаж без лифта, возможен торг", db.now()))
+        # «Морская, 5»: снятое раньше старое объявление Авито стоило дороже (12,5 млн) -> перевыставлено дешевле
+        c.execute("UPDATE listings SET first_seen='2026-10-01T10:00:00' WHERE source='cian' AND source_id='1'")
+        c.execute("UPDATE listings SET first_seen='2026-10-15T10:00:00' WHERE source='avito' AND source_id='2'")
+        c.execute("UPDATE listings SET active=0, price=12500000, removed_at='2026-10-10T10:00:00' "
+                  "WHERE source='cian' AND source_id='1'")
         # у «Дальней, 7» цена снижалась, а объявление снято с продажи
         c.execute("INSERT INTO price_history VALUES('cian','3',?,9500000)", (db.now(),))
         c.execute("UPDATE listings SET active=0, removed_at=?, removed_reason='нет на сайте' WHERE source='cian' AND source_id='3'",
@@ -108,6 +114,18 @@ class LikedPage(Case):
     def test_price_change_shown(self):
         self.assertIn("old-price", self.page + " ", "прежняя цена зачёркнута")
         self.assertIn("delta", self.page, "значок изменения цены на месте")
+        self.assertIn("Позвонили: 5 этаж без лифта, возможен торг", self.page, "заметка попадает в выгрузку избранного")
+        self.assertIn("перевыставлено", self.page, "перевыставление со старого снятого объявления отмечено")
+
+    def test_relisted_guards_against_empty_best_and_simultaneous_ads(self):
+        self.assertIsNone(share._relisted([
+            {"active": 1, "price": 9_000_000, "first_seen": "2026-11-10T10:00:00", "source": "avito"},
+            {"active": 0, "price": 10_000_000, "first_seen": "2026-11-01T10:00:00", "source": "cian"},
+        ], 8_000_000))
+        self.assertIsNone(share._relisted([
+            {"active": 1, "price": 9_000_000, "first_seen": "2026-11-01T10:15:00", "source": "avito"},
+            {"active": 0, "price": 10_000_000, "first_seen": "2026-11-01T10:00:00", "source": "cian"},
+        ], 9_000_000))
 
     def test_export_writes_file(self):
         res = share.export(str(self.dir / "избранное"), con())

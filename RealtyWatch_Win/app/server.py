@@ -32,16 +32,21 @@ def listings():
             hist.setdefault((r["source"], str(r["source_id"])), []).append([r["ts"], r["price"]])
         liked = {(r["source"], str(r["source_id"])) for r in con.execute("SELECT source, source_id FROM likes")}
         disliked = {(r["source"], str(r["source_id"])) for r in con.execute("SELECT source, source_id FROM dislikes")}
+        notes = {(r["source"], str(r["source_id"])): (r["text"] or "", r["ts"] or "")
+                 for r in con.execute("SELECT source, source_id, text, ts FROM notes")}
     finally:
         con.close()
     have_img = images.existing_set()
     for r in rows:
         key = (r["source"], str(r["source_id"]))
         r["flags"] = json.loads(r["flags"]) if r["flags"] else {}
-        r["raw"] = json.loads(r["raw"]) if r["raw"] else {}
+        raw = json.loads(r["raw"]) if r["raw"] else {}
+        r["apartments"] = bool(raw.get("apartments") or raw.get("isApartments"))
+        r.pop("raw", None)
         r["history"] = hist.get(key, [])
         r["liked"] = key in liked
         r["disliked"] = key in disliked
+        r["note"], r["note_ts"] = notes.get(key, ("", ""))
         r["object_id"] = r["object_id"] or f"{r['source']}:{r['source_id']}"
         r["has_img"] = key in have_img
         # объявления нет в поиске сайта столько прогонов, что ссылка на него уже никуда не ведёт
@@ -77,6 +82,26 @@ def like(body: dict = Body(...)):
 def dislike(body: dict = Body(...)):
     """Скрытые (дизлайк): квартира убирается из просмотра, но собирается и обновляется как все."""
     return _mark("dislikes", "likes", body)
+
+
+@app.post("/api/note")
+def note_set(body: dict = Body(...)):
+    """Личная заметка к квартире (по каждому её объявлению, чтобы переживала пересборку и слияния)."""
+    keys = [k.split(":", 1) for k in body.get("keys", []) if ":" in str(k)]
+    text = str(body.get("text") or "").strip()[:2000]
+    ts = db.now() if text else ""
+    con = db.connect()
+    try:
+        for source, sid in keys:
+            if text:
+                con.execute("INSERT OR REPLACE INTO notes(source, source_id, text, ts) VALUES(?,?,?,?)",
+                            (source, sid, text, ts))
+            else:
+                con.execute("DELETE FROM notes WHERE source=? AND source_id=?", (source, sid))
+        con.commit()
+    finally:
+        con.close()
+    return {"ok": True, "text": text, "ts": ts}
 
 
 @app.get("/img/{source}/{source_id}")
