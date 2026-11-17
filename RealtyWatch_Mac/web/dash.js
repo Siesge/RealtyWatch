@@ -130,6 +130,9 @@ const DASH_PERIODS = [["3", "3 дня"], ["7", "Неделя"], ["30", "Меся
 let DASH_PERIOD = store.get("rw.dashPeriod", "all"), DASH_S = [], DASH_D = null;
 // Только внутри круга (зона A): все блоки пересчитываются по квартирам в круге
 let DASH_ZONE = store.get("rw.dashZone", "0") === "1";
+// Скрытые квартиры (👎) не попадают в списки квартир дашборда — «Подешевели» и «Самые выгодные».
+// Медианы и графики рынка считаются по всем: рынок от того, что квартира вам не понравилась, не меняется
+let DASH_NODIS = store.get("rw.dashNoDis", "1") === "1";
 // Движение рынка: по умолчанию столбик — день (неделя, месяц на длинном периоде), по кнопке — проверка
 let DASH_EV_SCANS = store.get("rw.dashEvScans", "0") === "1";
 
@@ -267,6 +270,8 @@ function paintDashboard() {
         <span class="meta" id="dashPeriodNote"></span>
         <label class="zone-only ${Z ? "on" : ""}" title="Пересчитать весь дашборд только по квартирам внутри красного круга (зона A): показатели, графики, срез, источники, самые выгодные, подешевевшие и избранное. Выключено — вся Ялта (зоны A и B)">
           <input type="checkbox" id="dashZone" ${Z ? "checked" : ""}><span class="sw-mini"></span><span>Только внутри круга</span></label>
+        <label class="zone-only ${DASH_NODIS ? "on" : ""}" title="Не показывать в списках «Подешевели» и «Самые выгодные» квартиры, отмеченные «не нравится» (👎). Медианы, графики и срез рынка считаются по всем квартирам: рынок от ваших отметок не меняется">
+          <input type="checkbox" id="dashNoDis" ${DASH_NODIS ? "checked" : ""}><span class="sw-mini"></span><span>Исключить дизлайки</span></label>
       </div>
 
       ${chartCard("chRooms", "span2", "Медианная цена по комнатности", `${scope}, каждая точка — одна проверка рынка`, DASH_TIP.rooms(Z))}
@@ -319,6 +324,13 @@ function paintDashboard() {
   $("#dashZone").onchange = () => {
     DASH_ZONE = $("#dashZone").checked;
     store.set("rw.dashZone", DASH_ZONE ? "1" : "0");
+    const y = $(".main").scrollTop;
+    paintDashboard();
+    $(".main").scrollTop = y;
+  };
+  $("#dashNoDis").onchange = () => {
+    DASH_NODIS = $("#dashNoDis").checked;
+    store.set("rw.dashNoDis", DASH_NODIS ? "1" : "0");
     const y = $(".main").scrollTop;
     paintDashboard();
     $(".main").scrollTop = y;
@@ -445,26 +457,30 @@ function dropsBlock() {
       const before = h.filter(x => new Date(x[0]).getTime() <= from);
       const p0 = before.length ? before[before.length - 1][1] : h[0][1];
       const d = pct(i.price, p0);
-      if (d < 0 && (!best || d < best.d)) best = { d, p0, p1: i.price, src: i.source };
+      if (d < 0 && (!best || d < best.d)) best = { d, p0, p1: i.price, src: i.source, relisted: false };
+    }
+    if (o.relisted && o.relisted.diff < 0 && new Date(o.relisted.newFirst || 0).getTime() >= from) {
+      if (!best || o.relisted.pct < best.d)
+        best = { d: o.relisted.pct, p0: o.relisted.old, p1: o.relisted.now, src: o.relisted.oldSrc, relisted: true };
     }
     if (best) rows.push({ o, ...best });
   }
   rows.sort((a, b) => a.d - b.d);
   if (!rows.length) return `<div class="empty small"><b>Снижений цены пока нет</b>За выбранный период ни одна подходящая квартира${DASH_ZONE ? " в круге" : ""} не подешевела. Как только продавцы начнут снижать цены, самые сильные снижения появятся здесь — с этими продавцами проще торговаться.</div>`;
   const days = o => Math.max(0, Math.round((now - new Date(o.first_seen).getTime()) / 864e5));
-  return `<div class="drops">${rows.slice(0, 8).map(({ o, d, p0, p1, src }) => `<button class="drop" data-card="${esc(o.id)}" title="${esc(`${o.address || ""}\n${SRC[src]}: ${fmt(p0)} → ${fmt(p1)} ₽ (${signed(d)}). Клик — карточка в подборке`)}">
+  return `<div class="drops">${rows.slice(0, 8).map(({ o, d, p0, p1, src, relisted }) => `<button class="drop" data-card="${esc(o.id)}" title="${esc(`${o.address || ""}\n${relisted ? `Перевыставлено дешевле (ранее ${SRC[src]}): ` : `${SRC[src]}: `}${fmt(p0)} → ${fmt(p1)} ₽ (${signed(d)}). Клик — карточка в подборке`)}">
       <span class="d-main"><b>${o.rooms === 0 ? "студия" : `${o.rooms}-к`}, ${o.area} м²</b> <span class="meta">${esc(shortAddr(o.address))}</span></span>
       <span class="d-price">${mln(p0)} → <b>${mln(p1)}</b> млн</span>
-      <span class="d-pct">${signed(d)}</span>
+      <span class="d-pct">${relisted ? "↻ " : ""}${signed(d)}</span>
       <span class="d-age">${days(o)} дн.</span></button>`).join("")}
     ${rows.length > 8 ? `<div class="meta d-more">ещё ${rows.length - 8} ${plural(rows.length - 8, "квартира", "квартиры", "квартир")} подешевели</div>` : ""}</div>`;
 }
 
 const shortAddr = a => (a || "").replace(/^(Россия,\s*)?(Республика Крым,\s*)?(городской округ Ялта,\s*)?(Ялта,\s*)?/i, "").slice(0, 40);
 
-// Квартиры, по которым считается дашборд: вся Ялта (A+B) или только круг (A)
+// Квартиры для списков дашборда: вся Ялта (A+B) или только круг (A); скрытые (👎) — по галочке
 function scopeObjs() {
-  return cityObjs().filter(o => !DASH_ZONE || o.zone === "A");
+  return cityObjs().filter(o => (!DASH_ZONE || o.zone === "A") && !(DASH_NODIS && o.disliked));
 }
 
 function cityObjs() {
@@ -538,53 +554,104 @@ const chQuery = p => p === "last" ? "last=1" : p.endsWith("h") ? `hours=${parseF
 function openView(v) {
   const [name, arg] = String(v).split(":");
   if (name === "changes" && arg) { CH_PERIOD = arg; store.set("rw.chPeriod", arg); }
+  if (name === "cards" && arg === "hidden") {
+    // уведомление «в скрытые квартиры добавились объявления» — сразу «Скрытые»
+    const h = $("#fHidden");
+    if (!h.checked) { h.checked = true; h.dispatchEvent(new Event("input", { bubbles: true })); }
+  }
   setView(name);
 }
 
+let CH_DATA = null;
+
 async function renderChanges() {
-  const el = $("#view-changes");
-  const [ev, lastRuns] = await Promise.all([api(`/api/changes?${chQuery(CH_PERIOD)}`), CH_PERIOD === "last" ? api("/api/last_update") : null]);
+  const reqPeriod = CH_PERIOD;
+  const [ev, lastRuns] = await Promise.all([api(`/api/changes?${chQuery(reqPeriod)}`), reqPeriod === "last" ? api("/api/last_update") : null]);
+  if (CH_PERIOD !== reqPeriod) return;
+  CH_DATA = { period: reqPeriod, ev, lastRuns };
   if (view !== "changes") return;
+  paintChanges();
+}
+
+function paintChanges() {
+  const el = $("#view-changes");
+  if (!CH_DATA) return;
+  const { ev, lastRuns } = CH_DATA;
   const kinds = JSON.parse(store.get("rw.chKinds", '["new","down","up","removed","returned"]'));
-  const onlyPass = store.get("rw.chPass", "1") === "1";
   const kindOf = e => e.kind === "price" ? ((e.new_value || 0) < (e.old_value || 0) ? "down" : "up") : e.kind;
+  const f = readFilters();
+  const objById = new Map(OBJS.map(o => [o.id, o]));
+  const remObjs = new Set();
+  for (const e of ev) {
+    if (e.kind === "removed") remObjs.add(e.object_id || `${e.source}:${e.source_id}`);
+  }
+  const counts = { new: 0, down: 0, up: 0, removed: 0, returned: 0 };
   const groups = new Map();
+  const zoneMap = new Map();
   for (const e of ev) {
     const k = kindOf(e);
-    if (!kinds.includes(k)) continue;
     const oid = e.object_id || `${e.source}:${e.source_id}`;
+    const o = objById.get(oid);
+    const allowRemoved = k === "removed" || (kinds.includes("removed") && remObjs.has(oid));
+    if (matchObject(o, f, { ignoreZone: true, allowRemoved })) {
+      if (f.zones.includes(o.zone) && k in counts) counts[k]++;
+      if (kinds.includes(k) && o && !zoneMap.has(oid)) zoneMap.set(oid, o);
+    }
+    if (!kinds.includes(k)) continue;
     if (!groups.has(oid)) groups.set(oid, []);
     groups.get(oid).push({ ...e, k });
   }
-  let tiles = [...groups.entries()].map(([oid, list]) => ({ oid, list, o: OBJS.find(x => x.id === oid) }));
-  if (onlyPass) tiles = tiles.filter(t => t.o && !t.o.excluded);
-  const cnt = k => ev.filter(e => kindOf(e) === k).length;
+  const tiles = [];
+  for (const [oid, list] of groups) {
+    const o = objById.get(oid);
+    if (!matchObject(o, f, { allowRemoved: list.some(e => e.k === "removed") })) continue;
+    const lastTs = list.reduce((m, e) => (e.ts > m ? e.ts : m), "");
+    tiles.push({ oid, list, o, lastTs });
+  }
+  if (f.sort === "new") {
+    tiles.sort((a, b) => (b.lastTs > a.lastTs ? 1 : b.lastTs < a.lastTs ? -1 : 0));
+  } else {
+    const dir = f.sort.startsWith("-") ? -1 : 1;
+    tiles.sort((a, b) => ((sortKey(a.o, f.sort) > sortKey(b.o, f.sort)) ? 1 : (sortKey(a.o, f.sort) < sortKey(b.o, f.sort)) ? -1 : 0) * dir);
+  }
+  if (f.hiddenOnly) tiles.sort((a, b) => (b.o.fresh.length > 0) - (a.o.fresh.length > 0));
+  renderHeader([], [...zoneMap.values()]);
+  fitToolbar();
+  const emptyMsg = ev.length
+    ? `<div class="empty"><b>По выбранным фильтрам изменений нет</b>Всего за период событий: ${ev.length} — измените фильтры сверху (зону, комнаты, статус, цену или типы изменений).</div>`
+    : `<div class="empty"><b>Изменений нет</b>${CH_PERIOD === "last" ? "Последнее обновление ничего не изменило" : "За выбранный период"} по выбранным типам. Первичная загрузка сайта изменениями не считается.</div>${aboutTab("changes")}`;
   el.innerHTML = `<div class="ch-bar panel">
       <div class="seg small">${CH_PERIODS.map(([v, l, tip]) => `<label title="${tip}"><input type="radio" name="chPeriod" value="${v}" ${v === CH_PERIOD ? "checked" : ""}><span>${l}</span></label>`).join("")}</div>
-      <div class="seg small">${Object.entries(KIND).map(([k, v]) => `<label title="${v.tip}"><input type="checkbox" name="chKind" value="${k}" ${kinds.includes(k) ? "checked" : ""}><span><i class="kdot ${v.cls}"></i>${v.label} <em>${cnt(k)}</em></span></label>`).join("")}</div>
-      <label class="check" title="Показывать только квартиры, подходящие под параметры поиска"><input type="checkbox" id="chPass" ${onlyPass ? "checked" : ""}><span>только подходящие</span></label>
+      <div class="seg small">${Object.entries(KIND).map(([k, v]) => `<label title="${v.tip}"><input type="checkbox" name="chKind" value="${k}" ${kinds.includes(k) ? "checked" : ""}><span><i class="kdot ${v.cls}"></i>${v.label} <em>${counts[k] || 0}</em></span></label>`).join("")}</div>
       <span class="meta">${tiles.length} ${plural(tiles.length, "объект", "объекта", "объектов")} с изменениями</span>
       ${lastRuns ? `<div class="ch-last" title="Последний законченный сбор каждого сайта: изменения выше найдены именно им">${lastRuns.length
         ? "Последнее обновление: " + lastRuns.map(r => `<span><i class="sdot ${r.source}"></i>${SRC[r.source]} ${dtt(r.finished)}${r.status !== "done" ? ` <em class="st-badge ${r.status}">${STATE[r.status] || r.status}</em>` : ""}</span>`).join("")
         : "Сборов ещё не было"}</div>` : ""}
     </div>
-    ${tiles.length ? `<div class="ch-grid">${tiles.map(changeTile).join("")}</div>` :
-      `<div class="empty"><b>Изменений нет</b>${CH_PERIOD === "last" ? "Последнее обновление ничего не изменило" : "За выбранный период"} по выбранным типам. Первичная загрузка сайта изменениями не считается.</div>${aboutTab("changes")}`}`;
+    ${tiles.length ? `<div class="ch-grid">${tiles.map(changeTile).join("")}</div>` : emptyMsg}`;
   el.querySelectorAll("input[name=chPeriod]").forEach(r => r.onchange = () => { CH_PERIOD = r.value; store.set("rw.chPeriod", r.value); renderChanges(); });
   el.querySelectorAll("input[name=chKind]").forEach(c => c.onchange = () => {
-    store.set("rw.chKinds", JSON.stringify([...el.querySelectorAll("input[name=chKind]:checked")].map(x => x.value))); renderChanges();
+    store.set("rw.chKinds", JSON.stringify([...el.querySelectorAll("input[name=chKind]:checked")].map(x => x.value)));
+    paintChanges();
   });
-  $("#chPass").onchange = () => { store.set("rw.chPass", $("#chPass").checked ? "1" : "0"); renderChanges(); };
   el.querySelectorAll("[data-card]").forEach(b => b.onclick = () => goToCard(b.dataset.card));
   el.querySelectorAll("[data-open]").forEach(b => b.onclick = () => openObject(b.dataset.open));
 }
 
-function eventText(e) {
+function eventText(e, o) {
   if (e.k === "down" || e.k === "up") {
     const d = e.new_value - e.old_value;
     return `цена ${mln(e.old_value)} → <b>${mln(e.new_value)} млн</b> <span class="${d < 0 ? "good" : "bad"}">(${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽, ${signed(pct(e.new_value, e.old_value))})</span>`;
   }
-  if (e.k === "new") return `новое объявление, ${fmt(e.new_value)} ₽`;
+  if (e.k === "new") {
+    let tail = "";
+    const it = o && o.items.find(i => i.source === e.source && i.source_id === e.source_id);
+    if (o && o.relisted && (!it || it.active) && e.new_value && Math.abs(e.new_value - o.relisted.old) >= 50000) {
+      const d = e.new_value - o.relisted.old;
+      tail = ` · <span class="${d < 0 ? "good" : "bad"}" title="${esc(`Ранее эта же квартира продавалась на ${SRC[o.relisted.oldSrc]} за ${fmt(o.relisted.old)} ₽`)}">↻ перевыставлено (${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽ к прежним ${mln(o.relisted.old)} млн)</span>`;
+    }
+    return `новое объявление, ${fmt(e.new_value)} ₽${tail}`;
+  }
   if (e.k === "removed") return `снято с продажи: ${esc(e.note || "")}`;
   if (e.k === "returned") return `снова в продаже${e.new_value ? `, ${fmt(e.new_value)} ₽` : ""}`;
   return e.kind;
@@ -602,9 +669,15 @@ function changeTile(t) {
         <span class="ch-price" title="Текущая цена объекта (минимальная среди активных объявлений)">${o ? `${fmt(o.price)} ₽` : ""}</span></div>
       <div class="addr" title="Адрес">${ICON.pin}<span>${esc((o && o.address) || e0.address || "")}</span></div>
       <div class="ch-sum" title="На каких сайтах были изменения">${sites.length > 1 ? `изменения на ${sites.length} сайтах: ` : ""}${sites.map(s => `<i class="sdot ${s}"></i> ${SRC[s]}`).join(", ")}</div>
-      <ul class="ch-list">${t.list.map(e => `<li title="${esc(KIND[e.k].tip + " — " + tsLabel(e.ts))}"><span class="kbadge ${KIND[e.k].cls}">${KIND[e.k].label}</span>
-        <span class="ch-when">${tsLabel(e.ts)}</span><i class="sdot ${e.source}" title="${SRC[e.source]}"></i> <span>${SRC[e.source]}: ${eventText(e)}</span>
-        <a href="${esc(e.url)}" target="_blank" rel="noopener" title="Открыть объявление на ${SRC[e.source]}">${ICON.ext}</a></li>`).join("")}</ul>
+      <ul class="ch-list">${t.list.map(e => {
+        const it = o && o.items.find(i => i.source === e.source && i.source_id === e.source_id);
+        const link = it && it.off_site
+          ? `<span class="off-link" title="${esc(offTip(it, o.active))}">${ICON.noext}</span>`
+          : `<a href="${esc(e.url)}" target="_blank" rel="noopener" title="Открыть объявление на ${SRC[e.source]}">${ICON.ext}</a>`;
+        return `<li title="${esc(KIND[e.k].tip + " — " + tsLabel(e.ts))}"><span class="kbadge ${KIND[e.k].cls}">${KIND[e.k].label}</span>
+        <span class="ch-when">${tsLabel(e.ts)}</span><i class="sdot ${e.source}" title="${SRC[e.source]}"></i> <span>${SRC[e.source]}: ${eventText(e, o)}</span>
+        ${link}</li>`;
+      }).join("")}</ul>
       ${o ? `<div class="ch-acts"><button class="btn-sec sm" data-card="${esc(o.id)}" title="Открыть эту квартиру в подборке">В подборке</button>
         <button class="btn-sec sm" data-open="${esc(o.id)}" title="Окно с историей цен по каждому сайту">${ICON.chart}История цен</button></div>` : ""}
     </div></article>`;
@@ -623,7 +696,7 @@ async function updateChangesBadge() {
 }
 
 function markChangesSeen() {
-  store.set("rw.chSeen", new Date(Date.now() + 60000).toISOString().slice(0, 19));
+  store.set("rw.chSeen", localIso(Date.now() + 60000));
   $("#chBadge").classList.add("hidden");
 }
 
@@ -648,8 +721,33 @@ async function initSound() {
   };
 }
 
-// ---------- окно объекта: история цен ----------
-function openObject(id) {
+// ---------- окно объекта: история цен и личная заметка ----------
+async function saveObjectNote(o, rawText) {
+  const btn = $("#noteSave"), del = $("#noteDel");
+  if (btn) btn.disabled = true;
+  if (del) del.disabled = true;
+  try {
+    const r = await post("/api/note", { keys: o.items.map(key), text: rawText });
+    o.note = r.text;
+    o.note_ts = r.ts;
+    o.items.forEach(i => { i.note = r.text; i.note_ts = r.ts; });
+    o.text = [...o.items.map(i => `${i.title} ${i.address} ${i.description}`), o.note].join(" ").toLowerCase();
+    const ta = $("#objNote");
+    if (ta) ta.value = r.text;
+    const st = $("#noteStatus");
+    if (st) st.textContent = r.ts ? `сохранено ${tsLabel(r.ts)}` : "хранится только у вас, в базе";
+    if (del) del.classList.toggle("hidden", !r.text);
+    if (["cards", "table", "map", "changes"].includes(view)) render();
+    toast("ok", r.text ? "Заметка сохранена" : "Заметка удалена", r.text ? "Она видна на карточке и в выгрузке избранного" : "");
+  } catch (e) {
+    toast("warn", "Не удалось сохранить заметку", e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+    if (del) del.disabled = false;
+  }
+}
+
+function openObject(id, focusNote = false) {
   const o = OBJS.find(x => x.id === id);
   if (!o) return;
   const changed = o.items.some(i => lastChange(i));
@@ -663,14 +761,31 @@ function openObject(id) {
         <div class="m-price" title="Минимальная цена среди активных объявлений">${fmt(o.price)} ₽ <span class="meta">${fmt(o.price_m2)} ₽/м²</span> ${oldPrice(o)}</div>
         <div class="tags">${tags(o)}</div>
         ${offers(o)}
+        <div class="m-note">
+          <label for="objNote">Личная заметка</label>
+          <textarea id="objNote" rows="2" maxlength="2000" placeholder="Впечатления от квартиры, контакты, итог звонка, условия торга…">${esc(o.note || "")}</textarea>
+          <div class="m-note-acts">
+            <span class="meta" id="noteStatus">${o.note_ts ? `сохранено ${tsLabel(o.note_ts)}` : "хранится только у вас, в базе"}</span>
+            <span class="m-note-btns">
+              <button type="button" class="btn-sec sm ${o.note ? "" : "hidden"}" id="noteDel">Очистить</button>
+              <button type="button" class="btn-pri sm" id="noteSave">${ICON.ok}Сохранить заметку</button>
+            </span>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="m-chart-head"><h3>История цен по сайтам</h3><span class="meta">${changed ? "ступенька — изменение цены" : "цена не менялась с момента появления в базе"}</span></div>
+    <div class="m-chart-head"><h3>История цен по сайтам</h3><span class="meta">${changed ? "ступенька — изменение цены" : "цена не менялась с момента появления в базе"}</span>
+      <button class="link sm" id="chObjScale"></button></div>
     <div class="chart-box tall"><canvas id="chObj"></canvas></div>
     <div class="m-hist">${priceTable(o)}</div>
     ${desc ? `<details class="m-desc"><summary>Описание</summary><p>${esc(desc)}</p></details>` : ""}`;
   $("#modal").classList.remove("hidden");
   drawObjectChart(o);
+  const ta = $("#objNote");
+  $("#noteSave").onclick = () => saveObjectNote(o, ta.value);
+  $("#noteDel").onclick = () => saveObjectNote(o, "");
+  ta.onkeydown = e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveObjectNote(o, ta.value); } };
+  if (focusNote) requestAnimationFrame(() => ta.focus());
 }
 
 function priceTable(o) {
@@ -688,8 +803,23 @@ function priceTable(o) {
     <td class="num">${r.gone ? "" : fmt(r.price) + " ₽"}</td></tr>`).join("")}</tbody></table>`;
 }
 
+// Шкала графика цен: от нуля (по умолчанию) — изменение цены видно в настоящем масштабе: снижение на 300 тысяч
+// при цене 10 млн выглядит как 3%, а не как обрыв. «По ценам» — ось от меньшей цены до большей, как раньше:
+// видна каждая ступенька. Переключается кликом по графику или кнопкой над ним; выбор запоминается
+let OBJ_ABS = store.get("rw.objChartAbs", "1") !== "0";
+const SCALE_TIP = {
+  abs: ["шкала от нуля", "Шкала от нуля: изменения цены видны в настоящем масштабе. Клик по графику — шкала по ценам, крупнее"],
+  rel: ["шкала по ценам", "Шкала от меньшей цены до большей: видна каждая ступенька, но изменение выглядит крупнее, чем есть. Клик по графику — шкала от нуля"],
+};
+
 function drawObjectChart(o) {
   if (charts.chObj) charts.chObj.destroy();
+  const btn = $("#chObjScale"), [lbl, tip] = SCALE_TIP[OBJ_ABS ? "abs" : "rel"];
+  if (btn) {
+    btn.textContent = lbl;
+    btn.title = tip;
+    btn.onclick = () => { OBJ_ABS = !OBJ_ABS; store.set("rw.objChartAbs", OBJ_ABS ? "1" : "0"); drawObjectChart(o); };
+  }
   const now = Date.now();
   const per = {};
   const ds = o.items.map(i => {
@@ -707,8 +837,15 @@ function drawObjectChart(o) {
   opt.scales.x = { type: "linear", grid: { display: false }, border: { color: css("--line-2") },
     ticks: { color: css("--muted"), font: { family: "Manrope" }, maxTicksLimit: 6, callback: v => short ? tsLabel(v) : new Date(v).toLocaleDateString("ru-RU", { day: "numeric", month: "short" }) } };
   opt.scales.y.ticks.callback = v => `${mln(v)} млн`;
+  if (OBJ_ABS) opt.scales.y.min = 0;
   opt.interaction = { mode: "nearest", intersect: false };
   opt.plugins.tooltip.callbacks = { title: c => tsLabel(c[0].parsed.x), label: c => ` ${c.dataset.label}: ${fmt(c.parsed.y)} ₽` };
+  // клик по полю графика (не по легенде: она прячет линию сайта) переключает шкалу
+  const inPlot = (e, ch) => { const a = ch.chartArea; return e.x >= a.left && e.x <= a.right && e.y >= a.top && e.y <= a.bottom; };
+  // пересоздать график — уже после того, как Chart.js закончит разбирать этот клик: внутри его обработчика
+  // уничтоженный график роняет плагины («reading 'handleEvent'»)
+  opt.onClick = (e, els, ch) => { if (btn && inPlot(e, ch)) setTimeout(() => btn.click(), 0); };
+  opt.onHover = (e, els, ch) => { ch.canvas.style.cursor = inPlot(e, ch) ? "pointer" : "default"; };
   charts.chObj = new Chart($("#chObj"), { type: "line", data: { datasets: ds }, options: opt });
 }
 

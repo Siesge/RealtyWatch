@@ -22,6 +22,8 @@ const ICON = {
   noext: '<svg viewBox="0 0 24 24"><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5M14 4h6v6M4 4l16 16"/></svg>',
   map: '<svg viewBox="0 0 24 24"><circle cx="12" cy="10" r="2.5"/><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/></svg>',
   heart: '<svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z"/></svg>',
+  dislike: '<svg viewBox="0 0 24 24"><path d="M10 14.5v4.3a2.2 2.2 0 0 0 4 1.2l3.6-5.5V4H8.4a2 2 0 0 0-2 1.6l-1.3 6.6a2 2 0 0 0 2 2.3zM17.6 4h2.4v10.5h-2.4"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4.3h-4.3"/></svg>',
   warn: '<svg viewBox="0 0 24 24"><path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4.5M12 17.2v.1"/></svg>',
   ok: '<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
   down: '<svg viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></svg>',
@@ -34,6 +36,7 @@ const ICON = {
   chart: '<svg viewBox="0 0 24 24"><path d="M4 19h16M6 15l4-4 3 3 5-6"/></svg>',
   img: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 5-4.5 4 3.5 3-2.5 4 3.5"/></svg>',
   share: '<svg viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4"/></svg>',
+  note: '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
 };
 
 let LASTRUN = {}, ALL = [], OBJS = [], SETTINGS = null, view = "cards", jAfter = 0, lastStates = {};
@@ -53,7 +56,8 @@ const dt = s => s ? new Date(s).toLocaleDateString("ru-RU", { day: "numeric", mo
 const fileName = p => String(p || "").split(/[\\/]/).pop();   // в уведомлении — имя файла: весь путь в него не влезает
 const bkLabel = n => fileName(n).replace(/_\d{4}-\d{2}-\d{2}_\d{4}\.zip$/, "").replace(/_/g, " ");
 const mbs = v => `${Number(v).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} МБ`;
-const today = () => new Date().toISOString().slice(0, 10);
+const localIso = (ms = Date.now()) => { const d = new Date(ms); return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19); };
+const today = () => localIso().slice(0, 10);
 const key = r => `${r.source}:${r.source_id}`;
 const desktop = () => window.pywebview && window.pywebview.api;
 const store = {
@@ -64,7 +68,7 @@ const store = {
 const TAB_ABOUT = {
   cards: "Карточки найденных квартир: фото, цена и её история по каждому сайту, адрес, этаж, площадь, ремонт. Рядом карта — наведите на карточку, и точка подсветится. Сердечком отмечают то, за чем хочется следить: такие квартиры попадают на дашборд.",
   table: "Те же квартиры одним списком: цена, ₽/м², комнаты, площадь, этаж, ремонт, адрес, дата находки. Клик по заголовку колонки сортирует (порядок запоминается), клик по строке открывает карточку в подборке.",
-  changes: "Что изменилось на рынке между проверками: появилось новое объявление, квартиру сняли с продажи, продавец поднял или снизил цену. Можно выбрать период и типы изменений. Первая загрузка сайта изменением не считается.",
+  changes: "Что изменилось на рынке между проверками: появилось новое объявление, квартиру сняли с продажи, продавец поднял или снизил цену. Можно выбрать период, типы изменений и отфильтровать по зоне, комнатам, цене и другим параметрам. Первичная загрузка сайта изменениями не считается.",
   runs: "История сборов: когда запускался каждый сайт, сколько страниц прочитано и объявлений собрано, сколько новых и снятых. У каждого прогона есть подробный журнал — по нему видно, где сбор споткнулся.",
 };
 const aboutTab = key => ALL.length ? "" : `<div class="about"><b>Краткое описание</b><p>${TAB_ABOUT[key]}</p></div>`;
@@ -80,11 +84,34 @@ const plural = (n, one, few, many) => { const m10 = n % 10, m100 = n % 100; retu
 async function loadData() {
   ALL = await api("/api/listings");
   buildObjects();
+  if (view === "changes") { renderChanges(); return; }
   render();
   if (view === "dashboard") renderDashboard();
-  if (view === "changes") renderChanges();
 }
 async function loadSettings() { SETTINGS = await api("/api/settings"); }
+
+function relistedInfo(items, price) {
+  const live = items.filter(i => i.active && !i.off_site && i.price);
+  const gone = items.filter(i => (!i.active || i.off_site) && i.price);
+  if (!live.length || !gone.length || !price) return null;
+  const best = live.filter(i => i.price === price);
+  if (!best.length) return null;
+  const goneBefore = gone.filter(g => best.every(l => {
+    const gf = g.first_seen || "", lf = l.first_seen || "";
+    if (gf >= lf) return false;
+    const t0 = Date.parse(gf), t1 = Date.parse(lf);
+    return !isFinite(t0) || !isFinite(t1) || (t1 - t0) >= 6 * 3600e3;
+  }));
+  if (!goneBefore.length) return null;
+  goneBefore.sort((a, b) => ((b.removed_at || b.last_seen || "") > (a.removed_at || a.last_seen || "") ? 1 : -1));
+  const prev = goneBefore[0];
+  const diff = price - prev.price;
+  if (Math.abs(diff) < 50000) return null;
+  return {
+    old: prev.price, now: price, diff, pct: 100 * diff / prev.price,
+    oldSrc: prev.source, oldSeen: prev.removed_at || prev.last_seen, newFirst: best[0].first_seen,
+  };
+}
 
 function buildObjects() {
   const groups = new Map();
@@ -101,54 +128,92 @@ function buildObjects() {
     const reno = items.map(i => i.renovation).filter(Boolean).sort((a, b) => (RENO_RANK[b] || 0) - (RENO_RANK[a] || 0));
     const flags = {};
     items.forEach(i => Object.assign(flags, i.flags || {}));
+    const noted = items.filter(i => i.note).sort((a, b) => ((b.note_ts || "") > (a.note_ts || "") ? 1 : -1))[0];
+    const note = noted ? noted.note : "", note_ts = noted ? (noted.note_ts || "") : "";
+    const price = prices.length ? Math.min(...prices) : null;
     return {
-      id: p.object_id, items, p, flags,
+      id: p.object_id, items, p, flags, note, note_ts,
       img: items.find(i => i.has_img) || items.find(i => i.photo),
       sources: [...new Set(items.map(i => i.source))],
-      price: prices.length ? Math.min(...prices) : null, priceMax: prices.length ? Math.max(...prices) : null,
+      price, priceMax: prices.length ? Math.max(...prices) : null,
       liked: items.some(i => i.liked), active: items.some(i => i.active),
+      // лайк и дизлайк взаимоисключающие; если при слиянии баз квартира оказалась и там, и там — побеждает ♥
+      disliked: !items.some(i => i.liked) && items.some(i => i.disliked),
       excluded: items.every(i => i.excluded) ? p.excluded : null,
       renovation: p.excluded || !reno.length ? p.renovation : reno[0],
+      relisted: relistedInfo(items, price),
       first_seen: items.reduce((m, i) => (i.first_seen < m ? i.first_seen : m), p.first_seen),
       zone: p.zone, rooms: p.rooms, area: p.area, floor: p.floor, floors: p.floors, lat: p.lat, lon: p.lon,
       address: items.map(i => i.address).filter(Boolean).sort((a, b) => b.length - a.length)[0] || "",
-      text: items.map(i => `${i.title} ${i.address} ${i.description}`).join(" ").toLowerCase(),
+      text: [...items.map(i => `${i.title} ${i.address} ${i.description}`), note].join(" ").toLowerCase(),
     };
   });
-  OBJS.forEach(o => { o.price_m2 = o.price && o.area ? o.price / o.area : null; });
+  OBJS.forEach(o => { o.price_m2 = o.price && o.area ? o.price / o.area : null; o.fresh = freshItems(o); });
+}
+
+// Скрытая квартира: дизлайк ставится каждому её объявлению, поэтому объявление без дизлайка в скрытой
+// карточке добавилось в неё позже — новая квартира в том же доме или та же квартира на другом сайте.
+// Такие объявления подсвечиваются в «Скрытых», а их число стоит кружком на кнопке
+function freshItems(o) {
+  return o.disliked ? o.items.filter(i => !i.disliked) : [];
 }
 
 // ---------- фильтр просмотра ----------
 const checked = name => $$(`input[name=${name}]:checked`).map(i => i.value);
 
-function filtered(ignoreZone = false) {
-  const src = checked("src"), zones = checked("zone"), rooms = checked("rooms").map(Number);
-  const pmin = parseFloat($("#fPmin").value) * 1e6, pmax = parseFloat($("#fPmax").value) * 1e6;
-  const amin = parseFloat($("#fAmin").value), reno = $("#fReno").value, nb = $("#fNew").value;
-  const st = $("#fState").value, active = $("#fActive").checked, noCoords = $("#fNoCoords").checked, liked = $("#fLiked").checked;
-  const text = $("#fText").value.trim().toLowerCase();
-  let rows = OBJS.filter(o =>
-    o.sources.some(s => src.includes(s)) && (ignoreZone || zones.includes(o.zone)) &&
-    (o.rooms == null || rooms.includes(o.rooms)) &&
-    !(pmin && o.price < pmin) && !(pmax && o.price > pmax) && !(amin && o.area < amin) &&
-    (!reno || (reno === "known" ? o.renovation && o.renovation !== "any" : o.renovation === reno)) &&
-    (nb === "" || String(o.p.is_new_building ?? 0) === nb) &&
-    (st === "all" || (st === "pass" ? !o.excluded : !!o.excluded)) &&
-    (!active || o.active) && (!noCoords || o.lat == null) && (!liked || o.liked) &&
-    (!text || o.text.includes(text)));
+function readFilters() {
+  return {
+    src: checked("src"), zones: checked("zone"), rooms: checked("rooms").map(Number),
+    pmin: parseFloat($("#fPmin").value) * 1e6, pmax: parseFloat($("#fPmax").value) * 1e6,
+    amin: parseFloat($("#fAmin").value), reno: $("#fReno").value, nb: $("#fNew").value,
+    st: $("#fState").value, active: $("#fActive").checked, noCoords: $("#fNoCoords").checked,
+    liked: $("#fLiked").checked, hiddenOnly: $("#fHidden").checked, noDis: $("#fNoDis").checked,
+    text: $("#fText").value.trim().toLowerCase(), sort: $("#fSort").value,
+  };
+}
+
+function matchObject(o, f, { ignoreZone = false, allowRemoved = false } = {}) {
+  if (!o) return false;
+  // «Скрытые» показывают только квартиры с дизлайком; иначе их убирает галочка «исключить дизлайки»
+  const { hiddenOnly, noDis } = f;
+  return o.sources.some(s => f.src.includes(s)) && (ignoreZone || f.zones.includes(o.zone)) &&
+    (o.rooms == null || f.rooms.includes(o.rooms)) &&
+    !(f.pmin && o.price < f.pmin) && !(f.pmax && o.price > f.pmax) && !(f.amin && o.area < f.amin) &&
+    (!f.reno || (f.reno === "known" ? o.renovation && o.renovation !== "any" : o.renovation === f.reno)) &&
+    (f.nb === "" || String(o.p.is_new_building ?? 0) === f.nb) &&
+    (f.st === "all" || (f.st === "pass" ? !o.excluded : !!o.excluded)) &&
+    (!f.active || o.active || allowRemoved) && (!f.noCoords || o.lat == null) && (!f.liked || o.liked) &&
+    (hiddenOnly ? o.disliked : !(noDis && o.disliked)) &&
+    (!f.text || o.text.includes(f.text));
+}
+
+function sortKey(o, s) {
+  if (!o) return 0;
+  return ({ new: o.first_seen, price: o.price, "-price": o.price, ppm: o.price_m2, "-area": o.area }[s]) ?? 0;
+}
+
+function filtered(ignoreZone = false, f = readFilters()) {
+  const rows = OBJS.filter(o => matchObject(o, f, { ignoreZone }));
   if (ignoreZone) return rows;
-  const s = $("#fSort").value;
-  const k = { new: o => o.first_seen, price: o => o.price, "-price": o => o.price, ppm: o => o.price_m2, "-area": o => o.area }[s];
-  const dir = s === "new" || s.startsWith("-") ? -1 : 1;
-  rows.sort((a, b) => ((k(a) ?? 0) > (k(b) ?? 0) ? 1 : (k(a) ?? 0) < (k(b) ?? 0) ? -1 : 0) * dir);
+  const dir = f.sort === "new" || f.sort.startsWith("-") ? -1 : 1;
+  rows.sort((a, b) => ((sortKey(a, f.sort) > sortKey(b, f.sort)) ? 1 : (sortKey(a, f.sort) < sortKey(b, f.sort)) ? -1 : 0) * dir);
+  // в «Скрытых» первыми — карточки, в которые после скрытия добавились объявления
+  if (f.hiddenOnly) rows.sort((a, b) => (b.fresh.length > 0) - (a.fresh.length > 0));
   return rows;
 }
 
-function renderHeader(rows) {
-  const zr = filtered(true);
+function renderHeader(rows, zoneRows = null) {
+  const zr = zoneRows ?? filtered(true);
   for (const z of ["A", "B", "C"]) $(`#zc-${z}`).textContent = zr.filter(o => o.zone === z).length;
   const likes = OBJS.filter(o => o.liked).length;
   $("#likeCount").textContent = likes || "";
+  $("#hideCount").textContent = OBJS.filter(o => o.disliked).length || "";
+  const fresh = OBJS.filter(o => o.fresh.length).length, nb = $("#hideNew");
+  nb.textContent = fresh || "";
+  nb.hidden = !fresh;
+  nb.title = fresh ? `В ${fresh} ${plural(fresh, "скрытую квартиру", "скрытые квартиры", "скрытых квартир")} после скрытия добавились объявления — ` +
+    "это может быть новая квартира в том же доме или та же квартира на другом сайте. Откройте «Скрытые»: эти карточки там первые, новые объявления подсвечены" : "";
+  $("#fNoDisBox").classList.toggle("off", $("#fHidden").checked);  // в «Скрытых» галочка ни на что не влияет
   $("#btnShare").disabled = !likes;  // выгружать нечего, пока ничего не отмечено сердечком
   const ppm = median(rows.map(o => o.price_m2).filter(Boolean));
   const pr = median(rows.map(o => o.price).filter(Boolean));
@@ -166,11 +231,19 @@ function renderHeader(rows) {
 }
 
 function render() {
-  const rows = filtered();
-  renderHeader(rows);
   markFilters();
   fitToolbar();  // счётчики в фильтрах меняют ширину строки
-  if (view === "cards") renderCards(rows);
+  if (view === "changes") {
+    if (typeof paintChanges === "function") paintChanges();
+    return;
+  }
+  const rows = filtered();
+  // «Только в видимой области карты» сужает список карточек, а карта рядом показывает всё по фильтрам:
+  // иначе, сдвинув карту, вы увидели бы пустое место там, где квартиры есть
+  const list = view === "cards" ? inArea(rows) : rows;
+  renderHeader(list);
+  fitToolbar();
+  if (view === "cards") renderCards(list, rows);
   if (view === "table") renderTable(rows);
   if (view === "map") renderMap(rows);
 }
@@ -200,11 +273,25 @@ function priceTip(o) {
   return "Минимальная цена среди активных объявлений объекта.\n" + lines.join("\n") + "\nКлик по карточке — график цен.";
 }
 
+function relistTip(o) {
+  const rl = o.relisted;
+  if (!rl) return "";
+  const d = rl.diff;
+  return `Квартира перевыставлена с изменением цены: раньше на ${SRC[rl.oldSrc]} она продавалась за ${fmt(rl.old)} ₽` +
+    `${rl.oldSeen ? ` (снято ${dtt(rl.oldSeen)})` : ""}, сейчас — ${fmt(rl.now)} ₽ (${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽, ${d > 0 ? "+" : ""}${rl.pct.toFixed(1)}%).`;
+}
+
 function delta(o) {
   const i = o.items.find(x => x.active && x.price === o.price && lastChange(x)) || o.items.find(x => x.active && lastChange(x));
-  if (!i) return "";
-  const [old, now, ts] = lastChange(i), d = now - old;
-  return `<span class="delta ${d < 0 ? "down" : "up"}" title="${SRC[i.source]}: цена ${d < 0 ? "снижена" : "повышена"} ${dtt(ts)} — с ${fmt(old)} до ${fmt(now)} ₽ (${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽, ${(100 * d / old).toFixed(1)}%)">${d < 0 ? "↓" : "↑"} ${mln(Math.abs(d))} млн</span>`;
+  if (i) {
+    const [old, now, ts] = lastChange(i), d = now - old;
+    return `<span class="delta ${d < 0 ? "down" : "up"}" title="${SRC[i.source]}: цена ${d < 0 ? "снижена" : "повышена"} ${dtt(ts)} — с ${fmt(old)} до ${fmt(now)} ₽ (${d > 0 ? "+" : "−"}${fmt(Math.abs(d))} ₽, ${(100 * d / old).toFixed(1)}%)">${d < 0 ? "↓" : "↑"} ${mln(Math.abs(d))} млн</span>`;
+  }
+  if (o.relisted) {
+    const rl = o.relisted, d = rl.diff;
+    return `<span class="delta ${d < 0 ? "down" : "up"}" title="${esc(relistTip(o))}">↻ ${d < 0 ? "↓" : "↑"} ${mln(Math.abs(d))} млн</span>`;
+  }
+  return "";
 }
 
 function oldPrice(o) {
@@ -216,7 +303,7 @@ function oldPrice(o) {
 
 function renoTip(o) {
   const r = o.p;
-  if (o.renovation === "any") return "ЦИАН отнёс объявление к «с ремонтом», но вид ремонта не указан";
+  if (o.renovation === "any") return "Прежняя отметка ЦИАН «с ремонтом» без вида ремонта: так помечались объявления, пока программа не узнавала у ЦИАН вид ремонта. Уточнится при следующем сборе ЦИАН";
   if (!o.renovation) return "Ни сайт, ни описание не указывают вид ремонта. Объявление не отсеяно — проверьте по фото";
   return `Ремонт: ${RENO[o.renovation]}. ` + (r.renovation_raw ? `На сайте указано «${r.renovation_raw}»` : "Определено по тексту описания");
 }
@@ -243,20 +330,41 @@ function offTip(i, alive) {
       "Если объявление всё же живо — «Настройки → База данных → Перепроверить снятые»");
 }
 
+// Причины отсева объекта по одной: в базе они записаны через «; »
+const reasons = o => o.excluded ? String(o.excluded).split(/;\s*/).filter(Boolean) : [];
+const EXCL_TIP = "Не прошло отсев по параметрам поиска (параметры — в «Настройках»)";
+
 function tags(o) {
-  const t = [], r = o.p;
-  if (o.renovation) t.push(`<span class="tag ${o.renovation === "none" ? "bad" : "good"}" title="${esc(renoTip(o))}">${RENO[o.renovation] || o.renovation}</span>`);
+  const x = [], t = [], r = o.p;  // x — причины отсева (✕), идут первыми и подряд; t — остальные бэджи
+  // Причина отсева, у которой есть свой бэдж (ремонт, обременение, доля, торги), показывается этим же бэджем
+  // с крестиком — а не вторым бэджем рядом: «без ремонта» и «✕ без ремонта» говорили одно и то же дважды
+  const why = reasons(o), shown = new Set();
+  const excl = reason => why.includes(reason) && !shown.has(reason) && shown.add(reason);
+  if (o.renovation === "none" && excl("без ремонта"))
+    x.push(`<span class="tag bad" title="${esc(`${EXCL_TIP}: без ремонта.\n${renoTip(o)}`)}">✕ без ремонта</span>`);
+  else if (!o.renovation && excl("ремонт не указан"))
+    x.push(`<span class="tag bad" title="${esc(`${EXCL_TIP}: ремонт не указан, а в настройках — «только указанный ремонт».\n${renoTip(o)}`)}">✕ ремонт не указан</span>`);
+  else if (o.renovation) t.push(`<span class="tag ${o.renovation === "none" ? "bad" : "good"}" title="${esc(renoTip(o))}">${RENO[o.renovation] || o.renovation}</span>`);
   else t.push(`<span class="tag warn" title="${esc(renoTip(o))}">ремонт не указан</span>`);
   if (r.is_new_building) t.push(`<span class="tag" title="Квартира в новостройке (по данным сайта)">новостройка</span>`);
-  if (o.items.some(i => i.raw && i.raw.apartments)) t.push(`<span class="tag warn" title="Юридически апартаменты, а не квартира: нельзя прописаться, выше налог и тарифы ЖКХ">апартаменты</span>`);
+  if (o.items.some(i => i.apartments || (i.raw && (i.raw.apartments || i.raw.isApartments)))) t.push(`<span class="tag warn" title="Юридически апартаменты, а не квартира: нельзя прописаться, выше налог и тарифы ЖКХ">апартаменты</span>`);
+  if (o.relisted) {
+    const rl = o.relisted;
+    t.push(`<span class="tag ${rl.diff < 0 ? "good" : "warn"}" title="${esc(relistTip(o))}">↻ перевыставлено ${rl.diff < 0 ? "↓" : "↑"} ${mln(Math.abs(rl.diff))} млн</span>`);
+  }
   const sellers = [...new Set(o.items.map(i => i.seller_type).filter(Boolean))];
   sellers.forEach(s => t.push(`<span class="tag" title="${esc(SELLER_TIP[s] || s)}">${SELLER[s] || s}</span>`));
   if (o.lat == null) t.push(`<span class="tag warn" title="Сайт не дал координаты: зона определена по адресу, на карте объекта нет">нет координат</span>`);
-  for (const [k, lbl, what] of [["encumbrance", "обременение?", "обременение"], ["share", "доля?", "продажа доли"], ["auction", "торги?", "торги / аукцион"]])
-    if (o.flags[k]) t.push(`<span class="tag warn" title="${esc(`Возможно ${what}. В тексте найдено: «${o.flags[k].join("» … «")}». Проверьте вручную`)}">${lbl}</span>`);
-  if (o.excluded) t.push(`<span class="tag bad" title="${esc(`Не прошло отсев по параметрам поиска: ${o.excluded}. Параметры — в «Настройках»`)}">✕ ${esc(o.excluded)}</span>`);
+  for (const [k, lbl, what, reason] of [["encumbrance", "обременение?", "обременение", "обременение"], ["share", "доля?", "продажа доли", "доля"],
+    ["auction", "торги?", "торги / аукцион", "аукцион/торги"]]) {
+    const found = o.flags[k] ? `В тексте найдено: «${o.flags[k].join("» … «")}».` : "";
+    if (excl(reason)) x.push(`<span class="tag bad" title="${esc(`${EXCL_TIP}: ${what}. ${found}`)}">✕ ${reason}</span>`);
+    else if (o.flags[k]) t.push(`<span class="tag warn" title="${esc(`Возможно ${what}. ${found} Проверьте вручную`)}">${lbl}</span>`);
+  }
+  // остальные причины — каждая отдельным бэджем: длинная строка через «; » не помещалась в карточку
+  why.filter(w => !shown.has(w)).forEach(w => x.push(`<span class="tag bad" title="${esc(`${EXCL_TIP}: ${w}`)}">✕ ${esc(w)}</span>`));
   if (!o.active) t.push(`<span class="tag bad" title="${esc("Снято со всех сайтов:\n" + o.items.map(i => `${SRC[i.source]}: ${goneTip(i)}`).join("\n"))}">снято с продажи</span>`);
-  return t.join("");
+  return x.concat(t).join("");
 }
 
 function offers(o) {
@@ -270,14 +378,16 @@ function offers(o) {
           `.\nВ базе с ${dtt(i.first_seen)}, последний раз в поиске ${dtt(i.last_seen)}` + (i.seller_type ? `.\n${SELLER_TIP[i.seller_type]}` : "") +
           (i.missed ? `.\n\n${missTip(i)}` : "")
         : `Перечёркнуто — объявление считается снятым с продажи: ${goneTip(i)}.\nЕсли оно на сайте есть — «Настройки → База данных → Перепроверить снятые»`;
-    const mark = i.off_site ? ` <span class="tag miss" title="${esc(offTip(i, o.active))}">нет на сайте</span>`
-      : i.active && i.missed ? ` <span class="tag miss" title="${esc(missTip(i))}">нет в поиске</span>` : "";
+    const isNew = o.fresh.includes(i);
+    const mark = (isNew ? ` <span class="tag miss fresh" title="${esc(`Добавилось в карточку после того, как вы её скрыли. В базе с ${dtt(i.first_seen)}`)}">новое</span>` : "") +
+      (i.off_site ? ` <span class="tag miss" title="${esc(offTip(i, o.active))}">нет на сайте</span>`
+      : i.active && i.missed ? ` <span class="tag miss" title="${esc(missTip(i))}">нет в поиске</span>` : "");
     const body = `<i class="sdot ${i.source}"></i><span>${SRC[i.source]}${mark}${i.excluded && !o.excluded ? ` <span class="tag warn" title="${esc(`Это объявление не прошло отсев (${i.excluded}), но другое объявление этой квартиры прошло`)}">!</span>` : ""}</span>
     <span>${best && i.price === best && i.active ? '<span class="best" title="Здесь цена ниже, чем на других сайтах">дешевле</span> ' : ""}${ch ? `<s class="old-mini">${mln(ch[0])}</s> ` : ""}<b>${fmt(i.price)} ₽</b></span>`;
     // ссылки нет: объявление с сайта пропало, открывать нечего
     return i.off_site
-      ? `<div class="offer off ${i.active ? "" : "gone"}" title="${esc(tip)}">${body}${ICON.noext}</div>`
-      : `<a class="offer ${i.active ? "" : "gone"}" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(tip)}">${body}${ICON.ext}</a>`;
+      ? `<div class="offer off ${i.active ? "" : "gone"} ${isNew ? "fresh" : ""}" title="${esc(tip)}">${body}${ICON.noext}</div>`
+      : `<a class="offer ${i.active ? "" : "gone"} ${isNew ? "fresh" : ""}" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(tip)}">${body}${ICON.ext}</a>`;
   }).join("")}</div>`;
 }
 
@@ -292,13 +402,17 @@ function card(o) {
   const rooms = o.rooms === 0 ? "студия" : o.rooms ?? "—";
   const n = o.items.length;
   const multiTip = `Эта квартира найдена на: ${o.sources.map(s => SRC[s]).join(", ")} — объявления объединены в одну карточку.\n` +
-    "Признаки одной квартиры: те же комнаты, этаж и этажность, площадь ±1 м², адрес в пределах 150 м, цена ±10%";
-  return `<article class="card ${o.excluded ? "excl" : ""} ${o.active ? "" : "inactive"} ${o.id === PICK ? "picked" : ""}" data-id="${esc(o.id)}">
+    "Признаки одной квартиры: те же комнаты, этаж и этажность, площадь ±1 м², адрес в пределах 150 м, цена ±10%. " +
+    "Во вторичном жилье на разных сайтах допускается одно расхождение — площадь до 3 м² или этажность дома — " +
+    "если дом тот же, а цена отличается не больше чем на 2%";
+  return `<article class="card ${o.excluded ? "excl" : ""} ${o.active ? "" : "inactive"} ${o.disliked ? "disliked" : ""} ${o.id === PICK ? "picked" : ""}" data-id="${esc(o.id)}">
     ${o.id === PICK ? `<div class="pick-note" title="Подсветка снимется по клику на карточку">${ICON.pin}<span>Вы перешли к этой квартире</span></div>` : ""}
+    ${o.fresh.length ? freshNote(o) : ""}
     ${media(o)}
       <div class="media-top"><span class="left"><span class="pill zone-${o.zone}" title="${esc(ZONE_TIP[o.zone] || "")}">${ZONE_SHORT[o.zone] || o.zone}</span>
         ${o.sources.length > 1 ? `<span class="pill multi" title="${esc(multiTip)}">${o.sources.length} ${plural(o.sources.length, "сайт", "сайта", "сайтов")}</span>` : ""}</span>
-        <button class="heart ${o.liked ? "on" : ""}" title="${o.liked ? "В избранном — нажмите, чтобы убрать" : "Добавить в избранное: фильтр «Избранное» и отдельный блок на дашборде"}">${ICON.heart}</button></div>
+        <span class="marks"><button class="heart dis ${o.disliked ? "on" : ""}" title="${o.disliked ? "Скрыта — нажмите, чтобы вернуть в подборку" : "Не нравится — скрыть из подборки, таблицы, карты и дашборда. Сбор по ней продолжится; посмотреть и вернуть — кнопка «Скрытые»"}">${ICON.dislike}</button>
+        <button class="heart ${o.liked ? "on" : ""}" title="${o.liked ? "В избранном — нажмите, чтобы убрать" : "Добавить в избранное: фильтр «Избранное» и отдельный блок на дашборде"}">${ICON.heart}</button></span></div>
       <div class="media-bottom"><div><div class="price" title="${esc(priceTip(o))}">${fmt(o.price)} ₽ ${oldPrice(o)}</div>
         <div class="ppm" title="Цена за квадратный метр общей площади${o.priceMax > o.price ? `; на других сайтах цена до ${fmt(o.priceMax)} ₽` : ""}">${fmt(o.price_m2)} ₽/м²${o.priceMax > o.price ? ` · до ${mln(o.priceMax)} млн` : ""}</div></div>${delta(o)}</div>
     </div>
@@ -311,18 +425,43 @@ function card(o) {
       <div class="addr" title="Адрес (самый подробный из объявлений объекта)">${ICON.pin}<span>${esc(o.address || "адрес не указан")}</span></div>
       ${meta ? `<div class="meta" title="Жилая площадь, кухня, год постройки — со страниц объявлений">${esc(meta)}</div>` : ""}
       <div class="tags">${tags(o)}</div>
+      ${o.note ? `<div class="card-note" title="${esc("Личная заметка (клик по кнопке ✎ или карточке — изменить):\n" + o.note)}">${ICON.note}<span>${esc(o.note)}</span></div>` : ""}
       ${offers(o)}
       <p class="desc" title="Начало описания; полностью — в окне карточки (клик по карточке)">${esc((o.p.description || "").slice(0, 320))}</p>
     </div>
     <div class="card-foot"><span title="Когда объект впервые появился в базе; число объявлений на всех сайтах">с ${dt(o.first_seen)} · ${n} ${plural(n, "объявление", "объявления", "объявлений")}</span>
-      <span class="acts">${o.lat != null ? `<button class="icon-btn pin" title="Показать на карте рядом">${ICON.map}</button>` : ""}</span></div>
+      <span class="acts"><button class="icon-btn note-btn ${o.note ? "on" : ""}" title="${esc(o.note ? "Изменить заметку" : "Добавить заметку к квартире")}">${ICON.note}</button>${o.lat != null ? `<button class="icon-btn pin" title="Показать на карте рядом">${ICON.map}</button>` : ""}</span></div>
   </article>`;
 }
 
-function renderCards(rows) {
+// Плашка на скрытой карточке, в которую после скрытия добавились объявления
+function freshNote(o) {
+  const n = o.fresh.length, where = [...new Set(o.fresh.map(i => SRC[i.source]))].join(", ");
+  return `<div class="fresh-note" title="${esc("Новые объявления подсвечены ниже. Если это другая квартира, которая вас интересует, — верните карточку в подборку (👎 ещё раз). " +
+    "Если та же квартира на другом сайте или такая же неинтересная — «Оставить скрытой»: кружок на кнопке «Скрытые» погаснет")}">
+    ${ICON.dislike}<span>После скрытия ${plural(n, "добавилось", "добавились", "добавилось")} ${n} ${plural(n, "объявление", "объявления", "объявлений")}: ${esc(where)}</span>
+    <button class="keep-hidden">Оставить скрытой</button></div>`;
+}
+
+// «Оставить скрытой»: дизлайк ставится и новым объявлениям — карточка больше не считается изменившейся
+async function keepHidden(id) {
+  const o = OBJS.find(x => x.id === id);
+  if (!o || !o.fresh.length) return;
+  const keys = o.fresh.map(key);
+  o.fresh.forEach(i => { i.disliked = true; i.liked = false; });
+  o.fresh = [];
+  try {
+    await post("/api/dislike", { keys, on: true });
+  } catch (e) {
+    toast("warn", "Не удалось сохранить", e.message);
+  }
+  render();
+}
+
+function renderCards(rows, mapRows = rows) {
   if (sideOn()) {
-    if (!SIDE) SIDE = makeMap("sideMap");
-    drawMap(SIDE, rows);
+    if (!SIDE) { SIDE = makeMap("sideMap"); areaControl(SIDE).addTo(SIDE.map); }
+    drawMap(SIDE, mapRows);
     hl = null;
   }
   const el = $("#cardsList");
@@ -334,10 +473,12 @@ function renderCards(rows) {
     if (p && !shown.includes(p)) rows = [p, ...rows.filter(o => o !== p)];
   }
   if (!rows.length) {
-    const liked = $("#fLiked").checked;
-    el.innerHTML = `<div class="empty"><b>${liked ? "В избранном пока пусто" : ALL.length ? "Ничего не найдено" : "База пока пуста"}</b>${
-      liked ? "Нажмите ♥ на карточке, чтобы добавить объект" : ALL.length ? "Ослабьте фильтры или включите другие зоны" : "Нажмите «Запустить» слева, чтобы собрать объявления"}</div>`
-      + (liked ? "" : aboutTab("cards"));
+    const liked = $("#fLiked").checked, hidden = $("#fHidden").checked, area = areaOn() && mapRows.length;
+    const [head, text] = hidden ? ["Скрытых квартир нет", "Нажмите 👎 на карточке, чтобы убрать квартиру из подборки — она появится здесь"]
+      : liked ? ["В избранном пока пусто", "Нажмите ♥ на карточке, чтобы добавить объект"]
+      : area ? ["В видимой области карты квартир нет", "Сдвиньте или отдалите карту и нажмите «Обновить» на карте — или снимите галочку «Только в видимой области»"]
+      : ALL.length ? ["Ничего не найдено", "Ослабьте фильтры или включите другие зоны"] : ["База пока пуста", "Нажмите «Запустить» слева, чтобы собрать объявления"];
+    el.innerHTML = `<div class="empty"><b>${head}</b>${text}</div>` + (liked || hidden || area ? "" : aboutTab("cards"));
     return;
   }
   if (!groupOn()) {
@@ -355,31 +496,51 @@ function renderCards(rows) {
   }).join("");
 }
 
-async function toggleLike(id, btn) {
+// ♥ и 👎 на карточке. Отметки взаимоисключающие: ♥ снимает 👎 и наоборот (так же и на сервере)
+async function toggleLike(id, btn) { return toggleMark(id, "liked", btn); }
+async function toggleDislike(id, btn) { return toggleMark(id, "disliked", btn); }
+
+async function toggleMark(id, kind, btn) {
   const o = OBJS.find(x => x.id === id);
   if (!o) return;
-  const on = !o.liked;
-  o.liked = on;
-  o.items.forEach(i => { i.liked = on; });
+  const other = kind === "liked" ? "disliked" : "liked";
+  const on = !o[kind];
+  o[kind] = on;
+  if (on) o[other] = false;
+  o.items.forEach(i => { i[kind] = on; if (on) i[other] = false; });
+  o.fresh = freshItems(o);
   if (btn) { btn.classList.toggle("on", on); btn.classList.add("pop"); setTimeout(() => btn.classList.remove("pop"), 400); }
   try {
-    await post("/api/like", { keys: o.items.map(key), on });
+    await post(kind === "liked" ? "/api/like" : "/api/dislike", { keys: o.items.map(key), on });
   } catch (e) {
     toast("warn", "Не удалось сохранить", e.message);
   }
-  if ($("#fLiked").checked && !on) render(); else renderHeader(filtered());
+  if (kind === "disliked") {
+    // квартира уходит из списка (или возвращается из «Скрытых») — список перерисовываем сразу
+    if (["cards", "table", "map", "changes"].includes(view)) render(); else renderHeader(filtered());
+    if (view === "dashboard" && typeof paintDashboard === "function") paintDashboard();
+    if (on) toast("ok", "Квартира скрыта", "Её не видно в подборке, таблице, на карте и в списках дашборда. Сбор по ней продолжается. Вернуть — кнопка «Скрытые»",
+      { label: "Вернуть", fn: () => toggleDislike(id) });
+    else if ($("#fHidden").checked) toast("ok", "Квартира возвращена", "Она снова в подборке");
+    return;
+  }
+  if (($("#fLiked").checked && !on) || view === "changes") render(); else renderHeader(filtered());
 }
 
 // ---------- таблица ----------
 const COLS = [
-  ["sources", "Сайты", o => o.items.map(i => `<a href="${esc(i.url)}" target="_blank" title="${fmt(i.price)} ₽"><i class="sdot ${i.source}"></i> ${SRC[i.source]}</a>`).join("<br>")],
+  ["sources", "Сайты", o => o.items.map(i => (i.off_site
+    ? `<span class="off-link" title="${esc(offTip(i, o.active))}"><i class="sdot ${i.source}"></i> ${SRC[i.source]}</span>`
+    : `<a href="${esc(i.url)}" target="_blank" rel="noopener" class="${i.active ? "" : "gone"}" title="${fmt(i.price)} ₽"><i class="sdot ${i.source}"></i> ${SRC[i.source]}</a>`) +
+    (o.fresh.includes(i) ? ` <span class="tag miss fresh" title="Добавилось в скрытую карточку после того, как вы её скрыли">новое</span>` : "")).join("<br>")],
   ["zone", "Зона", o => `<i class="zdot ${o.zone}"></i> ${ZONE_SHORT[o.zone]}`],
   ["price", "Цена", o => fmt(o.price) + (o.priceMax > o.price ? `<br><small>до ${fmt(o.priceMax)}</small>` : ""), 1],
   ["price_m2", "₽/м²", o => fmt(o.price_m2), 1], ["rooms", "Комн.", o => o.rooms ?? "", 1],
   ["area", "м²", o => o.area ?? "", 1], ["floor", "Этаж", o => `${o.floor ?? "?"}/${o.floors ?? "?"}`, 1],
   ["renovation", "Ремонт", o => RENO[o.renovation] || ""], ["address", "Адрес", o => esc(o.address || "")],
+  ["note", "Заметка", o => o.note ? `<span class="tbl-note" title="${esc(o.note)}">${esc(o.note)}</span>` : ""],
   ["excluded", "Отсев", o => esc(o.excluded || "")], ["first_seen", "Найдено", o => dt(o.first_seen)],
-  ["liked", "♥", o => o.liked ? "♥" : ""],
+  ["liked", "♥", o => o.liked ? "♥" : o.disliked ? `<span class="dis-mark" title="Скрыта — отмечена «не нравится»">${ICON.dislike}</span>` : ""],
 ];
 
 function renderTable(rows) {
@@ -492,7 +653,9 @@ function drawMap(M, rows) {
   M.layer.clearLayers();
   M.markers = {};
   rows.filter(o => o.lat != null).forEach(o => {
-    const links = o.items.map(i => `<a href="${esc(i.url)}" target="_blank">${SRC[i.source]} · ${fmt(i.price)} ₽ →</a>`).join("<br>");
+    const links = o.items.map(i => i.off_site
+      ? `<span class="off-link" title="${esc(offTip(i, o.active))}">${SRC[i.source]} · ${fmt(i.price)} ₽ (нет на сайте)</span>`
+      : `<a href="${esc(i.url)}" target="_blank" rel="noopener">${SRC[i.source]} · ${fmt(i.price)} ₽ →</a>`).join("<br>");
     const mk = L.circleMarker([o.lat, o.lon], markerStyle(o, false))
       .bindPopup(`<b>${fmt(o.price)} ₽</b>${o.liked ? " ♥" : ""}<br>${o.rooms ?? "?"}-к, ${o.area ?? "?"} м², ${o.floor ?? "?"}/${o.floors ?? "?"} эт.<br><span style="opacity:.7">${esc(o.address)}</span><br>${links}`)
       .addTo(M.layer);
@@ -503,6 +666,43 @@ function drawMap(M, rows) {
 }
 
 function renderMap(rows) { if (!MAIN) MAIN = makeMap("map"); drawMap(MAIN, rows); }
+
+// ---------- подборка: только квартиры в видимой области карты рядом ----------
+// Область запоминается в момент, когда ставят галочку или нажимают «Обновить», — а не на каждый сдвиг карты:
+// карту двигают, чтобы посмотреть, и список не должен прыгать под рукой. Сдвинули — кнопка «Обновить» подсвечивается.
+const AREA = { on: false, bounds: null };
+const areaOn = () => AREA.on && !!AREA.bounds && view === "cards" && sideOn();
+const inArea = rows => areaOn() ? rows.filter(o => o.lat != null && AREA.bounds.contains([o.lat, o.lon])) : rows;
+
+function areaControl(M) {
+  const c = L.control({ position: "topleft" });
+  c.onAdd = () => {
+    const box = L.DomUtil.create("div", "area-ctl");
+    box.innerHTML = `<label class="area-chk" title="Показывать в списке карточек только квартиры, которые сейчас видны на карте. Карта при этом показывает все квартиры по фильтрам — двигайте и приближайте её, а потом нажмите «Обновить»">
+        <input type="checkbox"><span>Только в видимой области</span></label>
+      <button class="area-upd" disabled title="Взять видимую сейчас область карты и пересобрать по ней список карточек">${ICON.refresh}<span>Обновить</span></button>`;
+    L.DomEvent.disableClickPropagation(box);
+    L.DomEvent.disableScrollPropagation(box);
+    const chk = box.querySelector("input"), upd = box.querySelector(".area-upd");
+    const take = () => { AREA.bounds = M.map.getBounds(); upd.classList.remove("stale"); render(); $("#cardsList").scrollTop = 0; };
+    chk.checked = AREA.on;
+    chk.onchange = () => {
+      AREA.on = chk.checked;
+      upd.disabled = !AREA.on;
+      box.classList.toggle("on", AREA.on);
+      if (AREA.on) take(); else { upd.classList.remove("stale"); render(); }
+    };
+    upd.onclick = take;
+    // карту сдвинули или приблизили — список отстал от того, что на экране: подсказываем «Обновить»
+    M.map.on("moveend zoomend", () => {
+      if (!AREA.on || !AREA.bounds) return;
+      const b = M.map.getBounds();
+      upd.classList.toggle("stale", !(b.getSouthWest().equals(AREA.bounds.getSouthWest(), 1e-6) && b.getNorthEast().equals(AREA.bounds.getNorthEast(), 1e-6)));
+    });
+    return box;
+  };
+  return c;
+}
 
 // ---------- круг (зона A) на карте: замок, перенос центра кликом, радиус — за край круга ----------
 const LOCK_ICON = {
@@ -755,7 +955,7 @@ async function renderRuns() {
     <th class="num">Новых</th><th class="num">Изм.</th><th class="num">Снято</th><th>Итог</th><th></th></tr></thead><tbody>${runs.map(r => `<tr>
     <td><i class="sdot ${r.source}"></i> ${SRC[r.source]}</td><td><span class="st-badge ${r.status}" title="${esc(STATE_TIP[r.status] || "")}">${STATE[r.status] || r.status}</span></td>
     <td>${t(r.started)}</td><td>${t(r.finished)}</td><td>${r.mode}</td><td class="num">${r.pages ?? ""}</td>
-    <td class="num">${r.declared ?? ""}</td><td class="num ${r.declared && r.collected != null && r.collected < 0.95 * r.declared && r.source !== "avito" ? "bad" : ""}">${r.collected ?? r.found ?? ""}</td>
+    <td class="num">${r.declared ?? ""}</td><td class="num ${r.declared && r.collected != null && r.collected < (r.source === "cian" ? 0.85 : 0.95) * r.declared && r.source !== "avito" ? "bad" : ""}">${r.collected ?? r.found ?? ""}</td>
     <td class="num">${r.new ?? ""}</td><td class="num">${r.changed ?? ""}</td><td class="num">${r.removed ?? ""}</td><td>${esc(r.message || "")}</td>
     <td>${r.has_log ? `<button class="icon-btn" data-log="${r.id}" title="Подробный журнал прогона: каждый запрос, коды ответов, время, страницы выдачи, сохранённые при сбоях страницы">${ICON.list}</button>` : ""}</td></tr>`).join("")}</tbody></table></div>`
     : `<div class="empty"><b>Прогонов ещё не было</b>Запустите сбор данных в панели слева</div>${aboutTab("runs")}`;
@@ -799,7 +999,7 @@ async function renderSettings() {
         <option value="exclude_none" ${f.renovation === "exclude_none" ? "selected" : ""}>без ремонта — отсеять</option>
         <option value="strict" ${f.renovation === "strict" ? "selected" : ""}>только указанный ремонт</option>
         <option value="off" ${f.renovation === "off" ? "selected" : ""}>не учитывать</option></select>`,
-        "<b>без ремонта — отсеять</b>: убираются «требует ремонта», «без отделки», черновая/предчистовая (по полю сайта или тексту); где ремонт не указан — остаётся с жёлтой меткой. <b>только указанный</b>: остаются лишь объявления с явно указанным ремонтом. ЦИАН дополнительно фильтруется по ремонту на своей стороне.")}
+        "<b>без ремонта — отсеять</b>: убираются «требует ремонта», «без отделки», черновая/предчистовая (по полю сайта или тексту); где ремонт не указан — остаётся с жёлтой меткой. <b>только указанный</b>: остаются лишь объявления с явно указанным ремонтом. У Авито и Яндекса вид ремонта берётся из поля «Ремонт» сайта, у ЦИАН — отдельными выдачами по каждому виду ремонта (в его общей выдаче вида ремонта нет); описание читается, только если сайт вид ремонта не сообщил.")}
       ${field("Исключать обременение", sw("sEnc", f.exclude_encumbrance), "Ищет в тексте «обременение», «арест», «в залоге», «залог у банка». Отрицания («без обременений», «аресты сняты») не считаются. Выключено — объявление остаётся с меткой «обременение?».")}
       ${field("Исключать доли", sw("sShare", f.exclude_share), "Категория «доля» на ЦИАН, заголовок «Доля…» на Авито, в тексте «доля», «1/2 доли», «долевая собственность».")}
       ${field("Исключать аукционы и торги", sw("sAuc", f.exclude_auction), "В тексте «аукцион», «торги», «банкротство», «конкурсный управляющий». «Торг уместен» не считается.")}
@@ -1231,7 +1431,7 @@ async function poll() {
         if (keep) body.scrollTop += body.scrollHeight - h0;
         jAfter = j.n;
         if (j.msg.startsWith("🔔")) {
-          toast("ok", "Изменения на рынке", j.msg.replace(/^🔔\s*изменения на рынке:\s*/, ""), { label: "Показать", fn: () => setView("changes") });
+          toast("ok", "Изменения на рынке", j.msg.replace(/^🔔\s*изменения на рынке\s*(?:\([^)]*\))?:\s*/, ""), { label: "Показать", fn: () => setView("changes") });
           loadData();
           updateChangesBadge();
         }
@@ -1247,7 +1447,17 @@ async function poll() {
       const last = s.journal[s.journal.length - 1];
       $("#jLast").textContent = `${last.t} · ${SRC[last.src] || (last.src === "db" ? "База" : "")}: ${last.msg}`;
     }
-    if (Object.values(s.status).some(v => v.running) && Date.now() - (poll.lastLoad || 0) > 15000) { poll.lastLoad = Date.now(); loadData(); }
+    const running = Object.values(s.status).filter(v => v.running);
+    if (running.length) {
+      const sig = running.map(v => `${v.found || 0}:${v.new || 0}:${v.changed || 0}:${v.details || 0}`).join("|");
+      if (sig !== poll.lastSig && Date.now() - (poll.lastLoad || 0) > 15000) {
+        poll.lastSig = sig;
+        poll.lastLoad = Date.now();
+        loadData();
+      }
+    } else {
+      poll.lastSig = "";
+    }
   } catch (e) { /* сервер ещё стартует */ }
   setTimeout(poll, 2000);
 }
@@ -1297,11 +1507,11 @@ function setView(v) {
   $$(".view").forEach(el => el.classList.add("hidden"));
   $(`#view-${v}`).classList.remove("hidden");
   $("#viewTitle").textContent = VIEW_TITLE[v];
-  const lists = v === "cards" || v === "table" || v === "map";
+  const lists = ["cards", "table", "map", "changes"].includes(v);
   if (v === "changes") markChangesSeen();
   $("#filters").classList.toggle("hidden", !lists);
   $("#fSortBox").classList.toggle("hidden", v === "table");  // в таблице сортируют кликом по заголовку колонки
-  if (lists) requestAnimationFrame(fitToolbar);  // панель только что показали — теперь её можно измерить
+  if (lists) { markFilters(); requestAnimationFrame(fitToolbar); }  // панель только что показали — теперь её можно измерить
   $("#btnSide").classList.toggle("hidden", v !== "cards");
   $("#btnGroup").classList.toggle("hidden", v !== "cards");
   $(".main").classList.toggle("inner-scroll", v === "cards");
@@ -1314,10 +1524,149 @@ function setView(v) {
   $("#cardsList").scrollTop = 0;
 }
 
+function serializeFilters() {
+  return {
+    src: checked("src"), zones: checked("zone"), rooms: checked("rooms"),
+    pmin: $("#fPmin").value, pmax: $("#fPmax").value, amin: $("#fAmin").value,
+    reno: $("#fReno").value, nb: $("#fNew").value, st: $("#fState").value,
+    active: $("#fActive").checked, noCoords: $("#fNoCoords").checked,
+    liked: $("#fLiked").checked, hiddenOnly: $("#fHidden").checked, noDis: $("#fNoDis").checked,
+    text: $("#fText").value, sort: $("#fSort").value,
+  };
+}
+
+function applyFilterState(s) {
+  if (!s || typeof s !== "object") return;
+  if (Array.isArray(s.src)) $$('input[name="src"]').forEach(i => i.checked = s.src.includes(i.value));
+  if (Array.isArray(s.zones)) $$('input[name="zone"]').forEach(i => i.checked = s.zones.includes(i.value));
+  if (Array.isArray(s.rooms)) $$('input[name="rooms"]').forEach(i => i.checked = s.rooms.includes(i.value));
+  $("#fPmin").value = s.pmin ?? "";
+  $("#fPmax").value = s.pmax ?? "";
+  $("#fAmin").value = s.amin ?? "";
+  $("#fText").value = s.text ?? "";
+  for (const [id, keyName, def] of [["fReno", "reno", ""], ["fNew", "nb", ""], ["fState", "st", "pass"], ["fSort", "sort", "new"]]) {
+    const el = $(`#${id}`), val = s[keyName] ?? def;
+    el.value = [...el.options].some(o => o.value === val) ? val : def;
+  }
+  $("#fActive").checked = s.active !== false;
+  $("#fNoCoords").checked = !!s.noCoords;
+  $("#fHidden").checked = !!s.hiddenOnly;
+  $("#fLiked").checked = !s.hiddenOnly && !!s.liked;
+  $("#fNoDis").checked = s.noDis !== false;
+}
+
+function saveFilterState() {
+  store.set("rw.filters", JSON.stringify(serializeFilters()));
+}
+
+function restoreFilters() {
+  try {
+    const raw = store.get("rw.filters", "");
+    if (raw) applyFilterState(JSON.parse(raw));
+  } catch (e) { /* повреждённый JSON игнорируем */ }
+}
+
+function loadPresets() {
+  try {
+    const raw = store.get("rw.presets", "[]");
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list.filter(p => p && typeof p.name === "string" && p.state && typeof p.state === "object") : [];
+  } catch (e) { return []; }
+}
+
+function savePresetsList(list) {
+  store.set("rw.presets", JSON.stringify(list.slice(0, 8)));
+}
+
+function sameFilterState(a, b) {
+  const norm = s => JSON.stringify({
+    src: [...(s.src || [])].sort(), zones: [...(s.zones || [])].sort(), rooms: [...(s.rooms || [])].sort(),
+    pmin: String(s.pmin || ""), pmax: String(s.pmax || ""), amin: String(s.amin || ""),
+    reno: String(s.reno || ""), nb: String(s.nb || ""), st: String(s.st || "pass"),
+    active: s.active !== false, noCoords: !!s.noCoords, liked: !!s.liked, hiddenOnly: !!s.hiddenOnly,
+    noDis: s.noDis !== false, text: String(s.text || "").trim(), sort: String(s.sort || "new"),
+  });
+  return norm(a) === norm(b);
+}
+
+function suggestPresetName(s) {
+  const parts = [];
+  if (s.liked) parts.push("Избранное");
+  if (s.hiddenOnly) parts.push("Скрытые");
+  if (s.zones && s.zones.length && s.zones.length < 3) parts.push(s.zones.map(z => ZONE_SHORT[z]).join("+"));
+  if (s.rooms && s.rooms.length && s.rooms.length < 3) parts.push(s.rooms.map(r => `${r}к`).join(", "));
+  if (s.pmax) parts.push(`до ${s.pmax} млн`);
+  else if (s.pmin) parts.push(`от ${s.pmin} млн`);
+  if (s.amin) parts.push(`от ${s.amin} м²`);
+  if (s.reno) parts.push($("#fReno").options[$("#fReno").selectedIndex]?.text || "");
+  if (s.text) parts.push(s.text.trim());
+  return (parts.filter(Boolean).join(" · ") || "Мой фильтр").slice(0, 32);
+}
+
+let presetFormOpen = false;
+function renderPresets() {
+  const bar = $("#presetBar");
+  if (!bar) return;
+  const presets = loadPresets(), cur = serializeFilters();
+  const chips = presets.map((p, idx) => {
+    const active = sameFilterState(cur, p.state);
+    return `<span class="preset-chip ${active ? "on" : ""}">
+      <button type="button" class="preset-go" data-apply="${idx}" title="Применить набор фильтров «${esc(p.name)}»">${esc(p.name)}</button>
+      <button type="button" class="preset-x" data-del="${idx}" title="Удалить набор «${esc(p.name)}»">×</button></span>`;
+  }).join("");
+  const right = presetFormOpen
+    ? `<span class="preset-form"><input type="text" id="presetName" maxlength="32" value="${esc(suggestPresetName(cur))}" placeholder="Название набора…">
+      <button type="button" class="chip on" id="presetSave">Сохранить</button>
+      <button type="button" class="link sm" id="presetCancel">Отмена</button></span>`
+    : (presets.length < 8
+      ? `<button type="button" class="chip preset-add" id="btnPresetNew" title="Сохранить текущее сочетание фильтров как быструю кнопку">+ Сохранить фильтр</button>`
+      : `<span class="meta">максимум 8 наборов</span>`);
+  bar.innerHTML = `<span class="preset-lbl">Наборы:</span>${chips}${right}`;
+  bar.querySelectorAll("[data-apply]").forEach(b => b.onclick = () => {
+    const p = loadPresets()[+b.dataset.apply];
+    if (!p) return;
+    applyFilterState(p.state);
+    saveFilterState();
+    renderPresets();
+    render();
+  });
+  bar.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
+    const list = loadPresets(), idx = +b.dataset.del, removed = list.splice(idx, 1)[0];
+    if (!removed) return;
+    savePresetsList(list);
+    renderPresets();
+    toast("ok", "Набор удалён", removed.name, {
+      label: "Вернуть",
+      fn: () => { const curList = loadPresets(); curList.splice(idx, 0, removed); savePresetsList(curList); renderPresets(); },
+    });
+  });
+  const addBtn = $("#btnPresetNew");
+  if (addBtn) addBtn.onclick = () => { presetFormOpen = true; renderPresets(); const inp = $("#presetName"); if (inp) { inp.focus(); inp.select(); } };
+  const saveBtn = $("#presetSave"), cancelBtn = $("#presetCancel"), nameInp = $("#presetName");
+  const commitPreset = () => {
+    const name = (nameInp?.value || "").trim().slice(0, 32) || suggestPresetName(cur);
+    const list = loadPresets().filter(p => p.name !== name);
+    list.push({ name, state: cur });
+    savePresetsList(list);
+    presetFormOpen = false;
+    renderPresets();
+  };
+  if (saveBtn) saveBtn.onclick = commitPreset;
+  if (cancelBtn) cancelBtn.onclick = () => { presetFormOpen = false; renderPresets(); };
+  if (nameInp) nameInp.onkeydown = e => {
+    if (e.key === "Enter") { e.preventDefault(); commitPreset(); }
+    if (e.key === "Escape") { e.preventDefault(); presetFormOpen = false; renderPresets(); }
+  };
+}
+
 function resetFilters() {
-  $$("#filters input[type=checkbox]").forEach(i => i.checked = !(i.value === "C" || i.id === "fNoCoords" || i.id === "fLiked"));
+  clearTimeout(_filterTimer);
+  // по умолчанию всё включено, кроме посёлков, «без координат», «Избранного» и «Скрытых»; «исключить дизлайки» — включено
+  $$("#filters input[type=checkbox]").forEach(i => i.checked = !(i.value === "C" || ["fNoCoords", "fLiked", "fHidden"].includes(i.id)));
   $("#fPmin").value = $("#fPmax").value = $("#fAmin").value = $("#fText").value = "";
   $("#fReno").value = $("#fNew").value = ""; $("#fState").value = "pass"; $("#fSort").value = "new";
+  saveFilterState();
+  renderPresets();
   render();
 }
 
@@ -1331,7 +1680,19 @@ function setTheme(t) {
 }
 
 $$(".nav button").forEach(b => b.onclick = () => setView(b.dataset.view));
-$("#filters").addEventListener("input", () => render());
+// «Скрытые» и «Избранное» не включаются вместе: квартира не бывает и той, и другой. Слушатели на самих
+// переключателях срабатывают раньше общего на панели, поэтому список рисуется уже с одним из них
+$("#fHidden").addEventListener("input", () => { if ($("#fHidden").checked) $("#fLiked").checked = false; });
+$("#fLiked").addEventListener("input", () => { if ($("#fLiked").checked) $("#fHidden").checked = false; });
+let _filterTimer = null;
+$("#filters").addEventListener("input", e => {
+  if (e.target.closest("#presetBar")) return;
+  saveFilterState();
+  renderPresets();
+  clearTimeout(_filterTimer);
+  if (["text", "search", "number"].includes(e.target.type)) _filterTimer = setTimeout(render, 120);
+  else render();
+});
 $("#btnReset").onclick = resetFilters;
 $("#btnRun").onclick = async () => {
   const sources = $$(".src-run:checked").map(i => i.value);
@@ -1356,7 +1717,10 @@ $("#cardsList").addEventListener("click", e => {
   const c = e.target.closest(".card");
   if (!c) return;
   if (c.classList.contains("picked")) { PICK = null; c.classList.remove("picked"); c.querySelector(".pick-note")?.remove(); }
-  if (e.target.closest(".heart")) { e.preventDefault(); toggleLike(c.dataset.id, e.target.closest(".heart")); return; }
+  const mark = e.target.closest(".heart");
+  if (mark) { e.preventDefault(); (mark.classList.contains("dis") ? toggleDislike : toggleLike)(c.dataset.id, mark); return; }
+  if (e.target.closest(".keep-hidden")) { e.preventDefault(); keepHidden(c.dataset.id); return; }
+  if (e.target.closest(".note-btn")) { e.preventDefault(); openObject(c.dataset.id, true); return; }
   if (e.target.closest(".pin")) {
     if (!sideOn()) setSide(true);
     highlight(c.dataset.id, true);
@@ -1393,6 +1757,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       LASTRUN[r.source] = { state: r.status, message: r.message, finished: r.finished, running: false };
   } catch (e) { /* нет прогонов */ }
   renderSources({});
+  restoreFilters();
+  renderPresets();
   setView("dashboard");
   await loadData();
   initAuto();

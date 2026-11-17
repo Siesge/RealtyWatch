@@ -81,8 +81,10 @@
 
     <div class="toolbar hidden" id="filters">
       <div class="tb-row">
-        <label class="search" title="Поиск по заголовку, адресу и описанию всех объявлений объекта"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
-          <input type="search" id="fText" placeholder="Улица, ЖК, слово из описания"></label>
+        <label class="search" title="Поиск по заголовку, адресу, описанию и личной заметке объекта"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+          <input type="search" id="fText" placeholder="Улица, ЖК, описание или заметка"></label>
+        <label class="like-toggle hide-toggle" title="Показать только скрытые квартиры — те, что отмечены «не нравится» (👎 на карточке). Отсюда их можно вернуть в подборку: нажмите 👎 ещё раз. Сбор по ним идёт как обычно — цены и снятие обновляются"><input type="checkbox" id="fHidden">
+          <span><svg viewBox="0 0 24 24"><path d="M3.5 3.5l17 17M10.4 6.1A9.7 9.7 0 0 1 12 6c5 0 8.6 4.1 9.6 6-.4.9-1.4 2.3-2.8 3.5M6.6 7.5C4.6 8.8 3.1 10.7 2.4 12c1 1.9 4.6 6 9.6 6 1.6 0 3-.4 4.3-1M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg><b>Скрытые</b> <em id="hideCount"></em><i id="hideNew" class="new-badge" hidden></i></span></label>
         <label class="like-toggle" title="Показать только объекты, отмеченные сердечком"><input type="checkbox" id="fLiked">
           <span><svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z"/></svg><b>Избранное</b> <em id="likeCount"></em></span></label>
         <div class="seg" id="zoneSeg">
@@ -112,6 +114,7 @@
         <label class="sel" id="fSortBox" title="Порядок карточек; в таблице порядок задаётся кликом по заголовку колонки"><svg class="ic" viewBox="0 0 24 24"><path d="M7 4.5v15M7 19.5l-3-3M7 19.5l3-3M17 19.5v-15M17 4.5l-3 3M17 4.5l3 3"/></svg><span>Сортировка</span><select id="fSort"><option value="new">сначала новые</option><option value="price">дешевле</option><option value="-price">дороже</option><option value="ppm">₽/м² ↑</option><option value="-area">площадь ↓</option></select></label>
         <label class="check" title="Скрыть объекты, снятые с продажи на всех сайтах"><input type="checkbox" id="fActive" checked><span>активные</span></label>
         <label class="check wide" title="Показать только объекты без координат (их нельзя отнести к зоне точно)"><input type="checkbox" id="fNoCoords"><span>без координат</span></label>
+        <label class="check wide nodis" id="fNoDisBox" title="Не показывать квартиры, отмеченные «не нравится» (👎 на карточке). Посмотреть и вернуть их — кнопка «Скрытые» слева от «Избранного»"><input type="checkbox" id="fNoDis" checked><i class="ic-dis"><svg viewBox="0 0 24 24"><path d="M10 14.5v4.3a2.2 2.2 0 0 0 4 1.2l3.6-5.5V4H8.4a2 2 0 0 0-2 1.6l-1.3 6.6a2 2 0 0 0 2 2.3zM17.6 4h2.4v10.5h-2.4"/></svg></i><span>исключить дизлайки</span></label>
         <button id="btnReset" class="link" title="Вернуть фильтры просмотра по умолчанию">Сбросить</button>
         <span class="tb-right">
         <button id="btnShare" class="toggle" title="Сохранить избранное одной веб-страницей: плитки и таблица со своими фильтрами, фотографии внутри файла. Открывается без интернета — такой файл можно просто отправить"><svg viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4M5 15v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4"/></svg><span>Выгрузить</span></button>
@@ -119,6 +122,7 @@
         <button id="btnSide" class="toggle" title="Карта рядом с карточками. Разделитель между ними можно двигать"><svg viewBox="0 0 24 24"><path d="M9 4 3 6.5v13.5l6-2.5 6 2.5 6-2.5V4l-6 2.5L9 4z"/></svg><span>Карта рядом</span></button>
         </span>
       </div>
+      <div class="tb-presets" id="presetBar"></div>
     </div>
 
     <section id="view-dashboard" class="view"></section>

@@ -235,11 +235,13 @@ class RunManager:
         Снятым считается только то, что сайт явно показывает снятым (статус, закрыто) или не находит (404,
         редирект в каталог). Если проверить не удалось, объявление остаётся в продаже с отметкой «нет в поиске»
         (счётчик missed) и проверяется снова в следующем прогоне. Возвращает (снято, примечания к итогу)."""
-        cand = db.missing(con, scraper.name, seen)
+        skip = {str(x) for x in (getattr(scraper, "skip_missing_ids", None) or ())}
+        cand = [r for r in db.missing(con, scraper.name, seen) if str(r["source_id"]) not in skip]
         if not cand:
             return 0, []
-        limit_n, expected, tau, gap = mass_limit(con, scraper.name, prev_seen, started)
-        active = len(prev_seen)
+        eff_prev = {k: v for k, v in prev_seen.items() if str(k) not in skip} if skip else prev_seen
+        limit_n, expected, tau, gap = mass_limit(con, scraper.name, eff_prev, started)
+        active = len(eff_prev)
         if len(cand) > limit_n:
             scraper.complete = False
             scraper.incomplete_reason = f"пропало {len(cand)} из {active} за {gap:g} дн. — больше допуска {limit_n:.0f}"
@@ -260,7 +262,6 @@ class RunManager:
                 except (Blocked, IpBanned) as e:
                     aborted = f"{type(e).__name__}: {e}"
                     lg(f"⚠ проверка страниц прервана — сайт ограничил доступ ({e}); остальные проверю в следующий раз")
-                pause((1.0, 2.5) if scraper.name != "avito" else scraper.delay, stop)
             if state == "active":
                 con.execute("UPDATE listings SET missed=0 WHERE source=? AND source_id=?", (row["source"], row["source_id"]))
                 if price:
@@ -272,7 +273,10 @@ class RunManager:
                 unknown += 1
                 con.execute("UPDATE listings SET missed=? WHERE source=? AND source_id=?",
                             ((row.get("missed") or 0) + 1, row["source"], row["source_id"]))
-            con.commit()
+            if aborted is None and n < limit:
+                con.commit()  # не держим транзакцию открытой на время сетевой паузы перед следующей проверкой
+                pause((1.0, 2.5) if scraper.name != "avito" else scraper.delay, stop)
+        con.commit()
         if unknown:
             lg(f"статус не подтверждён у {unknown}: проверю в следующем прогоне. Те, кого нет в поиске "
                f"{offsale.GONE_AFTER} прогона подряд, считаются потерянными на этом сайте — ссылка на него убирается, "

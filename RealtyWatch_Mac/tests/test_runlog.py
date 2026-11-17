@@ -23,7 +23,10 @@ class Api(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         page = body["jsonQuery"]["page"]["value"]
-        if page == FAIL_PAGE["n"]:
+        if "repair" in body["jsonQuery"]:
+            # выдачи по виду ремонта: здесь пустые
+            data, code = json.dumps({"data": {"offersSerialized": [], "aggregatedCount": 0}}).encode(), 200
+        elif page == FAIL_PAGE["n"]:
             data, code = b"<html>502 Bad Gateway</html>", 502
         else:
             chunk = [cian_offer(r) for r in ROWS[(page - 1) * 28: page * 28]]
@@ -58,11 +61,12 @@ class RunLog(Case):
     def test_requests_and_summary_are_logged(self):
         run("cian", Cian)
         r = last_run()
-        self.assertEqual((r["status"], r["declared"], r["collected"], r["requests"]), ("done", 60, 60, 3))
+        # 4 выдачи по виду ремонта (по одной пустой странице) и 3 страницы основной
+        self.assertEqual((r["status"], r["declared"], r["collected"], r["requests"]), ("done", 60, 60, 7))
         text = runlog.run_log_path(r["id"]).read_text(encoding="utf-8")
-        self.assertEqual(text.count("→ http    POST 200"), 3)
+        self.assertEqual(text.count("→ http    POST 200"), 7)
         self.assertIn("выдача: прочитано страниц 3 из 3, заявлено сайтом 60, собрано уникальных 60", text)
-        self.assertIn("итог: заявлено сайтом 60, собрано уникальных 60, запросов 3", text)
+        self.assertIn("итог: заявлено сайтом 60, собрано уникальных 60, запросов 7", text)
 
     def test_server_error_saves_page(self):
         FAIL_PAGE["n"] = 2

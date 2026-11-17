@@ -25,38 +25,83 @@ def index():
 @app.get("/api/listings")
 def listings():
     con = db.connect()
-    rows = [dict(r) for r in con.execute("SELECT * FROM listings ORDER BY first_seen DESC")]
-    hist = {}
-    for r in con.execute("SELECT source, source_id, ts, price FROM price_history ORDER BY ts"):
-        hist.setdefault((r["source"], r["source_id"]), []).append([r["ts"], r["price"]])
-    liked = {(r["source"], r["source_id"]) for r in con.execute("SELECT source, source_id FROM likes")}
-    con.close()
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM listings ORDER BY first_seen DESC")]
+        hist = {}
+        for r in con.execute("SELECT source, source_id, ts, price FROM price_history ORDER BY ts"):
+            hist.setdefault((r["source"], str(r["source_id"])), []).append([r["ts"], r["price"]])
+        liked = {(r["source"], str(r["source_id"])) for r in con.execute("SELECT source, source_id FROM likes")}
+        disliked = {(r["source"], str(r["source_id"])) for r in con.execute("SELECT source, source_id FROM dislikes")}
+        notes = {(r["source"], str(r["source_id"])): (r["text"] or "", r["ts"] or "")
+                 for r in con.execute("SELECT source, source_id, text, ts FROM notes")}
+    finally:
+        con.close()
+    have_img = images.existing_set()
     for r in rows:
-        key = (r["source"], r["source_id"])
+        key = (r["source"], str(r["source_id"]))
         r["flags"] = json.loads(r["flags"]) if r["flags"] else {}
-        r["raw"] = json.loads(r["raw"]) if r["raw"] else {}
+        raw = json.loads(r["raw"]) if r["raw"] else {}
+        r["apartments"] = bool(raw.get("apartments") or raw.get("isApartments"))
+        r.pop("raw", None)
         r["history"] = hist.get(key, [])
         r["liked"] = key in liked
+        r["disliked"] = key in disliked
+        r["note"], r["note_ts"] = notes.get(key, ("", ""))
         r["object_id"] = r["object_id"] or f"{r['source']}:{r['source_id']}"
-        r["has_img"] = images.local_path(*key) is not None
+        r["has_img"] = key in have_img
         # объявления нет в поиске сайта столько прогонов, что ссылка на него уже никуда не ведёт
         r["off_site"] = offsale.off_search(r)
     return rows
 
 
-@app.post("/api/like")
-def like(body: dict = Body(...)):
-    """Избранное хранится по каждому объявлению объекта — так оно переживает пересборку объектов."""
+def _mark(table, other, body):
+    """Отметка по каждому объявлению объекта — так она переживает пересборку объектов. Лайк и дизлайк
+    взаимоисключающие: поставленная отметка снимает противоположную."""
     keys = [k.split(":", 1) for k in body.get("keys", [])]
     con = db.connect()
-    for source, sid in keys:
-        if body.get("on"):
-            con.execute("INSERT OR IGNORE INTO likes VALUES(?,?,?)", (source, sid, db.now()))
-        else:
-            con.execute("DELETE FROM likes WHERE source=? AND source_id=?", (source, sid))
-    con.commit()
-    con.close()
+    try:
+        for source, sid in keys:
+            if body.get("on"):
+                con.execute(f"INSERT OR IGNORE INTO {table} VALUES(?,?,?)", (source, sid, db.now()))
+                con.execute(f"DELETE FROM {other} WHERE source=? AND source_id=?", (source, sid))
+            else:
+                con.execute(f"DELETE FROM {table} WHERE source=? AND source_id=?", (source, sid))
+        con.commit()
+    finally:
+        con.close()
     return {"ok": True}
+
+
+@app.post("/api/like")
+def like(body: dict = Body(...)):
+    """Избранное (♥)."""
+    return _mark("likes", "dislikes", body)
+
+
+@app.post("/api/dislike")
+def dislike(body: dict = Body(...)):
+    """Скрытые (дизлайк): квартира убирается из просмотра, но собирается и обновляется как все."""
+    return _mark("dislikes", "likes", body)
+
+
+@app.post("/api/note")
+def note_set(body: dict = Body(...)):
+    """Личная заметка к квартире (по каждому её объявлению, чтобы переживала пересборку и слияния)."""
+    keys = [k.split(":", 1) for k in body.get("keys", []) if ":" in str(k)]
+    text = str(body.get("text") or "").strip()[:2000]
+    ts = db.now() if text else ""
+    con = db.connect()
+    try:
+        for source, sid in keys:
+            if text:
+                con.execute("INSERT OR REPLACE INTO notes(source, source_id, text, ts) VALUES(?,?,?,?)",
+                            (source, sid, text, ts))
+            else:
+                con.execute("DELETE FROM notes WHERE source=? AND source_id=?", (source, sid))
+        con.commit()
+    finally:
+        con.close()
+    return {"ok": True, "text": text, "ts": ts}
 
 
 @app.get("/img/{source}/{source_id}")
@@ -65,14 +110,16 @@ def image(source: str, source_id: str):
     p = images.local_path(source, source_id)
     if p is None:
         con = db.connect()
-        r = con.execute("SELECT photo, img_tries FROM listings WHERE source=? AND source_id=?", (source, source_id)).fetchone()
-        if r and r["photo"] and (r["img_tries"] or 0) < images.MAX_TRIES:
-            if images.download(source, source_id, r["photo"]):
-                p = images.local_path(source, source_id)
-            else:
-                con.execute("UPDATE listings SET img_tries=COALESCE(img_tries,0)+1 WHERE source=? AND source_id=?", (source, source_id))
-                con.commit()
-        con.close()
+        try:
+            r = con.execute("SELECT photo, img_tries FROM listings WHERE source=? AND source_id=?", (source, source_id)).fetchone()
+            if r and r["photo"] and (r["img_tries"] or 0) < images.MAX_TRIES:
+                if images.download(source, source_id, r["photo"]):
+                    p = images.local_path(source, source_id)
+                else:
+                    con.execute("UPDATE listings SET img_tries=COALESCE(img_tries,0)+1 WHERE source=? AND source_id=?", (source, source_id))
+                    con.commit()
+        finally:
+            con.close()
     if p is None:
         return Response(status_code=404)
     return FileResponse(p, media_type=MEDIA.get(p.suffix, "image/jpeg"), headers={"Cache-Control": "max-age=86400"})
@@ -103,25 +150,28 @@ def schedule_set(body: dict = Body(...)):
 @app.get("/api/changes")
 def changes(days: int = 7, baseline: int = 0, hours: float = 0, last: int = 0):
     con = db.connect()
-    rows = history.changes(con, days, bool(baseline), hours=hours or None, last=bool(last))
-    con.close()
-    return rows
+    try:
+        return history.changes(con, days, bool(baseline), hours=hours or None, last=bool(last))
+    finally:
+        con.close()
 
 
 @app.get("/api/last_update")
 def last_update():
     con = db.connect()
-    rows = history.last_update(con)
-    con.close()
-    return rows
+    try:
+        return history.last_update(con)
+    finally:
+        con.close()
 
 
 @app.get("/api/dashboard")
 def dashboard(days: int = 0):
     con = db.connect()
-    d = history.dashboard(con, days or None)
-    con.close()
-    return d
+    try:
+        return history.dashboard(con, days or None)
+    finally:
+        con.close()
 
 
 @app.post("/api/recheck_removed")
@@ -138,9 +188,11 @@ def recheck_removed():
 @app.post("/api/images/repair")
 def images_repair():
     con = db.connect()
-    con.execute("UPDATE listings SET img_tries=0")  # ручной запуск — новый круг попыток
-    con.commit()
-    con.close()
+    try:
+        con.execute("UPDATE listings SET img_tries=0")  # ручной запуск — новый круг попыток
+        con.commit()
+    finally:
+        con.close()
     images.repair_async(db.connect, log=lambda m: manager.log("db", m))
     return {"started": True}
 
@@ -198,9 +250,10 @@ def db_purge(body: dict = Body(...)):
     try:
         if body.get("dry_run"):
             con = db.connect()
-            res = purge.preview(con, body.get("from") or None, body.get("to") or None)
-            con.close()
-            return res
+            try:
+                return purge.preview(con, body.get("from") or None, body.get("to") or None)
+            finally:
+                con.close()
         res = purge.purge(body.get("from") or None, body.get("to") or None)
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -343,12 +396,16 @@ def set_zone(body: dict = Body(...)):
     cfg["zone"].update(center=[round(lat, 6), round(lon, 6)], radius_m=round(radius), polygon=None)
     settings.save(cfg)
     con = db.connect()
-    before = {(r["source"], r["source_id"]): r["zone"] for r in con.execute("SELECT source, source_id, zone FROM listings")}
-    con.close()
+    try:
+        before = {(r["source"], r["source_id"]): r["zone"] for r in con.execute("SELECT source, source_id, zone FROM listings")}
+    finally:
+        con.close()
     res = _reclassify(cfg)
     con = db.connect()
-    after = {(r["source"], r["source_id"]): r["zone"] for r in con.execute("SELECT source, source_id, zone FROM listings")}
-    con.close()
+    try:
+        after = {(r["source"], r["source_id"]): r["zone"] for r in con.execute("SELECT source, source_id, zone FROM listings")}
+    finally:
+        con.close()
     res["moved_in"] = sum(1 for k, z in after.items() if z == "A" and before.get(k) != "A")
     res["moved_out"] = sum(1 for k, z in after.items() if z != "A" and before.get(k) == "A")
     manager.log("db", f"круг изменён: центр {old['center'][0]:.5f}, {old['center'][1]:.5f} → {lat:.5f}, {lon:.5f}, "
@@ -359,21 +416,22 @@ def set_zone(body: dict = Body(...)):
 
 def _reclassify(cfg):
     con = db.connect()
-    n = 0
-    for r in con.execute("SELECT * FROM listings").fetchall():
-        item = dict(r)
-        item["flags"] = {}
-        item["zone"] = geo.classify(item, cfg["zone"])
-        reasons = rules.evaluate(item, cfg["filters"])
-        con.execute("UPDATE listings SET zone=?, excluded=?, flags=? WHERE source=? AND source_id=?",
-                    (item["zone"], "; ".join(reasons) or None, json.dumps(item["flags"], ensure_ascii=False),
-                     item["source"], item["source_id"]))
-        n += 1
-    con.commit()
-    objects = dedupe.rebuild(con)
-    snapshots = history.rebuild_snapshots(con)
-    con.close()
-    return {"updated": n, "objects": objects, "snapshots": snapshots}
+    try:
+        updates = []
+        for r in con.execute("SELECT * FROM listings").fetchall():
+            item = dict(r)
+            item["flags"] = {}
+            item["zone"] = geo.classify(item, cfg["zone"])
+            reasons = rules.evaluate(item, cfg["filters"])
+            updates.append((item["zone"], "; ".join(reasons) or None, json.dumps(item["flags"], ensure_ascii=False),
+                            item["source"], item["source_id"]))
+        con.executemany("UPDATE listings SET zone=?, excluded=?, flags=? WHERE source=? AND source_id=?", updates)
+        con.commit()
+        objects = dedupe.rebuild(con)
+        snapshots = history.rebuild_snapshots(con)
+        return {"updated": len(updates), "objects": objects, "snapshots": snapshots}
+    finally:
+        con.close()
 
 
 @app.post("/api/run")
@@ -396,8 +454,10 @@ def status(after: int = 0):
 @app.get("/api/runs")
 def runs():
     con = db.connect()
-    rows = [dict(r) for r in con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 50")]
-    con.close()
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 50")]
+    finally:
+        con.close()
     for r in rows:
         r["has_log"] = runlog.run_log_path(r["id"]) is not None
     return rows

@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS runs(
     status TEXT, pages INTEGER, found INTEGER, new INTEGER, changed INTEGER, removed INTEGER, message TEXT
 );
 CREATE TABLE IF NOT EXISTS likes(source TEXT, source_id TEXT, ts TEXT, PRIMARY KEY(source, source_id));
+-- «Скрытые» (дизлайк): квартира не нравится, и её не надо показывать в подборке. Сбор её не пропускает —
+-- цены и снятие ведутся как у всех, скрыта она только в просмотре и возвращается кнопкой «Скрытые»
+CREATE TABLE IF NOT EXISTS dislikes(source TEXT, source_id TEXT, ts TEXT, PRIMARY KEY(source, source_id));
+-- Личные заметки к квартире (по каждому объявлению объекта, как лайк/дизлайк — чтобы не терялись при пересборке)
+CREATE TABLE IF NOT EXISTS notes(source TEXT, source_id TEXT, text TEXT, ts TEXT, PRIMARY KEY(source, source_id));
 -- События рынка для экрана «Изменения»: new | price | removed | returned.
 -- baseline=1 — объявление попало в базу при первичной загрузке сайта (не новое для рынка)
 CREATE TABLE IF NOT EXISTS events(
@@ -37,6 +42,8 @@ CREATE TABLE IF NOT EXISTS events(
 );
 -- Сводка рынка после каждого запуска сбора (когда отработали все сайты) — точка на графиках дашборда
 CREATE TABLE IF NOT EXISTS snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, run_id INTEGER, data TEXT);
+-- Служебные отметки базы: например, по какой версии правил собраны объекты (dedupe_rules)
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
 # Колонки, добавленные после первой версии (ALTER TABLE для старых баз)
@@ -66,6 +73,21 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+def hidden_fresh(con, since=None):
+    """Сколько скрытых квартир (дизлайк, без ♥) получили объявления, которым дизлайк не ставили, — то есть
+    добавившиеся в карточку уже после скрытия. since — считать только объявления, впервые найденные с этого
+    момента (для уведомления о прошедшем сборе); без него — все такие, как кружок на кнопке «Скрытые»."""
+    return con.execute("""
+        WITH hid AS (SELECT DISTINCT l.object_id FROM listings l JOIN dislikes d USING(source, source_id)
+                     WHERE l.object_id IS NOT NULL),
+             fav AS (SELECT DISTINCT l.object_id FROM listings l JOIN likes k USING(source, source_id)
+                     WHERE l.object_id IS NOT NULL)
+        SELECT COUNT(DISTINCT l.object_id) FROM listings l
+        WHERE l.object_id IN hid AND l.object_id NOT IN fav
+          AND NOT EXISTS (SELECT 1 FROM dislikes d WHERE d.source = l.source AND d.source_id = l.source_id)
+          AND (? IS NULL OR l.first_seen >= ?)""", (since, since)).fetchone()[0]
+
+
 _init_lock = threading.Lock()
 _initialized = False
 
@@ -80,6 +102,7 @@ def connect():
             con.close()
             _initialized = True
     con = sqlite3.connect(DB_FILE, timeout=30)
+    con.execute("PRAGMA synchronous=NORMAL")
     con.row_factory = sqlite3.Row
     return con
 

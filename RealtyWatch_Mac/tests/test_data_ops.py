@@ -4,7 +4,7 @@
 import json
 from pathlib import Path
 
-from app import alerts, db, history, purge, runlog, server, transfer, trash
+from app import alerts, db, dedupe, history, images, paths, purge, runlog, server, transfer, trash
 from app.scrapers.cian import Cian
 from tests.support import Case, cian_offer, con, counts, listings, run
 
@@ -13,7 +13,9 @@ GOOD, BAD = "2026-10-20T10:00:00", "2026-10-22T10:00:00"
 
 def cian(rows, verify=None):
     class C(Cian):
-        def _load(self, page):
+        def _load(self, page, repair=None):
+            if repair:  # выдачи по виду ремонта в этих тестах пустые
+                return [], 0
             return [cian_offer(r) for r in rows[(page - 1) * 28: page * 28]], len(rows)
 
         def verify(self, row):
@@ -304,3 +306,83 @@ class Backups(Case):
     def test_restore_rejects_foreign_name(self):
         with self.assertRaises(ValueError):
             transfer.restore("нет_такой.zip")
+
+
+class ImportAndImagesCache(Case):
+    """Импорт архива сохраняет статистику прогонов и пересчитывает снимки/правила; кэш фото находит файлы."""
+
+    def test_existing_set_matches_server_listings(self):
+        run("cian", cian(listings("cian", 3)))
+        rows = server.listings()
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(not r["has_img"] for r in rows))
+        img_dir = images.IMAGES / "cian"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        first = rows[0]
+        (img_dir / f"{first['source_id']}.webp").write_bytes(b"\x00" * 2048)
+        self.assertIn((first["source"], first["source_id"]), images.existing_set())
+        after = {r["source_id"]: r["has_img"] for r in server.listings()}
+        self.assertTrue(after[first["source_id"]])
+
+    def test_import_merge_keeps_run_metrics_and_rebuilds_snapshots(self):
+        run("cian", cian(listings("cian", 5)))
+        c = con()
+        c.execute("UPDATE runs SET declared=50, collected=5, requests=3")
+        c.commit()
+        zip_path = self.dir / "export.zip"
+        transfer.export_zip(zip_path)
+        purge.clear_all()
+        res = transfer.import_zip(zip_path, mode="merge")
+        self.assertEqual(res["added"], 5)
+        c2 = con()
+        r = c2.execute("SELECT declared, collected, requests FROM runs").fetchone()
+        self.assertEqual((r["declared"], r["collected"], r["requests"]), (50, 5, 3))
+        meta = c2.execute("SELECT value FROM meta WHERE key='dedupe_rules'").fetchone()
+        self.assertEqual(meta["value"], str(dedupe.RULES_VERSION))
+        self.assertGreaterEqual(c2.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 1)
+
+
+class ListingsPayloadAndNotes(Case):
+    """Облегчённый /api/listings (apartments вместо raw) и личные заметки к квартире (API, очистка, перенос)."""
+
+    def test_listings_drops_raw_and_exposes_apartments_and_notes(self):
+        c = con()
+        db.upsert(c, {
+            "source": "cian", "source_id": "101", "url": "https://cian.test/101", "title": "1-к., 40 м²",
+            "price": 9_000_000, "rooms": 1, "area": 40.0, "floor": 2, "floors": 5,
+            "address": "Ялта, ул. Морская, 1", "raw": {"isApartments": True, "repair": 2, "huge": "x" * 500},
+        })
+        db.upsert(c, {
+            "source": "avito", "source_id": "202", "url": "https://avito.test/202", "title": "1-к., 40 м²",
+            "price": 9_100_000, "rooms": 1, "area": 40.0, "floor": 2, "floors": 5,
+            "address": "Ялта, ул. Морская, 1", "raw": {"apartments": False},
+        })
+        c.commit()
+        dedupe.rebuild(c)
+        c.close()
+
+        rows = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertNotIn("raw", rows["cian:101"])
+        self.assertTrue(rows["cian:101"]["apartments"])
+        self.assertFalse(rows["avito:202"]["apartments"])
+
+        # Сохранение и очистка заметки
+        server.note_set({"keys": ["cian:101", "avito:202"], "text": "  Вид во двор, торг до 8,8  "})
+        rows2 = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertEqual(rows2["cian:101"]["note"], "Вид во двор, торг до 8,8")
+        self.assertEqual(rows2["avito:202"]["note"], "Вид во двор, торг до 8,8")
+
+        # Экспорт → полная очистка → слияние сохраняет заметку
+        zip_path = self.dir / "with-note.zip"
+        transfer.export_zip(zip_path, with_images=False)
+        purge.clear_all()
+        c = con()
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM notes").fetchone()[0], 0)
+        c.close()
+        transfer.import_zip(zip_path, mode="merge")
+        rows3 = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertEqual(rows3["cian:101"]["note"], "Вид во двор, торг до 8,8")
+
+        # Пустой текст удаляет заметку
+        server.note_set({"keys": ["cian:101", "avito:202"], "text": ""})
+        self.assertEqual([r["note"] for r in server.listings()], ["", ""])
