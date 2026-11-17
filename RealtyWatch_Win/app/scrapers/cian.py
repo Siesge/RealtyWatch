@@ -244,19 +244,23 @@ class Cian(Scraper):
             return st["offers"], agg if agg is not None else tot
 
         def via_browser(b):
-            html = b.goto(url)
-            st = b.evaluate(_JS_STATE)
-            if not st:
-                st = parse_state(b.raw_html()) or parse_state(html)
-            if not st and hasattr(b, "_wait_js"):
-                if b._wait_js("() => !!(window._cianConfig && Object.keys(window._cianConfig).length)", 8):
-                    cur = b.content() if hasattr(b, "content") else html
-                    st = b.evaluate(_JS_STATE) or parse_state(b.raw_html()) or parse_state(cur)
-            if not st:
-                self.snapshot_last("нет состояния страницы")
-                raise IOError("ЦИАН: не найдено состояние страницы")
-            agg, tot = st.get("aggregated"), st.get("total")
-            return st["offers"], agg if agg is not None else tot
+            for attempt in range(2):
+                html = b.goto(url)
+                st = b.evaluate(_JS_STATE)
+                if not st:
+                    st = parse_state(b.raw_html()) or parse_state(html)
+                if not st and hasattr(b, "_wait_js"):
+                    if b._wait_js("() => !!(window._cianConfig && Object.keys(window._cianConfig).length)", 8):
+                        cur = b.content() if hasattr(b, "content") else html
+                        st = b.evaluate(_JS_STATE) or parse_state(b.raw_html()) or parse_state(cur)
+                if st:
+                    agg, tot = st.get("aggregated"), st.get("total")
+                    return st["offers"], agg if agg is not None else tot
+                if attempt == 0:
+                    self.log("страница ЦИАН пришла без данных выдачи — повторяю загрузку")
+                    self.wait()
+            self.snapshot_last("нет состояния страницы")
+            raise IOError("ЦИАН: не найдено состояние страницы")
 
         return self.fetch(via_http, via_browser)
 

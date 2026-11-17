@@ -616,6 +616,126 @@ class CianStateAndFallback(Case):
                 finally:
                     lb.close()
 
+    @unittest.skipUnless(has_browser(), "нет установленного Chromium")
+    def test_browser_retries_transient_http_500_and_reports_persistent_500(self):
+        """Реальный сценарий прогона №165: при HTTP 500 («Ошибка 500 - Циан») в браузере
+        выполняются повторы с паузой; при восстановлении сбор идёт без снимка, а при стойком 500
+        поднимается IOError('HTTP 500 ...') со снимком http 500, а не 'не найдено состояние страницы'."""
+        fast_timing(self)
+        err500 = (
+            '<!DOCTYPE html><html><head><title>Ошибка 500 - Циан</title></head>'
+            '<body><h1>Страница не загрузилась</h1><p>Попробуйте ещё раз, уже должно работать</p></body></html>'
+        ).encode("utf-8")
+        ssr_bytes = self._ssr_html(aggregated=42, total=95).encode("utf-8")
+        state = {"gets": 0, "persistent": False}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                state["gets"] += 1
+                is_err = state["persistent"] or state["gets"] == 1
+                body = err500 if is_err else ssr_bytes
+                self.send_response(500 if is_err else 200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        base_url = f"http://127.0.0.1:{srv.server_port}"
+
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                self.log.clear()
+                state["gets"] = 0
+                state["persistent"] = persistent
+                snaps = []
+                c = Cian(settings.load(), self.log.append, None, lambda **k: None)
+                c.use_browser = True
+                c._page_url = lambda page, repair=None: f"{base_url}/cat.php?p={page}"
+                lb = LocalBrowser("cian", c.is_blocked, self.log.append, None, is_ready=c.is_ready, label="ЦИАН")
+                lb.keep = lambda body, reason, ext="html": snaps.append((reason, ext))
+                try:
+                    c.get_browser = lambda lb=lb: (setattr(c, "browser", lb), lb)[1]
+                    if not persistent:
+                        offers, count = c._load(2)
+                        self.assertEqual((offers, count), ([self.offer], 42))
+                        self.assertEqual(state["gets"], 2)
+                        self.assertEqual(snaps, [])
+                        self.assertTrue(any("ошибка сервера (HTTP 500) — повторяю" in m for m in self.log), self.log)
+                    else:
+                        with self.assertRaises(IOError) as ctx:
+                            c._load(3)
+                        self.assertIn("HTTP 500", str(ctx.exception))
+                        self.assertNotIn("не найдено состояние страницы", str(ctx.exception))
+                        self.assertEqual(state["gets"], 1 + len(LocalBrowser.SERVER_RETRY_WAITS))
+                        self.assertEqual(snaps, [("http 500", "html")])
+                finally:
+                    lb.close()
+
+    def test_http_retries_transient_502_and_browser_retries_empty_state(self):
+        """HTTP повторяет временный 502 без снимков и перехода в браузер; в браузере страница 200
+        без _cianConfig перегружается один раз перед ошибкой состояния."""
+        fast_timing(self)
+        posts = {"n": 0}
+        ssr_json = json.dumps({"data": {"offersSerialized": [self.offer], "aggregatedCount": 11}}).encode("utf-8")
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                posts["n"] += 1
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                code = 502 if posts["n"] == 1 else 200
+                body = b"<html>502 Bad Gateway</html>" if code == 502 else ssr_json
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json" if code == 200 else "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        orig_api = cian_mod.API
+        cian_mod.API = f"http://127.0.0.1:{srv.server_port}/api"
+        self.addCleanup(setattr, cian_mod, "API", orig_api)
+
+        snaps = []
+        c = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        c.runlog = SimpleNamespace(request=lambda *a: None, line=lambda *a: None,
+                                   snapshot=lambda body, reason, ext="html": snaps.append((reason, ext)))
+        offers, count = c._load(1)
+        self.assertEqual((offers, count), ([self.offer], 11))
+        self.assertFalse(c.use_browser)
+        self.assertEqual(c.last_mode, "http")
+        self.assertEqual(posts["n"], 2)
+        self.assertEqual(snaps, [])
+
+        ssr_html = self._ssr_html(aggregated=7, total=15)
+        b_calls = {"n": 0}
+        c2 = Cian(settings.load(), self.log.append, None, lambda **k: None)
+        c2.use_browser = True
+        c2.wait = lambda *a, **k: None
+
+        def fake_goto(u):
+            b_calls["n"] += 1
+            return "<html></html>" if b_calls["n"] == 1 else ssr_html
+
+        fake_b = SimpleNamespace(goto=fake_goto, evaluate=lambda js: None, raw_html=lambda: None)
+        c2.get_browser = lambda: fake_b
+        self.assertEqual(c2._load(1), ([self.offer], 7))
+        self.assertEqual(b_calls["n"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

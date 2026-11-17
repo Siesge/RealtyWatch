@@ -51,6 +51,7 @@ class Scraper:
         self.delay = tuple(self.site.get("delay", (3, 7)))
         self.runlog = NullRunLog()  # подробный журнал прогона (назначает RunManager)
         self.http = Http(self.name, self.is_blocked)
+        self.http.stop = stop
         self.http.trace = self._trace
         self.http.save_block_snapshots = self.mode != "auto"
         self.browser = None

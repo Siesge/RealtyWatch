@@ -34,6 +34,8 @@ def pause(delay, stop=None):
 
 
 class Http:
+    RETRY_WAITS = [(1.5, 3.0), (4.0, 7.0)]  # паузы перед повтором при временных сбоях сети и HTTP 5xx
+
     def __init__(self, site, is_blocked):
         self.site = site
         self.is_blocked = is_blocked
@@ -41,6 +43,7 @@ class Http:
         self.s = cffi.Session(impersonate="chrome", timeout=40)
         self.s.headers.update({"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6"})
         self._load_cookies()
+        self.stop = None       # событие остановки прогона (назначает Scraper)
         self.trace = None      # trace(kind, method, url, status, ms, size, note, body, reason) — подробный журнал
         self.last_text = None  # тело последнего ответа (для снимка страницы при сбое)
         self.save_block_snapshots = True  # в режиме auto переключение на браузер штатно — снимки заглушек не плодим
@@ -68,24 +71,36 @@ class Http:
             self.trace(*a, **k)
 
     def request(self, method, url, **kw):
-        t0 = time.time()
-        try:
-            r = self.s.request(method, url, **kw)
-        except Exception as e:  # сетевые ошибки curl
-            self._trace("http", method, url, None, round((time.time() - t0) * 1000), None, f"{type(e).__name__}: {e}")
-            raise IOError(f"{type(e).__name__}: {e}") from e
-        ms, text = round((time.time() - t0) * 1000), r.text
-        self.last_text = text
-        if r.status_code in (401, 403, 429, 439) or self.is_blocked(text, str(r.url)):
-            self._trace("http", method, url, r.status_code, ms, len(text), "блокировка/капча",
-                        text if self.save_block_snapshots else None,
-                        f"http {r.status_code} блокировка" if self.save_block_snapshots else None)
-            raise Blocked(f"HTTP {r.status_code} {r.url}")
-        if r.status_code >= 400:
-            self._trace("http", method, url, r.status_code, ms, len(text), "ошибка сервера", text, f"http {r.status_code}")
-            raise IOError(f"HTTP {r.status_code} {url}")
-        self._trace("http", method, url, r.status_code, ms, len(text), "" if str(r.url) == url else f"→ {r.url}")
-        return r
+        for attempt in range(len(self.RETRY_WAITS) + 1):
+            t0 = time.time()
+            try:
+                r = self.s.request(method, url, **kw)
+            except Exception as e:  # сетевые ошибки curl
+                ms = round((time.time() - t0) * 1000)
+                if attempt < len(self.RETRY_WAITS):
+                    self._trace("http", method, url, None, ms, None,
+                                f"{type(e).__name__}: {e} — повтор {attempt + 1}/{len(self.RETRY_WAITS)}")
+                    pause(self.RETRY_WAITS[attempt], self.stop)
+                    continue
+                self._trace("http", method, url, None, ms, None, f"{type(e).__name__}: {e}")
+                raise IOError(f"{type(e).__name__}: {e}") from e
+            ms, text = round((time.time() - t0) * 1000), r.text
+            self.last_text = text
+            if r.status_code in (401, 403, 429, 439) or self.is_blocked(text, str(r.url)):
+                self._trace("http", method, url, r.status_code, ms, len(text), "блокировка/капча",
+                            text if self.save_block_snapshots else None,
+                            f"http {r.status_code} блокировка" if self.save_block_snapshots else None)
+                raise Blocked(f"HTTP {r.status_code} {r.url}")
+            if r.status_code >= 500 and attempt < len(self.RETRY_WAITS):
+                self._trace("http", method, url, r.status_code, ms, len(text),
+                            f"ошибка сервера — повтор {attempt + 1}/{len(self.RETRY_WAITS)}")
+                pause(self.RETRY_WAITS[attempt], self.stop)
+                continue
+            if r.status_code >= 400:
+                self._trace("http", method, url, r.status_code, ms, len(text), "ошибка сервера", text, f"http {r.status_code}")
+                raise IOError(f"HTTP {r.status_code} {url}")
+            self._trace("http", method, url, r.status_code, ms, len(text), "" if str(r.url) == url else f"→ {r.url}")
+            return r
 
     def get(self, url, **kw):
         return self.request("GET", url, **kw)
@@ -114,6 +129,8 @@ class Browser:
     AFTER_SOLVE_WAIT_S = 40  # сколько ждать, пока сайт откроет страницу после решённой капчи
     PASSED_TEXT = "Проверка пройдена"
     CLICK_REACT_S = 4.0      # сколько ждать начала перехода после нажатия по ссылке
+    SERVER_RETRY_WAITS = [(3.5, 6.5), (8.0, 14.0), (15.0, 25.0)]  # паузы перед повтором при HTTP 5xx в браузере
+    NAV_RETRY_WAITS = [(3.0, 6.0), (7.0, 13.0)]  # паузы перед повтором при обрыве загрузки/таймауте в браузере
 
     def __init__(self, site, is_blocked, log, stop, window="hidden", captcha_wait_min=10, is_ip_banned=None,
                  is_ready=None, label=None, solver=None, blocked_js=None):
@@ -148,8 +165,27 @@ class Browser:
         self._gt = {}       # вкладка → ответы GeeTest (задание, картинки, итог) с момента загрузки её страницы
 
     def _nav(self, url):
-        resp = self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        self.last_status = resp.status if resp else None  # код ответа сайта — нужен для проверки «страница не найдена»
+        for attempt in range(len(self.NAV_RETRY_WAITS) + 1):
+            try:
+                resp = self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                self.last_status = resp.status if resp else None  # код ответа сайта — нужен для проверки «страница не найдена»
+                return
+            except Stopped:
+                raise
+            except Exception as e:
+                if attempt == len(self.NAV_RETRY_WAITS):
+                    raise IOError(f"{self.label}: не удалось загрузить страницу ({e})") from e
+                w = self.NAV_RETRY_WAITS[attempt]
+                self.log(f"сбой загрузки страницы ({e}) — повторяю через {w[0]:g}–{w[1]:g} с "
+                         f"({attempt + 1}/{len(self.NAV_RETRY_WAITS)})")
+                pause(w, self.stop)
+
+    def _server_error(self, html):
+        """Временная ошибка сервера (HTTP 5xx или страница «Ошибка 500»), а не капча."""
+        if self.last_status is not None and 500 <= self.last_status < 600:
+            return True
+        head = (html or "")[:8000]
+        return "<title>Ошибка 5" in head or "frontend-status-pages/5" in head
 
     def start(self):
         if self.ctx:
@@ -522,6 +558,26 @@ class Browser:
         moved = "" if self.page.url == url else f"→ {self.page.url}"
         self._trace("browser", "GET", url, self.last_status, round((time.time() - t0) * 1000), len(html),
                     " · ".join(x for x in (how, moved) if x))
+        for attempt, wait_s in enumerate(self.SERVER_RETRY_WAITS, 1):
+            if not (self._server_error(html) and not self._blocked(html, self.page.url)
+                    and not self.is_ip_banned(html, self.page.url)):
+                break
+            code = self.last_status if self.last_status and self.last_status >= 500 else "5xx"
+            self.log(f"ошибка сервера (HTTP {code}) — повторяю через {wait_s[0]:g}–{wait_s[1]:g} с "
+                     f"({attempt}/{len(self.SERVER_RETRY_WAITS)})")
+            pause(wait_s, self.stop)
+            t_retry = time.time()
+            self._nav(url)
+            pause(settle, self.stop)
+            html = self.content()
+            moved = "" if self.page.url == url else f"→ {self.page.url}"
+            self._trace("browser", "GET", url, self.last_status, round((time.time() - t_retry) * 1000), len(html),
+                        " · ".join(x for x in (f"повтор {attempt} после HTTP {code}", moved) if x))
+        if (self._server_error(html) and not self._blocked(html, self.page.url)
+                and not self.is_ip_banned(html, self.page.url)):
+            code = self.last_status if self.last_status and self.last_status >= 500 else 500
+            self.keep(html, f"http {code}")
+            raise IOError(f"HTTP {code} {url}")
         if self._blocked(html, self.page.url) and self.last_status not in (403, 429, 439):
             # Иногда страница проверки сама открывает выдачу через несколько секунд, а иногда проходит после перезагрузки
             pause((8, 14), self.stop)
