@@ -4,6 +4,7 @@ UDP-обнаружение устройств рядом, сопряжение �
 import hashlib
 import hmac
 import http.client
+import io
 import ipaddress
 import json
 import logging
@@ -74,7 +75,11 @@ HEARTBEAT_INTERVAL_SEC = 8.0
 HEARTBEAT_TIMEOUT_SEC = 2.0
 DB_SESSION_TTL_SEC = 600.0
 MAX_CARDS_BYTES = 250 * 1024 * 1024
+MAX_MARKS_BYTES = 64 * 1024 * 1024
 MAX_DB_BYTES = 1024 * 1024 * 1024  # 1 ГБ для полной базы и дельты фото
+_MARKS_SYNC_FORMAT = "realtywatch-marks-v1"
+_MARKS_SYNC_VERSION = 1
+MARK_CATEGORIES = ("likes", "dislikes", "notes", "merges")
 DISCONNECT_MSG = "Связь с устройством прервалась во время передачи — данные не повреждены, повторите после восстановления сети"
 
 
@@ -377,6 +382,235 @@ def _outbox_log(con, peer_id: str, kind: str, event_id: str = "", payload_path: 
         pass
 
 
+def _normalize_mark_items(raw, *, allow_empty: bool = False) -> list[str]:
+    """Нормализует список выбранных категорий отметок (likes, dislikes, notes, merges)."""
+    if isinstance(raw, str):
+        parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(p).strip().lower() for p in raw if str(p).strip()]
+    else:
+        parts = []
+    seen = set(parts)
+    ordered = [cat for cat in MARK_CATEGORIES if cat in seen]
+    if not ordered and not allow_empty:
+        raise ValueError("выберите хотя бы один параметр (лайки, дизлайки, заметки или ручные объединения)")
+    return ordered
+
+
+def _marks_counts(con) -> dict:
+    """Количество объектов с лайками, дизлайками, заметками и групп ручного объединения в БД."""
+    likes_n = con.execute(
+        "SELECT COUNT(DISTINCT COALESCE(l.object_id, k.source || ':' || k.source_id)) "
+        "FROM likes k LEFT JOIN listings l ON l.source = k.source AND l.source_id = k.source_id"
+    ).fetchone()[0]
+    dislikes_n = con.execute(
+        "SELECT COUNT(DISTINCT COALESCE(l.object_id, k.source || ':' || k.source_id)) "
+        "FROM dislikes k LEFT JOIN listings l ON l.source = k.source AND l.source_id = k.source_id"
+    ).fetchone()[0]
+    notes_n = con.execute(
+        """SELECT COUNT(DISTINCT obj_key) FROM (
+               SELECT COALESCE(l.object_id, n.source || ':' || n.source_id) AS obj_key
+               FROM notes n LEFT JOIN listings l ON l.source = n.source AND l.source_id = n.source_id
+               WHERE TRIM(COALESCE(n.text, '')) != ''
+               UNION
+               SELECT COALESCE(l.object_id, inr.source || ':' || inr.source_id) AS obj_key
+               FROM imported_notes inr LEFT JOIN listings l ON l.source = inr.source AND l.source_id = inr.source_id
+               WHERE TRIM(COALESCE(inr.text, '')) != ''
+           )"""
+    ).fetchone()[0]
+    merges_n = len(dedupe.active_manual_merges(con)[0])
+    return {
+        "likes": int(likes_n or 0),
+        "dislikes": int(dislikes_n or 0),
+        "notes": int(notes_n or 0),
+        "merges": int(merges_n or 0),
+    }
+
+
+def _union_manual_merges_rows(main_rows: list[dict], inc_rows: list[dict]) -> list[tuple]:
+    """Объединяет списки manual_merges двух машин без разрыва пересекающихся связок (приоритет primary у main)."""
+    if not inc_rows and not main_rows:
+        return []
+    if not main_rows:
+        return [
+            (str(r["source"]), str(r["source_id"]), str(r["group_id"]), 1 if r.get("is_primary") else 0, str(r.get("ts") or ""))
+            for r in inc_rows
+            if r.get("source") and r.get("source_id") and r.get("group_id")
+        ]
+    by_key, by_tag, info = {}, {}, {}
+    for side, rows in (("main", main_rows), ("imp", inc_rows)):
+        for r in rows:
+            src = str(r.get("source") or "").strip()
+            sid = str(r.get("source_id") or "").strip()
+            gid = str(r.get("group_id") or "").strip()
+            if not src or not sid or not gid:
+                continue
+            k = (src, sid)
+            tag = (side, gid)
+            by_key.setdefault(k, set()).add(tag)
+            by_tag.setdefault(tag, set()).add(k)
+            info.setdefault(k, []).append((side, r))
+    seen_k, used_gids, out = set(), set(), []
+    for k0 in sorted(by_key):
+        if k0 in seen_k:
+            continue
+        comp_keys, comp_tags = set(), set()
+        stack = [k0]
+        seen_k.add(k0)
+        while stack:
+            k = stack.pop()
+            comp_keys.add(k)
+            for tag in by_key[k]:
+                if tag in comp_tags:
+                    continue
+                comp_tags.add(tag)
+                for nk in by_tag[tag]:
+                    if nk not in seen_k:
+                        seen_k.add(nk)
+                        stack.append(nk)
+        if len(comp_keys) < 2:
+            continue
+        cands = [
+            (1 if r.get("is_primary") else 0, str(r.get("ts") or ""), 1 if side == "main" else 0, k, str(r.get("group_id") or ""))
+            for k in comp_keys
+            for side, r in info[k]
+        ]
+        _, win_ts, _, prim_key, win_gid = max(cands)
+        if not win_gid or win_gid in used_gids:
+            win_gid = f"{prim_key[0]}:{prim_key[1]}"
+        used_gids.add(win_gid)
+        ts = max((str(r.get("ts") or "") for k in comp_keys for _, r in info[k]), default=win_ts)
+        for src, sid in sorted(comp_keys):
+            out.append((src, sid, win_gid, 1 if (src, sid) == prim_key else 0, ts))
+    return out
+
+
+def _export_marks_payload(con, ident: dict, items: list[str]) -> dict:
+    """Экспортирует выбранные категории пользовательского слоя (лайки, дизлайки, заметки, ручные объединения)."""
+    sel = _normalize_mark_items(items)
+    full_counts = _marks_counts(con)
+    counts = {cat: full_counts[cat] if cat in sel else 0 for cat in MARK_CATEGORIES}
+
+    likes_rows, dislikes_rows, notes_rows, imp_notes_rows, merges_rows = [], [], [], [], []
+    ref_keys: set[tuple[str, str]] = set()
+
+    if "likes" in sel:
+        for r in con.execute("SELECT source, source_id, ts FROM likes"):
+            s, sid = str(r["source"]), str(r["source_id"])
+            likes_rows.append({"source": s, "source_id": sid, "ts": str(r["ts"] or "")})
+            ref_keys.add((s, sid))
+
+    if "dislikes" in sel:
+        for r in con.execute("SELECT source, source_id, ts FROM dislikes"):
+            s, sid = str(r["source"]), str(r["source_id"])
+            dislikes_rows.append({"source": s, "source_id": sid, "ts": str(r["ts"] or "")})
+            ref_keys.add((s, sid))
+
+    if "notes" in sel:
+        for r in con.execute("SELECT source, source_id, text, ts FROM notes WHERE TRIM(COALESCE(text, '')) != ''"):
+            s, sid = str(r["source"]), str(r["source_id"])
+            notes_rows.append({"source": s, "source_id": sid, "text": str(r["text"]).strip()[:2000], "ts": str(r["ts"] or "")})
+            ref_keys.add((s, sid))
+        for r in con.execute(
+            "SELECT source, source_id, origin_id, origin_name, text, ts, updated_at "
+            "FROM imported_notes WHERE TRIM(COALESCE(text, '')) != ''"
+        ):
+            s, sid = str(r["source"]), str(r["source_id"])
+            imp_notes_rows.append({
+                "source": s,
+                "source_id": sid,
+                "origin_id": str(r["origin_id"] or ""),
+                "origin_name": str(r["origin_name"] or ""),
+                "text": str(r["text"]).strip()[:2000],
+                "ts": str(r["ts"] or ""),
+                "updated_at": str(r["updated_at"] or ""),
+            })
+            ref_keys.add((s, sid))
+
+    if "merges" in sel:
+        by_group, primaries = dedupe.active_manual_merges(con)
+        active_gids = set(by_group.keys())
+        if active_gids:
+            for r in con.execute("SELECT source, source_id, group_id, is_primary, ts FROM manual_merges"):
+                gid = str(r["group_id"] or "")
+                if gid not in active_gids:
+                    continue
+                s, sid = str(r["source"]), str(r["source_id"])
+                merges_rows.append({
+                    "source": s,
+                    "source_id": sid,
+                    "group_id": gid,
+                    "is_primary": 1 if r["is_primary"] else 0,
+                    "ts": str(r["ts"] or ""),
+                })
+                ref_keys.add((s, sid))
+
+    ref_listings = []
+    ref_history = []
+    if ref_keys:
+        for src, sid in sorted(ref_keys):
+            row = con.execute("SELECT * FROM listings WHERE source=? AND source_id=?", (src, sid)).fetchone()
+            if row is not None:
+                d = dict(row)
+                d.pop("object_id", None)
+                ref_listings.append(d)
+            for hr in con.execute(
+                "SELECT source, source_id, ts, price FROM price_history WHERE source=? AND source_id=?",
+                (src, sid),
+            ):
+                ref_history.append({
+                    "source": str(hr["source"]),
+                    "source_id": str(hr["source_id"]),
+                    "ts": str(hr["ts"]),
+                    "price": hr["price"],
+                })
+
+    return {
+        "format": _MARKS_SYNC_FORMAT,
+        "version": _MARKS_SYNC_VERSION,
+        "created_at": _now_ts(),
+        "from_device_id": ident["device_id"],
+        "from_device_name": ident["device_name"],
+        "items": sel,
+        "counts": counts,
+        "likes": likes_rows,
+        "dislikes": dislikes_rows,
+        "notes": notes_rows,
+        "imported_notes": imp_notes_rows,
+        "manual_merges": merges_rows,
+        "ref_listings": ref_listings,
+        "ref_price_history": ref_history,
+    }
+
+
+def _pack_marks_zip(payload: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("marks.json", json.dumps(payload, ensure_ascii=False))
+    return buf.getvalue()
+
+
+def _unpack_marks_zip(raw_or_path) -> dict:
+    try:
+        zf_ctx = zipfile.ZipFile(io.BytesIO(raw_or_path), "r") if isinstance(raw_or_path, (bytes, bytearray)) else zipfile.ZipFile(raw_or_path, "r")
+    except zipfile.BadZipFile as e:
+        raise ValueError("повреждён архив отметок") from e
+    with zf_ctx as zf:
+        bad = zf.testzip()
+        if bad:
+            raise ValueError(f"повреждён файл внутри архива отметок: {bad}")
+        if "marks.json" not in zf.namelist():
+            raise ValueError("в пакете отсутствует marks.json")
+        try:
+            payload = json.loads(zf.read("marks.json").decode("utf-8"))
+        except Exception as e:
+            raise ValueError("некорректный JSON в пакете отметок") from e
+    if not isinstance(payload, dict) or payload.get("format") != _MARKS_SYNC_FORMAT:
+        raise ValueError("неподдерживаемый формат пакета отметок")
+    _normalize_mark_items(payload.get("items") or [])
+    return payload
+
+
 class LanService:
     """Управляет LAN-сервером, UDP-обнаружением, PIN-сопряжением, очередью входящих и отправкой."""
 
@@ -409,6 +643,9 @@ class LanService:
         self._data_rev: int = 0
         self._outbox_count: int = 0
         self._newer_db_peer: dict | None = None
+        self._history_rev: int = 0
+        self._history_unread: int = 0
+        self._history_db_key: str | None = None
         self.sync_app = self._build_app()
 
     # ---------- хранилище очереди входящих (привязано к текущему db.DB_FILE) ----------
@@ -473,6 +710,283 @@ class LanService:
             self._probe_reply_ts.clear()
             self._outbox_count = 0
             self._newer_db_peer = None
+            self._history_rev = 0
+            self._history_unread = 0
+            self._history_db_key = None
+
+    def _ensure_history_unread(self) -> int:
+        cur_key = str(db.DB_FILE)
+        with self._lock:
+            if self._history_db_key == cur_key:
+                return self._history_unread
+        cnt = 0
+        try:
+            con = db.connect()
+            try:
+                cnt = int(con.execute("SELECT COUNT(*) FROM sync_history WHERE COALESCE(seen, 0)=0").fetchone()[0] or 0)
+            finally:
+                con.close()
+        except Exception:
+            cnt = 0
+        with self._lock:
+            self._history_db_key = cur_key
+            self._history_unread = cnt
+            return self._history_unread
+
+    def _build_preview_items(self, con, keys, fallback_rows: dict | None = None,
+                             notes_map: dict | None = None, summary_hint: dict | None = None,
+                             limit: int = 30) -> list[dict]:
+        """Собирает компактные карточки предпросмотра для боковой панели истории сети
+        (по локальной БД listings с откатом на данные пакета, включая прямую ссылку на сайт)."""
+        clean = []
+        seen_k = set()
+        for k in keys or []:
+            if isinstance(k, (list, tuple)) and len(k) == 2:
+                pair = (str(k[0]), str(k[1]))
+                if pair[0] and pair[1] and pair not in seen_k:
+                    seen_k.add(pair)
+                    clean.append(pair)
+        if not clean:
+            return []
+
+        fb = fallback_rows or {}
+        nmap = notes_map or {}
+        grouped: dict[str, dict] = {}
+        order_ids: list[str] = []
+
+        for src, sid in clean:
+            row = con.execute(
+                "SELECT object_id, source, source_id, url, title, address, rooms, area, price "
+                "FROM listings WHERE source=? AND source_id=?",
+                (src, sid),
+            ).fetchone()
+            if row is not None:
+                oid = str(row["object_id"] or f"{src}:{sid}")
+                rdict = dict(row)
+            else:
+                oid = f"{src}:{sid}"
+                rdict = dict(fb.get((src, sid)) or {})
+                if not rdict and summary_hint:
+                    rdict = dict(summary_hint)
+                rdict.setdefault("source", src)
+                rdict.setdefault("source_id", sid)
+
+            note_txt = str(nmap.get((src, sid)) or "").strip()
+            if not note_txt:
+                nr = con.execute("SELECT text FROM notes WHERE source=? AND source_id=?", (src, sid)).fetchone()
+                if nr and nr[0]:
+                    note_txt = str(nr[0]).strip()
+                else:
+                    inr = con.execute(
+                        "SELECT text FROM imported_notes WHERE source=? AND source_id=? ORDER BY updated_at DESC LIMIT 1",
+                        (src, sid),
+                    ).fetchone()
+                    if inr and inr[0]:
+                        note_txt = str(inr[0]).strip()
+
+            if oid not in grouped:
+                order_ids.append(oid)
+                grouped[oid] = {
+                    "object_id": oid,
+                    "source": str(rdict.get("source") or src),
+                    "source_id": str(rdict.get("source_id") or sid),
+                    "url": str(rdict.get("url") or ""),
+                    "title": str(rdict.get("title") or ""),
+                    "address": str(rdict.get("address") or ""),
+                    "rooms": rdict.get("rooms"),
+                    "area": rdict.get("area"),
+                    "price": rdict.get("price"),
+                    "note": note_txt[:240],
+                }
+            else:
+                g = grouped[oid]
+                if not g["url"] and rdict.get("url"):
+                    g["url"] = str(rdict["url"])
+                if not g["address"] and rdict.get("address"):
+                    g["address"] = str(rdict["address"])
+                if not g["title"] and rdict.get("title"):
+                    g["title"] = str(rdict["title"])
+                if rdict.get("price") and (not g["price"] or rdict["price"] < g["price"]):
+                    g["price"] = rdict["price"]
+                if not g["note"] and note_txt:
+                    g["note"] = note_txt[:240]
+
+            if len(order_ids) >= limit:
+                break
+
+        return [grouped[oid] for oid in order_ids[:limit]]
+
+    def _record_history(self, con=None, *, kind: str, peer_id: str = "", peer_name: str = "",
+                        title: str = "", detail: str = "", keys=None, cats: dict | None = None,
+                        preview: list[dict] | None = None, req_id: str | None = None,
+                        batch_id: int | None = None, mark_seen: bool = False, direction: str = "in") -> int:
+        """Записывает (или обновляет по req_id) событие партнёра в таблицу sync_history."""
+        clean_keys = []
+        seen_k = set()
+        for k in keys or []:
+            if isinstance(k, (list, tuple)) and len(k) == 2:
+                pair = [str(k[0]), str(k[1])]
+                tk = (pair[0], pair[1])
+                if pair[0] and pair[1] and tk not in seen_k:
+                    seen_k.add(tk)
+                    clean_keys.append(pair)
+
+        clean_cats = {}
+        for ck, cv in (cats or {}).items():
+            c_list = []
+            c_seen = set()
+            for p in cv or []:
+                if isinstance(p, (list, tuple)) and len(p) == 2:
+                    tp = (str(p[0]), str(p[1]))
+                    if tp[0] and tp[1] and tp not in c_seen:
+                        c_seen.add(tp)
+                        c_list.append([tp[0], tp[1]])
+            if c_list:
+                clean_cats[str(ck)] = c_list
+
+        own = con is None
+        c = db.connect() if own else con
+        try:
+            now_s = _now_ts()
+            prev_list = preview if preview is not None else self._build_preview_items(c, clean_keys)
+            keys_s = json.dumps(clean_keys, ensure_ascii=False)
+            cats_s = json.dumps(clean_cats, ensure_ascii=False)
+            prev_s = json.dumps(prev_list, ensure_ascii=False)
+
+            row_id = None
+            if req_id:
+                ex = c.execute("SELECT id, keys_json, cats_json, preview_json, seen FROM sync_history WHERE req_id=?", (req_id,)).fetchone()
+                if ex is not None:
+                    row_id = int(ex["id"])
+                    eff_keys_s = keys_s if clean_keys else (ex["keys_json"] or "[]")
+                    eff_cats_s = cats_s if clean_cats else (ex["cats_json"] or "{}")
+                    eff_prev_s = prev_s if prev_list else (ex["preview_json"] or "[]")
+                    eff_seen = 1 if (mark_seen or ex["seen"]) else 0
+                    c.execute(
+                        """UPDATE sync_history
+                           SET ts=?, kind=?, peer_id=COALESCE(NULLIF(?,''), peer_id),
+                               peer_name=COALESCE(NULLIF(?,''), peer_name),
+                               batch_id=COALESCE(?, batch_id),
+                               title=?, detail=?, keys_json=?, cats_json=?, preview_json=?, seen=?
+                           WHERE id=?""",
+                        (now_s, kind, peer_id, peer_name[:80], batch_id, title[:200], detail[:1000],
+                         eff_keys_s, eff_cats_s, eff_prev_s, eff_seen, row_id),
+                    )
+            if row_id is None:
+                cur = c.execute(
+                    """INSERT INTO sync_history
+                       (ts, direction, kind, peer_id, peer_name, req_id, batch_id,
+                        title, detail, keys_json, cats_json, preview_json, seen)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        now_s,
+                        direction,
+                        kind,
+                        peer_id,
+                        (peer_name or "Партнёр")[:80],
+                        req_id,
+                        batch_id,
+                        title[:200],
+                        detail[:1000],
+                        keys_s,
+                        cats_s,
+                        prev_s,
+                        1 if mark_seen else 0,
+                    ),
+                )
+                row_id = int(cur.lastrowid or 0)
+                c.execute(
+                    "DELETE FROM sync_history WHERE id NOT IN (SELECT id FROM sync_history ORDER BY id DESC LIMIT 500)"
+                )
+
+            unread = int(c.execute("SELECT COUNT(*) FROM sync_history WHERE COALESCE(seen, 0)=0").fetchone()[0] or 0)
+            if own:
+                c.commit()
+        finally:
+            if own:
+                c.close()
+
+        with self._lock:
+            self._history_db_key = str(db.DB_FILE)
+            self._history_unread = unread
+            self._history_rev += 1
+        return row_id
+
+    def list_history(self, limit: int = 100) -> dict:
+        lim = max(1, min(int(limit or 100), 300))
+        with self._lock:
+            self._ensure_inbox_loaded()
+            active_reqs = set(self._inbox.keys())
+        con = db.connect()
+        try:
+            rows = [
+                dict(r)
+                for r in con.execute(
+                    "SELECT * FROM sync_history ORDER BY id DESC LIMIT ?",
+                    (lim,),
+                )
+            ]
+            unread = int(con.execute("SELECT COUNT(*) FROM sync_history WHERE COALESCE(seen, 0)=0").fetchone()[0] or 0)
+        finally:
+            con.close()
+
+        items = []
+        for r in rows:
+            req_id = r.get("req_id")
+            items.append({
+                "id": r["id"],
+                "ts": r["ts"],
+                "direction": r.get("direction") or "in",
+                "kind": r["kind"],
+                "peer_id": r.get("peer_id") or "",
+                "peer_name": r.get("peer_name") or "Партнёр",
+                "req_id": req_id,
+                "batch_id": r.get("batch_id"),
+                "pending_inbox": bool(req_id and req_id in active_reqs),
+                "title": r.get("title") or "",
+                "detail": r.get("detail") or "",
+                "keys": _parse_json(r.get("keys_json"), []),
+                "cats": _parse_json(r.get("cats_json"), {}),
+                "preview": _parse_json(r.get("preview_json"), []),
+                "seen": bool(r.get("seen")),
+            })
+        with self._lock:
+            self._history_db_key = str(db.DB_FILE)
+            self._history_unread = unread
+            hrev = self._history_rev
+        return {"items": items, "unread": unread, "rev": hrev}
+
+    def mark_history_seen(self, ids=None) -> dict:
+        con = db.connect()
+        try:
+            if isinstance(ids, list) and ids:
+                clean_ids = [int(x) for x in ids if str(x).isdigit() or isinstance(x, int)]
+                if clean_ids:
+                    ph = ",".join("?" * len(clean_ids))
+                    con.execute(f"UPDATE sync_history SET seen=1 WHERE id IN ({ph})", clean_ids)
+            else:
+                con.execute("UPDATE sync_history SET seen=1 WHERE COALESCE(seen, 0)=0")
+            con.commit()
+            unread = int(con.execute("SELECT COUNT(*) FROM sync_history WHERE COALESCE(seen, 0)=0").fetchone()[0] or 0)
+        finally:
+            con.close()
+        with self._lock:
+            self._history_db_key = str(db.DB_FILE)
+            self._history_unread = unread
+        return {"ok": True, "unread": unread}
+
+    def clear_history(self) -> dict:
+        con = db.connect()
+        try:
+            con.execute("DELETE FROM sync_history")
+            con.commit()
+        finally:
+            con.close()
+        with self._lock:
+            self._history_db_key = str(db.DB_FILE)
+            self._history_unread = 0
+            self._history_rev += 1
+        return {"ok": True, "unread": 0}
 
     def _outbox_dir(self) -> Path:
         return exchange.import_staging_dir() / "lan_outbox"
@@ -1112,6 +1626,7 @@ class LanService:
                         "freshness": data.get("freshness") or {},
                         "listings_count": data.get("listings_count"),
                         "likes_count": data.get("likes_count"),
+                        "marks_counts": data.get("marks_counts") if isinstance(data.get("marks_counts"), dict) else None,
                         "busy": bool(data.get("busy")),
                         "platform": data.get("platform") or "",
                         "error": None,
@@ -1521,6 +2036,7 @@ class LanService:
                 "busy": bool(rt.get("busy", False)),
                 "listings_count": rt.get("listings_count"),
                 "likes_count": rt.get("likes_count"),
+                "marks_counts": rt.get("marks_counts"),
                 "has_newer_db": bool(rt.get("has_newer_db", False)),
                 "newer_sources": list(rt.get("newer_sources") or []),
                 "live_cfg": _normalize_live_cfg(r.get("live_cfg_json")),
@@ -1545,6 +2061,7 @@ class LanService:
     def summary(self, lan_after: int = 0):
         """Компактная сводка для /api/status (поллинг каждые 1–2 с)."""
         cfg = self._lan_cfg()
+        hunread = self._ensure_history_unread()
         with self._lock:
             self._ensure_inbox_loaded()
             inbox_cnt = len(self._inbox)
@@ -1554,6 +2071,7 @@ class LanService:
             seq = self._live_seq
             drev = self._data_rev
             ocnt = self._outbox_count
+            hrev = self._history_rev
             newer_peer = dict(self._newer_db_peer) if self._newer_db_peer else None
         return {
             "enabled": cfg["enabled"],
@@ -1563,6 +2081,8 @@ class LanService:
             "known_peers": total_known,
             "inbox_count": inbox_cnt,
             "outbox_count": ocnt,
+            "history_unread": hunread,
+            "history_rev": hrev,
             "seq": seq,
             "data_rev": drev,
             "events": evs,
@@ -1575,6 +2095,7 @@ class LanService:
         try:
             ident = self._identity(con)
             local_f = exchange._db_freshness(con)
+            local_m = _marks_counts(con)
             ocnt = con.execute(
                 "SELECT COUNT(*) FROM sync_outbox WHERE payload_path IS NOT NULL AND payload_path != ''"
             ).fetchone()[0]
@@ -1608,6 +2129,8 @@ class LanService:
             "outbox_count": ocnt,
             "newer_db_peer": newer_peer,
             "local_freshness": local_f,
+            "local_marks": local_m,
+            "history_unread": self._ensure_history_unread(),
             "busy": runner.manager.any_running(),
         }
 
@@ -1619,6 +2142,7 @@ class LanService:
             local_f = exchange._db_freshness(con)
             local_listings = con.execute("SELECT COUNT(*) FROM listings WHERE COALESCE(imported_only,0)=0").fetchone()[0]
             local_likes = con.execute("SELECT COUNT(*) FROM likes").fetchone()[0]
+            local_m = _marks_counts(con)
         finally:
             con.close()
         busy = runner.manager.any_running()
@@ -1634,6 +2158,9 @@ class LanService:
                 row["local_counts"] = {"listings": local_listings, "likes": local_likes}
                 row["freshness_cmp"] = cmp_res
                 row["busy"] = busy
+            elif row.get("kind") == "marks":
+                row["local_marks"] = local_m
+                row["busy"] = busy
             out.append(row)
         return out
 
@@ -1645,6 +2172,20 @@ class LanService:
                 raise LanNotFoundError("входящий запрос не найден")
             self._save_inbox_manifest()
         self._cleanup_inbox_files(it)
+        try:
+            con = db.connect()
+            try:
+                con.execute("UPDATE sync_history SET seen=1, detail=CASE WHEN COALESCE(detail,'')='' THEN 'Отклонено' ELSE detail || ' · отклонено' END WHERE req_id=?", (req_id,))
+                con.commit()
+                unread = int(con.execute("SELECT COUNT(*) FROM sync_history WHERE COALESCE(seen, 0)=0").fetchone()[0] or 0)
+            finally:
+                con.close()
+            with self._lock:
+                self._history_db_key = str(db.DB_FILE)
+                self._history_unread = unread
+                self._history_rev += 1
+        except Exception:
+            pass
         runner.manager.log("lan", f"отклонён входящий запрос от {it.get('from_device_name') or 'устройства'}")
         return {"ok": True, "req_id": req_id}
 
@@ -1658,6 +2199,80 @@ class LanService:
         sdir = item.get("sess_dir")
         if sdir:
             shutil.rmtree(sdir, ignore_errors=True)
+
+    @staticmethod
+    def _extract_marks_history_meta(payload: dict, eff_items: list[str]):
+        cats_keys: dict[str, list[list[str]]] = {}
+        if "likes" in eff_items:
+            cats_keys["likes"] = [
+                [str(r["source"]), str(r["source_id"])]
+                for r in (payload.get("likes") or [])
+                if isinstance(r, dict) and r.get("source") and r.get("source_id")
+            ]
+        if "dislikes" in eff_items:
+            cats_keys["dislikes"] = [
+                [str(r["source"]), str(r["source_id"])]
+                for r in (payload.get("dislikes") or [])
+                if isinstance(r, dict) and r.get("source") and r.get("source_id")
+            ]
+        if "notes" in eff_items:
+            n_keys = []
+            for r in (payload.get("notes") or []) + (payload.get("imported_notes") or []):
+                if isinstance(r, dict) and r.get("source") and r.get("source_id") and str(r.get("text") or "").strip():
+                    n_keys.append([str(r["source"]), str(r["source_id"])])
+            cats_keys["notes"] = n_keys
+        if "merges" in eff_items:
+            cats_keys["merges"] = [
+                [str(r["source"]), str(r["source_id"])]
+                for r in (payload.get("manual_merges") or [])
+                if isinstance(r, dict) and r.get("source") and r.get("source_id")
+            ]
+        all_keys: list[list[str]] = []
+        seen = set()
+        for ck in MARK_CATEGORIES:
+            for pair in cats_keys.get(ck) or []:
+                tp = (pair[0], pair[1])
+                if tp not in seen:
+                    seen.add(tp)
+                    all_keys.append(pair)
+        fb_rows = {
+            (str(r["source"]), str(r["source_id"])): r
+            for r in (payload.get("ref_listings") or [])
+            if isinstance(r, dict) and r.get("source") and r.get("source_id")
+        }
+        notes_map = {
+            (str(r["source"]), str(r["source_id"])): str(r.get("text") or "").strip()
+            for r in (payload.get("notes") or [])
+            if isinstance(r, dict) and r.get("source") and r.get("source_id") and str(r.get("text") or "").strip()
+        }
+        return cats_keys, all_keys, fb_rows, notes_map
+
+    @staticmethod
+    def _extract_bundle_history_meta(zip_path: Path):
+        all_keys: list[list[str]] = []
+        fb_rows: dict[tuple[str, str], dict] = {}
+        notes_map: dict[tuple[str, str], str] = {}
+        seen = set()
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                _, cards = exchange._load_bundle_zip(zf)
+            for c in cards or []:
+                cnote = str(c.get("note") or "").strip()
+                for li in c.get("listings") or []:
+                    if not isinstance(li, dict):
+                        continue
+                    s, sid = str(li.get("source") or ""), str(li.get("source_id") or "")
+                    if not s or not sid:
+                        continue
+                    if (s, sid) not in seen:
+                        seen.add((s, sid))
+                        all_keys.append([s, sid])
+                    fb_rows[(s, sid)] = li
+                    if cnote:
+                        notes_map[(s, sid)] = cnote
+        except Exception:
+            pass
+        return all_keys, fb_rows, notes_map
 
     def accept_inbox(self, req_id: str, opts: dict | None = None):
         opts = opts or {}
@@ -1674,6 +2289,7 @@ class LanService:
             "device_name": it.get("from_device_name") or "Устройство LAN",
         }
         if kind == "cards":
+            b_keys, _, _ = self._extract_bundle_history_meta(Path(it["zip_path"]))
             likes_mode = str(opts.get("likes_mode") or "preserve")
             apply_merges = bool(opts.get("apply_manual_merges", True))
             res = exchange.import_cards_zip(
@@ -1684,15 +2300,76 @@ class LanService:
                 apply_manual_merges=apply_merges,
             )
             res["kind"] = "cards"
+            self._record_history(
+                kind="cards_applied",
+                peer_id=origin["device_id"],
+                peer_name=origin["device_name"],
+                req_id=req_id,
+                batch_id=res.get("batch_id"),
+                title="Принята подборка карточек",
+                detail=f"Новых: {res.get('new_cards', 0)}, совпало: {res.get('matched_cards', 0)}",
+                keys=b_keys,
+                mark_seen=True,
+            )
         elif kind == "favorites":
+            b_keys, _, _ = self._extract_bundle_history_meta(Path(it["zip_path"]))
             fav_mode = str(opts.get("favorites_mode") or "merge")
             if fav_mode not in ("merge", "replace"):
                 raise ValueError(f"неизвестный режим избранного: {fav_mode}")
             res = self._accept_favorites(it, origin, fav_mode)
+            self._record_history(
+                kind="favorites_applied",
+                peer_id=origin["device_id"],
+                peer_name=origin["device_name"],
+                req_id=req_id,
+                batch_id=res.get("batch_id"),
+                title="Принято Избранное (♥)",
+                detail=f"Режим: {'замена' if fav_mode == 'replace' else 'дополнение'} · карточек: {res.get('liked', 0)}",
+                keys=b_keys,
+                cats={"likes": b_keys} if b_keys else {},
+                mark_seen=True,
+            )
+        elif kind == "marks":
+            marks_mode = str(opts.get("mode") or "merge")
+            sel_items = opts.get("items") if opts.get("items") is not None else it.get("items")
+            payload = _unpack_marks_zip(Path(it["zip_path"]))
+            payload["from_device_id"] = origin["device_id"] or payload.get("from_device_id") or ""
+            payload["from_device_name"] = origin["device_name"] or payload.get("from_device_name") or "Устройство LAN"
+            res = self._apply_marks_payload(payload, items=sel_items, mode=marks_mode)
+            res["kind"] = "marks"
+            cats_k, all_k, fb_r, n_map = self._extract_marks_history_meta(payload, res["items"])
+            con = db.connect()
+            try:
+                prev_items = self._build_preview_items(con, all_k, fallback_rows=fb_r, notes_map=n_map)
+            finally:
+                con.close()
+            lbl_map = {"likes": "♥ лайки", "dislikes": "👎 дизлайки", "notes": "✎ заметки", "merges": "🔗 дубли"}
+            parts_str = ", ".join(f"{lbl_map[k]} ({res['incoming_counts'].get(k, 0)})" for k in res["items"] if k in lbl_map)
+            self._record_history(
+                kind="marks_applied",
+                peer_id=origin["device_id"],
+                peer_name=origin["device_name"],
+                req_id=req_id,
+                title="Приняты отметки и дубли",
+                detail=f"{'Перезаписано' if marks_mode == 'replace' else 'Добавлено к вашим'}: {parts_str}",
+                keys=all_k,
+                cats=cats_k,
+                preview=prev_items,
+                mark_seen=True,
+            )
         elif kind == "db":
             if runner.manager.any_running():
                 raise LanBusyError("Идёт сбор объявлений — дождитесь окончания, затем примите базу")
             res = self._accept_full_db(it, copy_filters_zone=bool(opts.get("copy_filters_zone", False)))
+            self._record_history(
+                kind="db_applied",
+                peer_id=origin["device_id"],
+                peer_name=origin["device_name"],
+                req_id=req_id,
+                title="Принята полная база по LAN",
+                detail=f"Объявлений: {res.get('listings', 0)}, объектов: {res.get('objects', 0)}, новых фото: {res.get('images_copied', 0)}",
+                mark_seen=True,
+            )
         else:
             raise ValueError(f"неподдерживаемый тип входящего запроса: {kind}")
 
@@ -2184,14 +2861,14 @@ class LanService:
         try:
             ident = self._identity(con)
             rows = [dict(r) for r in con.execute(
-                "SELECT source, source_id, title, address, rooms, area, price "
+                "SELECT source, source_id, url, title, address, rooms, area, price "
                 "FROM listings WHERE object_id=? OR (object_id IS NULL AND source||':'||source_id=?)",
                 (object_id, object_id),
             )]
             if not rows and ":" in str(object_id):
                 src0, sid0 = str(object_id).split(":", 1)
                 rows = [dict(r) for r in con.execute(
-                    "SELECT source, source_id, title, address, rooms, area, price "
+                    "SELECT source, source_id, url, title, address, rooms, area, price "
                     "FROM listings WHERE source=? AND source_id=?",
                     (src0, sid0),
                 )]
@@ -2220,6 +2897,7 @@ class LanService:
             "origin_name": ident["device_name"],
             "member_keys": member_keys,
             "summary": {
+                "url": first.get("url") or "",
                 "title": first.get("title") or "",
                 "address": first.get("address") or "",
                 "rooms": first.get("rooms"),
@@ -2321,6 +2999,517 @@ class LanService:
         item = next((it for it in self.list_inbox() if it.get("req_id") == req_id), None)
         return {"ok": True, "req_id": req_id, "item": item, "pull": data}
 
+    # ---------- Обмен отметками, заметками и ручными объединениями (тихий Pull / Push с выбором) ----------
+
+    def _apply_marks_payload(self, payload: dict, items=None, mode: str = "merge") -> dict:
+        """Применяет выбранные категории пользовательского слоя (лайки, дизлайки, заметки, ручные склейки)
+        в режиме 'merge' (добавить к своим) или 'replace' (перезаписать поверх своих с автобэкапом)."""
+        eff_mode = str(mode or "merge").strip().lower()
+        if eff_mode not in ("merge", "replace"):
+            raise ValueError(f"неизвестный режим применения отметок: {eff_mode}")
+
+        avail_items = _normalize_mark_items(payload.get("items") or [])
+        req_items = _normalize_mark_items(items if items is not None else avail_items)
+        eff_items = [x for x in req_items if x in avail_items]
+        if not eff_items:
+            raise ValueError("выберите хотя бы один параметр из доступных в пакете")
+
+        if "merges" in eff_items and runner.manager.any_running():
+            raise LanBusyError("Сначала дождитесь окончания сбора объявлений, чтобы применить ручные объединения карточек")
+
+        backup_path = None
+        if eff_mode == "replace":
+            backup_path = str(transfer.backup("перед_заменой_отметок", with_images=False))
+
+        con = db.connect()
+        try:
+            my_id = self._identity(con)["device_id"]
+            sender_id = str(payload.get("from_device_id") or "lan-peer")[:80]
+            sender_name = str(payload.get("from_device_name") or "Партнёр")[:80]
+            now_s = _now_ts()
+
+            # Собираем ключи объявлений, на которые ссылаются выбранные категории
+            needed_keys: set[tuple[str, str]] = set()
+            if "likes" in eff_items:
+                for r in payload.get("likes") or []:
+                    if isinstance(r, dict) and r.get("source") and r.get("source_id"):
+                        needed_keys.add((str(r["source"]), str(r["source_id"])))
+            if "dislikes" in eff_items:
+                for r in payload.get("dislikes") or []:
+                    if isinstance(r, dict) and r.get("source") and r.get("source_id"):
+                        needed_keys.add((str(r["source"]), str(r["source_id"])))
+            if "notes" in eff_items:
+                for r in payload.get("notes") or []:
+                    if isinstance(r, dict) and r.get("source") and r.get("source_id") and str(r.get("text") or "").strip():
+                        needed_keys.add((str(r["source"]), str(r["source_id"])))
+                for inr in payload.get("imported_notes") or []:
+                    if isinstance(inr, dict) and inr.get("source") and inr.get("source_id") and str(inr.get("text") or "").strip():
+                        needed_keys.add((str(inr["source"]), str(inr["source_id"])))
+            if "merges" in eff_items:
+                for r in payload.get("manual_merges") or []:
+                    if isinstance(r, dict) and r.get("source") and r.get("source_id") and r.get("group_id"):
+                        needed_keys.add((str(r["source"]), str(r["source_id"])))
+
+            # Докладываем отсутствующие в локальной базе объявления как imported_only=1 (без влияния на статистику рынка)
+            added_listings = 0
+            if needed_keys:
+                existing_keys = {(r[0], str(r[1])) for r in con.execute("SELECT source, source_id FROM listings")}
+                missing_keys = needed_keys - existing_keys
+                if missing_keys and payload.get("ref_listings"):
+                    lcols = [r[1] for r in con.execute("PRAGMA main.table_info(listings)") if r[1] != "object_id"]
+                    col_sql = ",".join(lcols)
+                    placeholders = ",".join("?" * len(lcols))
+                    for row in payload.get("ref_listings") or []:
+                        if not isinstance(row, dict):
+                            continue
+                        rk = (str(row.get("source") or ""), str(row.get("source_id") or ""))
+                        if rk not in missing_keys:
+                            continue
+                        rec = dict(row)
+                        rec["imported_only"] = 1
+                        vals = [rec.get(c) for c in lcols]
+                        cur = con.execute(f"INSERT OR IGNORE INTO listings({col_sql}) VALUES({placeholders})", vals)
+                        if cur.rowcount:
+                            added_listings += 1
+                    for hr in payload.get("ref_price_history") or []:
+                        if not isinstance(hr, dict):
+                            continue
+                        hk = (str(hr.get("source") or ""), str(hr.get("source_id") or ""))
+                        if hk in missing_keys and hr.get("ts") and hr.get("price") is not None:
+                            con.execute(
+                                "INSERT OR IGNORE INTO price_history(source, source_id, ts, price) VALUES(?,?,?,?)",
+                                (hk[0], hk[1], str(hr["ts"]), hr["price"]),
+                            )
+
+            # 1. Ручные объединения карточек (выполняем первыми, чтобы пересчитать object_id до раздачи отметок)
+            if "merges" in eff_items:
+                inc_mm = [
+                    {
+                        "source": str(r["source"]),
+                        "source_id": str(r["source_id"]),
+                        "group_id": str(r["group_id"]),
+                        "is_primary": 1 if r.get("is_primary") else 0,
+                        "ts": str(r.get("ts") or now_s),
+                    }
+                    for r in (payload.get("manual_merges") or [])
+                    if isinstance(r, dict) and r.get("source") and r.get("source_id") and r.get("group_id")
+                ]
+                if eff_mode == "replace":
+                    con.execute("DELETE FROM manual_merges")
+                    if inc_mm:
+                        con.executemany(
+                            "INSERT OR REPLACE INTO manual_merges(source, source_id, group_id, is_primary, ts) VALUES(?,?,?,?,?)",
+                            [(r["source"], r["source_id"], r["group_id"], r["is_primary"], r["ts"]) for r in inc_mm],
+                        )
+                else:
+                    main_mm = [dict(r) for r in con.execute("SELECT source, source_id, group_id, is_primary, ts FROM manual_merges")]
+                    merged_tuples = _union_manual_merges_rows(main_mm, inc_mm)
+                    con.execute("DELETE FROM manual_merges")
+                    if merged_tuples:
+                        con.executemany(
+                            "INSERT OR REPLACE INTO manual_merges(source, source_id, group_id, is_primary, ts) VALUES(?,?,?,?,?)",
+                            merged_tuples,
+                        )
+                dedupe.clean_manual_merges(con)
+                con.commit()
+                dedupe.rebuild(con)
+                history.mark_snapshots_dirty(con)
+            elif added_listings > 0:
+                con.commit()
+                if not runner.manager.any_running():
+                    dedupe.rebuild(con)
+
+            def _expand_with_fallback(src_s: str, sid_s: str) -> list[tuple[str, str]]:
+                exp = self._expand_object_keys(con, [(src_s, sid_s)])
+                return exp if exp else [(src_s, sid_s)]
+
+            orig_likes = {(r[0], str(r[1])) for r in con.execute("SELECT source, source_id FROM likes")}
+            orig_dislikes = {(r[0], str(r[1])) for r in con.execute("SELECT source, source_id FROM dislikes")}
+
+            # 2. Избранное (♥ лайки) и Скрытые (👎 дизлайки)
+            inc_likes_map: dict[tuple[str, str], str] = {}
+            if "likes" in eff_items:
+                for r in payload.get("likes") or []:
+                    if not isinstance(r, dict):
+                        continue
+                    s, sid = str(r.get("source") or ""), str(r.get("source_id") or "")
+                    ts = str(r.get("ts") or now_s) or now_s
+                    if not s or not sid:
+                        continue
+                    for ek in _expand_with_fallback(s, sid):
+                        if ek not in inc_likes_map or ts > inc_likes_map[ek]:
+                            inc_likes_map[ek] = ts
+                if eff_mode == "replace":
+                    con.execute("DELETE FROM likes")
+                    for (s, sid), ts in inc_likes_map.items():
+                        con.execute("INSERT OR REPLACE INTO likes(source, source_id, ts) VALUES(?,?,?)", (s, sid, ts))
+                        con.execute("DELETE FROM dislikes WHERE source=? AND source_id=?", (s, sid))
+                else:
+                    for (s, sid), ts in inc_likes_map.items():
+                        if (s, sid) in orig_likes or (s, sid) in orig_dislikes:
+                            continue
+                        con.execute("INSERT OR IGNORE INTO likes(source, source_id, ts) VALUES(?,?,?)", (s, sid, ts))
+
+            if "dislikes" in eff_items:
+                inc_dislikes_map: dict[tuple[str, str], str] = {}
+                for r in payload.get("dislikes") or []:
+                    if not isinstance(r, dict):
+                        continue
+                    s, sid = str(r.get("source") or ""), str(r.get("source_id") or "")
+                    ts = str(r.get("ts") or now_s) or now_s
+                    if not s or not sid:
+                        continue
+                    for ek in _expand_with_fallback(s, sid):
+                        if ek not in inc_dislikes_map or ts > inc_dislikes_map[ek]:
+                            inc_dislikes_map[ek] = ts
+                cur_likes = {(r[0], str(r[1])) for r in con.execute("SELECT source, source_id FROM likes")}
+                if eff_mode == "replace":
+                    con.execute("DELETE FROM dislikes")
+                    for (s, sid), ts in inc_dislikes_map.items():
+                        if "likes" in eff_items and (s, sid) in inc_likes_map:
+                            continue
+                        con.execute("INSERT OR REPLACE INTO dislikes(source, source_id, ts) VALUES(?,?,?)", (s, sid, ts))
+                        con.execute("DELETE FROM likes WHERE source=? AND source_id=?", (s, sid))
+                else:
+                    for (s, sid), ts in inc_dislikes_map.items():
+                        if (s, sid) in cur_likes or (s, sid) in orig_dislikes:
+                            continue
+                        con.execute("INSERT OR IGNORE INTO dislikes(source, source_id, ts) VALUES(?,?,?)", (s, sid, ts))
+
+            # 3. Заметки (личные и атрибутированные)
+            if "notes" in eff_items:
+                grouped_notes: dict[tuple[tuple[str, str], ...], tuple[str, str]] = {}
+                for r in payload.get("notes") or []:
+                    if not isinstance(r, dict):
+                        continue
+                    s, sid = str(r.get("source") or ""), str(r.get("source_id") or "")
+                    txt = str(r.get("text") or "").strip()[:2000]
+                    ts = str(r.get("ts") or now_s) or now_s
+                    if not s or not sid or not txt:
+                        continue
+                    sibs = tuple(sorted(_expand_with_fallback(s, sid)))
+                    prev = grouped_notes.get(sibs)
+                    if prev is None or ts >= prev[1]:
+                        grouped_notes[sibs] = (txt, ts)
+
+                if eff_mode == "replace":
+                    con.execute("DELETE FROM notes")
+                    con.execute("DELETE FROM imported_notes")
+                    for sibs, (txt, ts) in grouped_notes.items():
+                        for s, sid in sibs:
+                            con.execute(
+                                "INSERT OR REPLACE INTO notes(source, source_id, text, ts) VALUES(?,?,?,?)",
+                                (s, sid, txt, ts),
+                            )
+                    for inr in payload.get("imported_notes") or []:
+                        if not isinstance(inr, dict):
+                            continue
+                        s, sid = str(inr.get("source") or ""), str(inr.get("source_id") or "")
+                        oid_orig = str(inr.get("origin_id") or "")
+                        oname_orig = str(inr.get("origin_name") or "Импорт")[:80]
+                        txt = str(inr.get("text") or "").strip()[:2000]
+                        ts = str(inr.get("ts") or now_s)
+                        uat = str(inr.get("updated_at") or ts or now_s)
+                        if not s or not sid or not oid_orig or not txt or oid_orig == my_id:
+                            continue
+                        for es, esid in _expand_with_fallback(s, sid):
+                            con.execute(
+                                "INSERT OR REPLACE INTO imported_notes"
+                                "(source, source_id, origin_id, origin_name, text, ts, updated_at, batch_id) "
+                                "VALUES(?,?,?,?,?,?,?,NULL)",
+                                (es, esid, oid_orig, oname_orig, txt, ts, uat),
+                            )
+                else:
+                    orig_notes = {
+                        (str(r["source"]), str(r["source_id"])): str(r["text"] or "").strip()
+                        for r in con.execute("SELECT source, source_id, text FROM notes WHERE TRIM(COALESCE(text, '')) != ''")
+                    }
+                    for sibs, (txt, ts) in grouped_notes.items():
+                        existing_txts = [orig_notes[k] for k in sibs if k in orig_notes and orig_notes[k]]
+                        existing_txt = existing_txts[0] if existing_txts else ""
+                        if not existing_txt:
+                            for s, sid in sibs:
+                                con.execute(
+                                    "INSERT OR REPLACE INTO notes(source, source_id, text, ts) VALUES(?,?,?,?)",
+                                    (s, sid, txt, ts),
+                                )
+                        elif existing_txt != txt:
+                            for s, sid in sibs:
+                                con.execute(
+                                    "INSERT OR REPLACE INTO imported_notes"
+                                    "(source, source_id, origin_id, origin_name, text, ts, updated_at, batch_id) "
+                                    "VALUES(?,?,?,?,?,?,?,NULL)",
+                                    (s, sid, sender_id, sender_name, txt, ts, now_s),
+                                )
+                    for inr in payload.get("imported_notes") or []:
+                        if not isinstance(inr, dict):
+                            continue
+                        s, sid = str(inr.get("source") or ""), str(inr.get("source_id") or "")
+                        oid_orig = str(inr.get("origin_id") or "")
+                        oname_orig = str(inr.get("origin_name") or "Импорт")[:80]
+                        txt = str(inr.get("text") or "").strip()[:2000]
+                        ts = str(inr.get("ts") or now_s)
+                        uat = str(inr.get("updated_at") or ts or now_s)
+                        if not s or not sid or not oid_orig or not txt or oid_orig == my_id:
+                            continue
+                        for es, esid in _expand_with_fallback(s, sid):
+                            con.execute(
+                                """INSERT INTO imported_notes
+                                   (source, source_id, origin_id, origin_name, text, ts, updated_at, batch_id)
+                                   VALUES(?,?,?,?,?,?,?,NULL)
+                                   ON CONFLICT(source, source_id, origin_id) DO UPDATE SET
+                                     origin_name=excluded.origin_name, text=excluded.text,
+                                     ts=excluded.ts, updated_at=excluded.updated_at
+                                   WHERE COALESCE(excluded.updated_at, excluded.ts, '') >=
+                                         COALESCE(imported_notes.updated_at, imported_notes.ts, '')""",
+                                (es, esid, oid_orig, oname_orig, txt, ts, uat),
+                            )
+
+            con.commit()
+            counts_after = _marks_counts(con)
+        finally:
+            con.close()
+
+        self._bump_data_rev()
+        return {
+            "ok": True,
+            "mode": eff_mode,
+            "items": eff_items,
+            "backup": backup_path,
+            "added_listings": added_listings,
+            "incoming_counts": {k: int((payload.get("counts") or {}).get(k, 0)) for k in eff_items},
+            "counts": counts_after,
+            "from_device_name": sender_name,
+        }
+
+    def get_marks_info(self, peer_id: str | None = None) -> dict:
+        """Возвращает локальные счётчики отметок и (если указан peer_id) тихо запрашивает счётчики партнёра."""
+        con = db.connect()
+        try:
+            ident = self._identity(con)
+            local_m = _marks_counts(con)
+            peer = self._get_peer(con, peer_id) if peer_id else None
+        finally:
+            con.close()
+
+        remote_m = None
+        remote_err = None
+        if peer is not None:
+            hdrs = self._auth_headers(ident, peer)
+            try:
+                st, data = _http_call(peer["ip"], peer["port"], "GET", "/sync/marks/summary", headers=hdrs, timeout=4.0)
+                if st == 200 and isinstance(data, dict) and isinstance(data.get("counts"), dict):
+                    remote_m = {cat: int(data["counts"].get(cat, 0)) for cat in MARK_CATEGORIES}
+                    with self._lock:
+                        if peer["device_id"] in self._peer_runtime:
+                            self._peer_runtime[peer["device_id"]]["marks_counts"] = remote_m
+                else:
+                    remote_err = (data or {}).get("detail") or f"HTTP {st}"
+            except Exception as e:
+                remote_err = str(e)
+            if remote_m is None:
+                with self._lock:
+                    cached = (self._peer_runtime.get(peer["device_id"]) or {}).get("marks_counts")
+                    if isinstance(cached, dict):
+                        remote_m = dict(cached)
+
+        return {
+            "ok": True,
+            "local": local_m,
+            "remote": remote_m,
+            "remote_error": remote_err,
+            "busy": runner.manager.any_running(),
+            "peer": {"device_id": peer["device_id"], "name": peer["name"]} if peer else None,
+        }
+
+    def pull_marks(self, peer_id: str, items, mode: str = "merge") -> dict:
+        """Тихо забирает выбранные категории (лайки, дизлайки, заметки, ручные объединения) у сопряжённого
+        партнёра без уведомлений на его стороне и применяет локально в режиме merge или replace."""
+        sel_items = _normalize_mark_items(items)
+        eff_mode = str(mode or "merge").strip().lower()
+        if eff_mode not in ("merge", "replace"):
+            raise ValueError("режим должен быть 'merge' (добавить) или 'replace' (перезаписать)")
+        if "merges" in sel_items and runner.manager.any_running():
+            raise LanBusyError("Сначала дождитесь окончания сбора данных, чтобы запросить ручные объединения")
+
+        con = db.connect()
+        try:
+            ident = self._identity(con)
+            peer = self._get_peer(con, peer_id)
+        finally:
+            con.close()
+
+        q = urllib.parse.urlencode({"items": ",".join(sel_items)})
+        hdrs = self._auth_headers(ident, peer)
+        try:
+            st, _, raw = _http_raw(peer["ip"], peer["port"], "GET", f"/sync/marks?{q}", headers=hdrs, timeout=45.0)
+        except (ConnectionError, OSError) as e:
+            raise ValueError(str(e))
+        if st != 200:
+            try:
+                detail = json.loads(raw.decode("utf-8", errors="replace")).get("detail")
+            except Exception:
+                detail = None
+            raise ValueError(detail or f"не удалось получить данные с «{peer['name']}» (HTTP {st})")
+
+        payload = _unpack_marks_zip(raw)
+        payload["from_device_id"] = peer["device_id"]
+        payload["from_device_name"] = peer.get("name") or payload.get("from_device_name") or peer["device_id"]
+        res = self._apply_marks_payload(payload, items=sel_items, mode=eff_mode)
+        cats_k, all_k, fb_r, n_map = self._extract_marks_history_meta(payload, res["items"])
+        con = db.connect()
+        try:
+            prev_items = self._build_preview_items(con, all_k, fallback_rows=fb_r, notes_map=n_map)
+        finally:
+            con.close()
+        lbl_map = {"likes": "♥ лайки", "dislikes": "👎 дизлайки", "notes": "✎ заметки", "merges": "🔗 дубли"}
+        parts_str = ", ".join(f"{lbl_map[k]} ({res['incoming_counts'].get(k, 0)})" for k in res["items"] if k in lbl_map)
+        self._record_history(
+            kind="marks_pulled",
+            peer_id=peer["device_id"],
+            peer_name=payload["from_device_name"],
+            title="Загружены отметки и дубли",
+            detail=f"{'Перезаписано' if eff_mode == 'replace' else 'Добавлено к вашим'}: {parts_str}",
+            keys=all_k,
+            cats=cats_k,
+            preview=prev_items,
+            mark_seen=True,
+        )
+        runner.manager.log(
+            "lan",
+            f"загружены отметки от «{peer['name']}» ({', '.join(sel_items)}; режим: {'перезапись' if eff_mode == 'replace' else 'добавление'})",
+        )
+        return res
+
+    def send_marks(self, peer_ids: list[str], items) -> dict:
+        """Отправляет выбранные категории (лайки, дизлайки, заметки, ручные объединения) сопряжённому партнёру:
+        у получателя всплывает уведомление с перечнем предложенного и выбором добавить / перезаписать."""
+        if not peer_ids:
+            raise ValueError("выберите хотя бы одно устройство")
+        sel_items = _normalize_mark_items(items)
+
+        con = db.connect()
+        try:
+            ident = self._identity(con)
+            peers = [self._get_peer(con, pid) for pid in peer_ids]
+            payload = _export_marks_payload(con, ident, sel_items)
+        finally:
+            con.close()
+
+        raw_zip = _pack_marks_zip(payload)
+        results = []
+        con = db.connect()
+        try:
+            for p in peers:
+                hdrs = self._auth_headers(ident, p)
+                hdrs["Content-Type"] = "application/zip"
+                try:
+                    st, data = _http_call(p["ip"], p["port"], "POST", "/sync/push/marks", body=raw_zip, headers=hdrs, timeout=45.0)
+                    ok = st == 200 and bool(data.get("ok"))
+                    err = None if ok else (data.get("detail") or f"HTTP {st}")
+                    if ok:
+                        _outbox_log(con, p["device_id"], "marks", str(data.get("req_id") or ""))
+                except Exception as e:
+                    ok, data, err = False, {}, str(e)
+                results.append({
+                    "device_id": p["device_id"],
+                    "name": p["name"],
+                    "ok": ok,
+                    "error": err,
+                    "req_id": data.get("req_id"),
+                })
+        finally:
+            con.close()
+
+        ok_cnt = sum(1 for r in results if r["ok"])
+        if not ok_cnt and results:
+            raise ValueError(results[0]["error"] or "не удалось доставить данные на устройство")
+        runner.manager.log("lan", f"отправлены отметки ({', '.join(sel_items)}) на {ok_cnt} устройств(а)")
+        return {
+            "ok": ok_cnt > 0,
+            "items": sel_items,
+            "counts": payload["counts"],
+            "results": results,
+        }
+
+    def _enqueue_marks_bytes(self, peer: dict, raw: bytes) -> dict:
+        if not raw:
+            raise HTTPException(400, "Пустой пакет отметок")
+        if len(raw) > MAX_MARKS_BYTES:
+            raise HTTPException(413, "Пакет отметок превышает допустимый размер")
+        try:
+            payload = _unpack_marks_zip(raw)
+        except ValueError as e:
+            raise HTTPException(400, f"Некорректный пакет отметок: {e}")
+
+        req_id = uuid.uuid4().hex[:12]
+        origin_name = peer.get("name") or payload.get("from_device_name") or peer["device_id"]
+        avail_items = _normalize_mark_items(payload.get("items") or [])
+        raw_counts = payload.get("counts") or {}
+        counts = {cat: int(raw_counts.get(cat, 0)) if cat in avail_items else 0 for cat in MARK_CATEGORIES}
+
+        with self._lock:
+            self._ensure_inbox_loaded()
+            idir = self._inbox_dir()
+            idir.mkdir(parents=True, exist_ok=True)
+            zpath = idir / f"marks_{req_id}.zip"
+        part_path = zpath.with_name(zpath.name + ".part")
+        part_path.write_bytes(raw)
+        try:
+            part_path.replace(zpath)
+        except Exception:
+            part_path.unlink(missing_ok=True)
+            raise HTTPException(500, "Не удалось сохранить входящий пакет отметок")
+
+        received_at = _now_ts()
+        item = {
+            "req_id": req_id,
+            "kind": "marks",
+            "status": "pending",
+            "received_at": received_at,
+            "from_device_id": peer["device_id"],
+            "from_device_name": origin_name,
+            "from_ip": peer.get("ip") or "",
+            "from_port": peer.get("port") or 8766,
+            "zip_path": str(zpath),
+            "items": avail_items,
+            "counts": counts,
+        }
+        with self._lock:
+            self._ensure_inbox_loaded()
+            self._inbox[req_id] = item
+            self._save_inbox_manifest()
+        self._push_live_event("marks_offer", {
+            "event_id": f"marks_offer_{req_id}",
+            "req_id": req_id,
+            "from_device_id": peer["device_id"],
+            "from_device_name": origin_name,
+            "items": avail_items,
+            "counts": counts,
+            "received_at": received_at,
+        })
+        cats_k, all_k, fb_r, n_map = self._extract_marks_history_meta(payload, avail_items)
+        con = db.connect()
+        try:
+            prev_items = self._build_preview_items(con, all_k, fallback_rows=fb_r, notes_map=n_map)
+        finally:
+            con.close()
+        lbl_map = {"likes": "♥ лайки", "dislikes": "👎 дизлайки", "notes": "✎ заметки", "merges": "🔗 дубли"}
+        parts_str = ", ".join(f"{lbl_map[k]} ({counts.get(k, 0)})" for k in avail_items if k in lbl_map)
+        self._record_history(
+            kind="marks_offer",
+            peer_id=peer["device_id"],
+            peer_name=origin_name,
+            req_id=req_id,
+            title="Предложены отметки и дубли",
+            detail=parts_str,
+            keys=all_k,
+            cats=cats_k,
+            preview=prev_items,
+        )
+        runner.manager.log("lan", f"входящее предложение отметок от «{origin_name}» ({', '.join(avail_items)})")
+        return {"ok": True, "req_id": req_id, "kind": "marks", "queued": True}
+
     def apply_live_favorite(self, keys: list, on: bool, from_device_id: str = "", import_missing: bool = True):
         """Применяет входящее Live-Избранное (при auto_add/auto_sync или по кнопке «Принять»)."""
         clean = [(str(k[0]), str(k[1])) for k in (keys or []) if isinstance(k, (list, tuple)) and len(k) == 2]
@@ -2386,7 +3575,7 @@ class LanService:
         con = db.connect()
         try:
             src0, sid0 = keys[0]
-            r = con.execute("SELECT title, address, rooms, area, price FROM listings WHERE source=? AND source_id=?", (src0, str(sid0))).fetchone()
+            r = con.execute("SELECT url, title, address, rooms, area, price FROM listings WHERE source=? AND source_id=?", (src0, str(sid0))).fetchone()
             if r:
                 summary_obj = dict(r)
         finally:
@@ -2536,6 +3725,23 @@ class LanService:
             self._ensure_inbox_loaded()
             self._inbox[req_id] = item
             self._save_inbox_manifest()
+        b_keys, fb_r, n_map = self._extract_bundle_history_meta(zpath)
+        con = db.connect()
+        try:
+            prev_items = self._build_preview_items(con, b_keys, fallback_rows=fb_r, notes_map=n_map)
+        finally:
+            con.close()
+        self._record_history(
+            kind="favorites_offer" if kind == "favorites" else "cards_offer",
+            peer_id=peer["device_id"],
+            peer_name=origin["device_name"],
+            req_id=req_id,
+            title="Входящее Избранное (♥)" if kind == "favorites" else "Входящий пакет карточек",
+            detail=f"Карточек: {item['summary']['total']} (новых: {item['summary']['new']}, в базе: {item['summary']['matched']})",
+            keys=b_keys,
+            cats={"likes": b_keys} if kind == "favorites" and b_keys else {},
+            preview=prev_items,
+        )
         runner.manager.log(
             "lan",
             f"входящий запрос от «{origin['device_name']}»: "
@@ -2567,6 +3773,7 @@ class LanService:
                 freshness = exchange._db_freshness(con)
                 listings_cnt = con.execute("SELECT COUNT(*) FROM listings WHERE COALESCE(imported_only,0)=0").fetchone()[0]
                 likes_cnt = con.execute("SELECT COUNT(*) FROM likes").fetchone()[0]
+                m_counts = _marks_counts(con)
             finally:
                 con.close()
             cfg = svc._lan_cfg()
@@ -2580,6 +3787,7 @@ class LanService:
                 "latest_db_ts": _max_freshness_ts(freshness),
                 "listings_count": listings_cnt,
                 "likes_count": likes_cnt,
+                "marks_counts": m_counts,
                 "busy": runner.manager.any_running(),
             }
 
@@ -2769,6 +3977,14 @@ class LanService:
                     svc._ensure_inbox_loaded()
                     svc._inbox[req_id] = item
                     svc._save_inbox_manifest()
+                svc._record_history(
+                    kind="db_offer",
+                    peer_id=peer["device_id"],
+                    peer_name=item["from_device_name"],
+                    req_id=req_id,
+                    title="Входящая база данных",
+                    detail=f"Объявлений: {(meta.get('counts') or {}).get('listings', 0)} · все фото уже есть",
+                )
                 runner.manager.log("lan", f"входящая база от «{item['from_device_name']}» (все фото уже есть)")
                 return {"ok": True, "req_id": req_id, "missing_images": [], "queued": True}
 
@@ -2841,6 +4057,14 @@ class LanService:
                 svc._ensure_inbox_loaded()
                 svc._inbox[req_id] = sess_clean
                 svc._save_inbox_manifest()
+            svc._record_history(
+                kind="db_offer",
+                peer_id=peer["device_id"],
+                peer_name=sess_clean["from_device_name"],
+                req_id=req_id,
+                title="Входящая база данных",
+                detail=f"Объявлений: {(sess_clean.get('sender_counts') or {}).get('listings', 0)} · получено фото: {recv_cnt}",
+            )
             runner.manager.log(
                 "lan",
                 f"входящая база от «{sess_clean['from_device_name']}» готова (получено фото: {recv_cnt})",
@@ -2864,13 +4088,33 @@ class LanService:
                 return {"ok": True, "duplicate": True}
             origin_name = str(body.get("origin_name") or peer.get("name") or "Партнёр")
             keys = body.get("member_keys") or []
+            sum_obj = body.get("summary") or {}
             ev = svc._push_live_event("spotlight", {
                 "event_id": eid or uuid.uuid4().hex,
                 "from_device_id": peer["device_id"],
                 "from_device_name": origin_name,
                 "member_keys": keys,
-                "summary": body.get("summary") or {},
+                "summary": sum_obj,
             })
+            con = db.connect()
+            try:
+                prev_items = svc._build_preview_items(con, keys, summary_hint=sum_obj)
+            finally:
+                con.close()
+            det_parts = [
+                f"{sum_obj['rooms']}-к" if sum_obj.get("rooms") else ("студия" if sum_obj.get("rooms") == 0 else ""),
+                f"{sum_obj['area']} м²" if sum_obj.get("area") else "",
+                sum_obj.get("address") or sum_obj.get("title") or "",
+            ]
+            svc._record_history(
+                kind="spotlight",
+                peer_id=peer["device_id"],
+                peer_name=origin_name,
+                title="Показал карточку (👁 пинг)",
+                detail=", ".join(p for p in det_parts if p),
+                keys=keys,
+                preview=prev_items,
+            )
             runner.manager.log("lan", f"подсветка от «{origin_name}»")
             return {"ok": True, "queued": True, "seq": ev["seq"]}
 
@@ -2940,6 +4184,7 @@ class LanService:
             keys = body.get("keys") or []
             origin_name = str(body.get("origin_name") or peer.get("name") or "Партнёр")
 
+            sum_obj = body.get("summary") or {}
             if mode == "ask":
                 ev = svc._push_live_event("live_fav", {
                     "event_id": eid or uuid.uuid4().hex,
@@ -2947,12 +4192,42 @@ class LanService:
                     "from_device_name": origin_name,
                     "keys": keys,
                     "on": on,
-                    "summary": body.get("summary") or {},
+                    "summary": sum_obj,
                 })
+                con = db.connect()
+                try:
+                    prev_items = svc._build_preview_items(con, keys, summary_hint=sum_obj)
+                finally:
+                    con.close()
+                svc._record_history(
+                    kind="live_fav",
+                    peer_id=peer["device_id"],
+                    peer_name=origin_name,
+                    title="Live-Избранное: ♥ отмечено" if on else "Live-Избранное: ♥ снято",
+                    detail=str(sum_obj.get("address") or sum_obj.get("title") or ""),
+                    keys=keys,
+                    cats={"likes": keys} if on and keys else {},
+                    preview=prev_items,
+                )
                 return {"ok": True, "mode": "ask", "seq": ev["seq"]}
             if mode == "auto_add" and not on:
                 return {"ok": False, "ignored": True, "reason": "auto_add"}
             res = svc.apply_live_favorite(keys, on, from_device_id=peer["device_id"], import_missing=on)
+            con = db.connect()
+            try:
+                prev_items = svc._build_preview_items(con, keys, summary_hint=sum_obj)
+            finally:
+                con.close()
+            svc._record_history(
+                kind="live_fav",
+                peer_id=peer["device_id"],
+                peer_name=origin_name,
+                title="Live-Избранное: ♥ добавлено" if on else "Live-Избранное: ♥ снято",
+                detail=str(sum_obj.get("address") or sum_obj.get("title") or ""),
+                keys=keys,
+                cats={"likes": keys} if on and keys else {},
+                preview=prev_items,
+            )
             return {"ok": True, "mode": mode, **res}
 
         @app.post("/sync/live/note")
@@ -3004,6 +4279,7 @@ class LanService:
                         )
                     updated += 1
                 con.commit()
+                prev_items = svc._build_preview_items(con, targets or raw_keys) if updated else []
             finally:
                 con.close()
             if updated:
@@ -3015,6 +4291,16 @@ class LanService:
                     "keys": raw_keys,
                     "text": text,
                 })
+                svc._record_history(
+                    kind="live_note",
+                    peer_id=peer["device_id"],
+                    peer_name=origin_name,
+                    title="Заметка от партнёра (✎)" if text else "Заметка удалена партнёром",
+                    detail=text[:300] if text else "Текст заметки очищен",
+                    keys=targets or raw_keys,
+                    cats={"notes": targets or raw_keys},
+                    preview=prev_items,
+                )
             return {"ok": True, "updated": updated}
 
         @app.post("/sync/live/merge")
@@ -3036,6 +4322,7 @@ class LanService:
                 raise HTTPException(409, "Идёт сбор объявлений")
 
             action = str(body.get("action") or "")
+            origin_name = str(body.get("origin_name") or peer.get("name") or "Партнёр")
             con = db.connect()
             try:
                 if str(body.get("origin_device_id") or "") == svc._identity(con)["device_id"]:
@@ -3084,11 +4371,69 @@ class LanService:
                     dedupe.unmerge_all(con)
                     history.mark_snapshots_dirty(con)
                     applied = True
+                m_keys = (body.get("primary_keys") or []) + (body.get("secondary_keys") or []) + (body.get("keys") or [])
+                prev_items = svc._build_preview_items(con, m_keys) if applied and m_keys else []
             finally:
                 con.close()
             if applied:
                 svc._bump_data_rev()
+                act_title = {
+                    "merge": "Объединены карточки в дубль (🔗)",
+                    "unmerge": "Разделена объединённая карточка",
+                    "exclude": "Исключено объявление из склейки",
+                    "unmerge_all": "Сброшены ручные объединения",
+                }.get(action, "Изменение ручных объединений")
+                svc._record_history(
+                    kind="live_merge",
+                    peer_id=peer["device_id"],
+                    peer_name=origin_name,
+                    title=act_title,
+                    keys=m_keys,
+                    cats={"merges": m_keys} if m_keys else {},
+                    preview=prev_items,
+                )
             return {"ok": True, "applied": applied}
+
+        @app.get("/sync/marks/summary")
+        def sync_marks_summary(request: Request):
+            try:
+                svc._authenticate_request(request)
+            except LanAuthError as e:
+                raise HTTPException(401, str(e))
+            con = db.connect()
+            try:
+                counts = _marks_counts(con)
+            finally:
+                con.close()
+            return {"ok": True, "counts": counts}
+
+        @app.get("/sync/marks")
+        def sync_marks_pull(request: Request, items: str = "likes,dislikes,notes,merges"):
+            try:
+                svc._authenticate_request(request)
+            except LanAuthError as e:
+                raise HTTPException(401, str(e))
+            try:
+                sel_items = _normalize_mark_items(items)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            con = db.connect()
+            try:
+                ident = svc._identity(con)
+                payload = _export_marks_payload(con, ident, sel_items)
+            finally:
+                con.close()
+            raw_zip = _pack_marks_zip(payload)
+            return Response(content=raw_zip, media_type="application/zip")
+
+        @app.post("/sync/push/marks")
+        async def push_marks(request: Request):
+            try:
+                peer = svc._authenticate_request(request)
+            except LanAuthError as e:
+                raise HTTPException(401, str(e))
+            raw = await _read_checked_body(request, MAX_MARKS_BYTES, empty_msg="Пустой пакет отметок")
+            return svc._enqueue_marks_bytes(peer, raw)
 
         return app
 
@@ -3161,6 +4506,18 @@ def pull_db(peer_id: str):
     return service.pull_db(peer_id)
 
 
+def get_marks_info(peer_id: str | None = None):
+    return service.get_marks_info(peer_id=peer_id)
+
+
+def pull_marks(peer_id: str, items, mode: str = "merge"):
+    return service.pull_marks(peer_id, items=items, mode=mode)
+
+
+def send_marks(peer_ids: list[str], items):
+    return service.send_marks(peer_ids, items=items)
+
+
 def apply_live_favorite(keys: list, on: bool, from_device_id: str = "", import_missing: bool = True):
     return service.apply_live_favorite(keys, on, from_device_id=from_device_id, import_missing=import_missing)
 
@@ -3187,6 +4544,18 @@ def accept_inbox(req_id: str, opts: dict | None = None):
 
 def reject_inbox(req_id: str):
     return service.reject_inbox(req_id)
+
+
+def list_history(limit: int = 100):
+    return service.list_history(limit=limit)
+
+
+def mark_history_seen(ids=None):
+    return service.mark_history_seen(ids=ids)
+
+
+def clear_history():
+    return service.clear_history()
 
 
 def reset_runtime_cache():

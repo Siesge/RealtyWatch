@@ -1026,6 +1026,66 @@ def lan_pull_db(body: dict = Body(...)):
         raise HTTPException(400, str(e))
 
 
+@app.get("/api/lan/marks/info")
+def lan_marks_info(peer_id: str = ""):
+    pid = str(peer_id or "").strip() or None
+    try:
+        return lan_sync.get_marks_info(peer_id=pid)
+    except lan_sync.LanNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except (ValueError, ConnectionError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/lan/pull/marks")
+def lan_pull_marks(body: dict = Body(...)):
+    peer_id = str(body.get("peer_id") or "").strip()
+    if not peer_id:
+        raise HTTPException(400, "укажите устройство партнёра")
+    items = body.get("items")
+    mode = str(body.get("mode") or "merge")
+    try:
+        return lan_sync.pull_marks(peer_id, items=items, mode=mode)
+    except lan_sync.LanBusyError as e:
+        raise HTTPException(409, str(e))
+    except lan_sync.LanNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except (ValueError, ConnectionError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/lan/send/marks")
+def lan_send_marks(body: dict = Body(...)):
+    peer_ids = body.get("peer_ids")
+    if peer_ids is None and body.get("peer_id"):
+        peer_ids = [body["peer_id"]]
+    clean_ids = [str(x).strip() for x in (peer_ids or []) if str(x).strip()]
+    if not clean_ids:
+        raise HTTPException(400, "выберите хотя бы одно сопряжённое устройство")
+    items = body.get("items")
+    try:
+        return lan_sync.send_marks(clean_ids, items=items)
+    except lan_sync.LanNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except (ValueError, ConnectionError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/lan/history")
+def lan_history(limit: int = 100):
+    return lan_sync.list_history(limit=limit)
+
+
+@app.post("/api/lan/history/seen")
+def lan_history_seen(body: dict = Body(default={})):
+    return lan_sync.mark_history_seen(ids=body.get("ids"))
+
+
+@app.post("/api/lan/history/clear")
+def lan_history_clear():
+    return lan_sync.clear_history()
+
+
 @app.get("/api/runs")
 def runs():
     con = db.connect()

@@ -80,10 +80,17 @@
         <h1 id="viewTitle">Дашборд</h1>
         <div class="heading-sub" id="viewSub"></div>
       </div>
-      <div class="kpis" id="kpis"></div>
+      <div class="topbar-right">
+        <div class="kpis" id="kpis"></div>
+        <button type="button" id="lanHistBtn" class="lan-hist-btn" title="История действий по сети: входящие карточки, пинг, лайки, дизлайки, заметки и объединённые (клик открывает панель справа)">
+          <svg viewBox="0 0 24 24"><path d="M12 8v4l2.8 2.2M3.5 12a8.5 8.5 0 1 0 2.2-5.7L3.5 8.5M3.5 4.5v4h4"/></svg>
+          <span id="lanHistBadge" class="lan-cnt hidden">0</span>
+        </button>
+      </div>
     </header>
     <div id="freshDbBar" class="fresh-db-bar hidden"></div>
     <div id="updateBar" class="fresh-db-bar update-bar hidden"></div>
+    <div id="eventFocusBar" class="fresh-db-bar event-focus-bar hidden"></div>
 
     <div class="toolbar hidden" id="filters">
       <div class="tb-row">
@@ -133,7 +140,10 @@
               <span class="exp-txt"><b id="expFileTitle">Экспортировать в файл (.rwcards.zip)</b><i id="expFileSub">Карточки с фото, историей цен и заметками</i></span>
             </button>
             <button type="button" class="exp-item" data-exp="lan">
-              <span class="exp-txt"><b>Экспортировать по сети (LAN)</b><i>Отправка напрямую на другое устройство</i></span>
+              <span class="exp-txt"><b>Экспортировать карточки по сети (LAN)</b><i>Отправка выбранных карточек на другое устройство</i></span>
+            </button>
+            <button type="button" class="exp-item" data-exp="marks">
+              <span class="exp-txt"><b>Импорт / экспорт отметок и дублей (LAN)</b><i>Запросить или отправить ♥ лайки, 👎 дизлайки, ✎ заметки и 🔗 дубли</i></span>
             </button>
             <div class="exp-sep"></div>
             <button type="button" class="exp-item" data-exp="html">
@@ -169,6 +179,8 @@
     </div>
   </main>
 </div>
+<div id="lanDrawerBackdrop" class="lan-drawer-backdrop hidden"></div>
+<aside id="lanDrawer" class="lan-drawer" aria-hidden="true"></aside>
 <div id="modal" class="modal hidden"><div class="modal-card" role="dialog"><button class="modal-x" id="modalX" title="Закрыть (Esc)">✕</button><div id="modalBody"></div></div></div>
 <div id="tip" class="tip"></div>
 <div id="toasts" class="toasts"></div>

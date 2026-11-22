@@ -267,7 +267,7 @@ def clear_all():
     for table in (
         "listings", "price_history", "events", "snapshots", "runs",
         "likes", "dislikes", "notes", "manual_merges",
-        "import_batches", "import_items", "imported_notes", "sync_outbox",
+        "import_batches", "import_items", "imported_notes", "sync_outbox", "sync_history",
     ):
         con.execute(f"DELETE FROM {table}")
     con.commit()

@@ -45,8 +45,9 @@ const ICON = {
 let LASTRUN = {}, ALL = [], OBJS = [], SETTINGS = null, view = "cards", jAfter = 0, lastStates = {};
 const EXPORT_PICK = new Set();
 let IMP_BATCH_ID = null, IMP_FILTER = "all", IMP_DETAIL = null, IMP_HIGHLIGHT_ID = null;
-let LAN_SUM = { enabled: false, listening: false, online_peers: 0, inbox_count: 0, outbox_count: 0, data_rev: 0, newer_db_peer: null };
+let LAN_SUM = { enabled: false, listening: false, online_peers: 0, inbox_count: 0, outbox_count: 0, history_unread: 0, history_rev: 0, data_rev: 0, newer_db_peer: null };
 let lanPinTimer = null, lanDiscTimer = null, lanPollInit = false, LAN_CACHE = null, lanAfter = 0, SPOTLIGHT = null, dismissedFreshDb = "";
+let LAN_HIST_ITEMS = [], LAN_HIST_OPEN = false, EVENT_FOCUS = null;
 const canSpotlight = () => !!(LAN_SUM && LAN_SUM.enabled && (LAN_SUM.online_peers || 0) > 0);
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -287,6 +288,13 @@ function sortKey(o, s) {
 }
 
 function filtered(ignoreZone = false, f = readFilters()) {
+  if (EVENT_FOCUS && EVENT_FOCUS.keySet && EVENT_FOCUS.keySet.size) {
+    const rows = OBJS.filter(o => o.items.some(i => EVENT_FOCUS.keySet.has(`${i.source}:${i.source_id}`)));
+    if (ignoreZone) return rows;
+    const dir = f.sort === "new" || f.sort.startsWith("-") ? -1 : 1;
+    rows.sort((a, b) => ((sortKey(a, f.sort) > sortKey(b, f.sort)) ? 1 : (sortKey(a, f.sort) < sortKey(b, f.sort)) ? -1 : 0) * dir);
+    return rows;
+  }
   const rows = OBJS.filter(o => matchObject(o, f, { ignoreZone }));
   if (ignoreZone) return rows;
   const dir = f.sort === "new" || f.sort.startsWith("-") ? -1 : 1;
@@ -329,13 +337,15 @@ function renderHeader(rows, zoneRows = null) {
 function render() {
   markFilters();
   if (view === "changes") {
+    renderEventFocusBar([]);
     if (typeof paintChanges === "function") paintChanges();
     return;
   }
   const rows = filtered();
   // «Только в видимой области карты» сужает список карточек, а карта рядом показывает всё по фильтрам:
   // иначе, сдвинув карту, вы увидели бы пустое место там, где квартиры есть
-  const list = view === "cards" ? inArea(rows) : rows;
+  const list = view === "cards" && !EVENT_FOCUS ? inArea(rows) : rows;
+  renderEventFocusBar(rows);
   renderHeader(list);
   fitToolbar();
   if (view === "cards") renderCards(list, rows);
@@ -2190,8 +2200,11 @@ async function poll() {
       const newInbox = s.lan.inbox_count || 0;
       if (s.lan.seq != null && s.lan.seq > lanAfter) lanAfter = s.lan.seq;
       syncLanIndicators(s.lan);
+      const hasMarksOfferEv = (s.lan.events || []).some(ev => ev.kind === "marks_offer");
       if (wasInit && newInbox > prevInbox) {
-        toast("ok", "Входящий запрос по LAN", `Получены новые данные по локальной сети (${newInbox})`, { label: "Открыть", fn: () => openLanModal() });
+        if (!hasMarksOfferEv) {
+          toast("ok", "Входящий запрос по LAN", `Получены новые данные по локальной сети (${newInbox})`, { label: "Открыть", fn: () => openLanModal() });
+        }
         if (view === "imports" && !IMP_BATCH_ID) renderImports();
       } else if (!wasInit && newInbox > 0 && view === "imports" && !IMP_BATCH_ID) {
         renderImports();
@@ -2205,6 +2218,13 @@ async function poll() {
         if (ev.kind === "spotlight") {
           const freshEnough = wasInit || (ev.ts && (Date.now() - new Date(ev.ts).getTime()) < 15000);
           if (freshEnough) handleSpotlightEvent(ev);
+        } else if (ev.kind === "marks_offer") {
+          const freshEnough = wasInit || (ev.ts && (Date.now() - new Date(ev.ts).getTime()) < 15000);
+          if (freshEnough) {
+            toast("ok", `Предложение обновить отметки от «${ev.from_device_name || "Партнёра"}»`,
+              `Вам предлагают принять: ${marksSummaryText(ev.items, ev.counts)}. Выберите — добавить к своим или перезаписать.`,
+              { label: "Посмотреть и выбрать…", fn: () => openMarksOfferById(ev.req_id) });
+          }
         } else if (ev.kind === "live_fav" && wasInit) {
           handleLiveFavEvent(ev);
         } else if (ev.kind === "peer_state" && wasInit) {
@@ -2465,6 +2485,7 @@ function initExportMenu() {
     closeExportMenu();
     if (act === "file") exportCardsFlow();
     else if (act === "lan") exportCardsToLan();
+    else if (act === "marks") openLanMarksModal(null, "push");
     else if (act === "html") shareLiked($("#btnShare"));
   });
   updateExportBtnUI();
@@ -2479,15 +2500,28 @@ function syncLanIndicators(lan) {
   if (!lan) return;
   if (Array.isArray(lan.peers)) LAN_CACHE = lan;
   const wasSpot = canSpotlight();
+  const prevHistRev = LAN_SUM.history_rev ?? 0;
   LAN_SUM = {
     enabled: !!lan.enabled,
     listening: !!lan.listening,
     online_peers: lan.online_peers || 0,
     inbox_count: lan.inbox_count || 0,
     outbox_count: lan.outbox_count ?? LAN_SUM.outbox_count ?? 0,
+    history_unread: lan.history_unread ?? LAN_SUM.history_unread ?? 0,
+    history_rev: lan.history_rev ?? prevHistRev,
     data_rev: lan.data_rev ?? LAN_SUM.data_rev ?? 0,
     newer_db_peer: lan.newer_db_peer !== undefined ? lan.newer_db_peer : LAN_SUM.newer_db_peer,
   };
+  const histBadge = $("#lanHistBadge"), histBtn = $("#lanHistBtn");
+  if (histBadge) {
+    const hun = LAN_SUM.history_unread || 0;
+    histBadge.textContent = hun > 0 ? String(hun > 99 ? "99+" : hun) : "";
+    histBadge.classList.toggle("hidden", !(hun > 0));
+  }
+  if (histBtn) histBtn.classList.toggle("has-unread", (LAN_SUM.history_unread || 0) > 0);
+  if (LAN_HIST_OPEN && LAN_SUM.history_rev !== prevHistRev) {
+    refreshLanDrawer(true).catch(() => {});
+  }
   const nowSpot = canSpotlight();
   const onlineN = LAN_SUM.online_peers || 0;
   const led = $("#lanLed"), txt = $("#lanFootTxt"), lanBtn = $("#lanBtn"), footB = $("#lanFootBadge"), impB = $("#impBadge");
@@ -2555,6 +2589,320 @@ function renderFreshDbBar() {
   bar.classList.remove("hidden");
   $("#btnFreshPull").onclick = () => pullDbFromPeer(np.device_id, np.name);
   $("#btnFreshHide").onclick = () => { dismissedFreshDb = dKey; bar.classList.add("hidden"); };
+}
+
+function renderEventFocusBar(rows = []) {
+  const bar = $("#eventFocusBar");
+  if (!bar) return;
+  if (!EVENT_FOCUS || !["cards", "table", "map"].includes(view)) {
+    bar.classList.add("hidden");
+    bar.innerHTML = "";
+    return;
+  }
+  const n = rows.length;
+  bar.innerHTML = `<span class="fresh-db-txt">📌 Показаны объекты из истории сети: <b>${esc(EVENT_FOCUS.title)}</b> — ${n} ${plural(n, "объект", "объекта", "объектов")}</span>
+    <span class="fresh-db-acts">
+      <button type="button" class="btn-sec sm" id="btnReopenHistDrawer">Открыть историю</button>
+      <button type="button" class="btn-pri sm" id="btnClearEventFocus">Показать всю подборку ×</button>
+    </span>`;
+  bar.classList.remove("hidden");
+  $("#btnReopenHistDrawer").onclick = () => toggleLanDrawer(true);
+  $("#btnClearEventFocus").onclick = () => clearEventFocus();
+}
+
+function clearEventFocus() {
+  if (!EVENT_FOCUS) return;
+  EVENT_FOCUS = null;
+  renderEventFocusBar([]);
+  if (["cards", "table", "map"].includes(view)) render();
+}
+
+const LH_KIND_BADGE = {
+  spotlight: ["👁", "Пинг карточки"],
+  live_fav: ["♥", "Live-Избранное"],
+  live_note: ["✎", "Live-заметка"],
+  live_merge: ["🔗", "Объединение"],
+  marks_offer: ["⇄", "Предложение отметок"],
+  marks_applied: ["✓", "Приняты отметки"],
+  marks_pulled: ["⬇", "Загружены отметки"],
+  cards_offer: ["📦", "Пакет карточек"],
+  cards_applied: ["📦", "Карточки приняты"],
+  favorites_offer: ["♥", "Избранное по LAN"],
+  favorites_applied: ["♥", "Избранное принято"],
+  db_offer: ["🗄", "Снимок базы"],
+  db_applied: ["🗄", "База принята"],
+};
+
+function closeLanDrawer() {
+  LAN_HIST_OPEN = false;
+  const dr = $("#lanDrawer"), bd = $("#lanDrawerBackdrop"), btn = $("#lanHistBtn");
+  if (dr) { dr.classList.remove("open"); dr.setAttribute("aria-hidden", "true"); }
+  if (bd) bd.classList.add("hidden");
+  if (btn) btn.classList.remove("active");
+}
+
+async function toggleLanDrawer(forceOpen = null) {
+  const next = forceOpen !== null ? !!forceOpen : !LAN_HIST_OPEN;
+  if (!next) {
+    closeLanDrawer();
+    return;
+  }
+  LAN_HIST_OPEN = true;
+  const dr = $("#lanDrawer"), bd = $("#lanDrawerBackdrop"), btn = $("#lanHistBtn");
+  if (bd) bd.classList.remove("hidden");
+  if (dr) {
+    dr.setAttribute("aria-hidden", "false");
+    if (!dr.innerHTML) {
+      dr.innerHTML = `<div class="lh-top"><div><b>История действий по сети</b><span class="meta">Загрузка…</span></div><button type="button" class="modal-x lh-close" id="lanDrawerClose">✕</button></div>`;
+      const cx = $("#lanDrawerClose");
+      if (cx) cx.onclick = closeLanDrawer;
+    }
+    requestAnimationFrame(() => dr.classList.add("open"));
+  }
+  if (btn) btn.classList.add("active");
+  await refreshLanDrawer(true);
+}
+
+async function refreshLanDrawer(markSeen = false) {
+  const h = await api("/api/lan/history?limit=120");
+  LAN_HIST_ITEMS = h.items || [];
+  if (h.rev != null) LAN_SUM.history_rev = h.rev;
+  if (markSeen && (h.unread || 0) > 0) {
+    post("/api/lan/history/seen", {}).catch(() => {});
+    LAN_SUM.history_unread = 0;
+    const hb = $("#lanHistBadge"), hbtn = $("#lanHistBtn");
+    if (hb) { hb.textContent = ""; hb.classList.add("hidden"); }
+    if (hbtn) hbtn.classList.remove("has-unread");
+  }
+  if (LAN_HIST_OPEN) renderLanDrawerBody();
+}
+
+function _countDistinctObjectsForKeys(pairs) {
+  if (!Array.isArray(pairs) || !pairs.length) return 0;
+  const set = new Set(pairs.map(p => `${p[0]}:${p[1]}`));
+  const matchedOids = new Set();
+  const seenRaw = new Set();
+  for (const o of OBJS) {
+    if (o.items.some(i => set.has(`${i.source}:${i.source_id}`))) {
+      matchedOids.add(o.id);
+      o.items.forEach(i => seenRaw.add(`${i.source}:${i.source_id}`));
+    }
+  }
+  for (const k of set) {
+    if (!seenRaw.has(k)) matchedOids.add(k);
+  }
+  return matchedOids.size;
+}
+
+function renderLanDrawerBody() {
+  const dr = $("#lanDrawer");
+  if (!dr) return;
+  const byKeyObj = new Map();
+  for (const o of OBJS) {
+    for (const i of o.items) byKeyObj.set(`${i.source}:${i.source_id}`, o);
+  }
+
+  const renderObjRow = (it, pr) => {
+    const kStr = `${pr.source}:${pr.source_id}`;
+    const live = byKeyObj.get(kStr);
+    const rooms = (live?.rooms ?? pr.rooms);
+    const area = (live?.area ?? pr.area);
+    const price = (live?.price ?? pr.price);
+    const addr = live?.address || pr.address || live?.p?.title || pr.title || kStr;
+    const url = (live?.items?.find(x => x.url)?.url) || pr.url || "";
+    const noteTxt = pr.note || live?.note || (live?.imported_notes?.[0]?.text) || "";
+    const rLbl = rooms === 0 ? "студия" : (rooms != null ? `${rooms}-к` : "");
+    const facts = [rLbl, area != null ? `${area} м²` : "", price ? `${fmt(price)} ₽` : ""].filter(Boolean).join(" · ");
+    return `<div class="lh-obj" data-lh-id="${it.id}" data-lh-obj="${esc(kStr)}">
+      <div class="lh-obj-main" title="Перейти к этой карточке в подборке">
+        <div class="lh-obj-top"><i class="sdot ${esc(pr.source)}"></i><b>${esc(facts || SRC[pr.source] || pr.source)}</b></div>
+        <div class="lh-obj-addr">${esc(addr)}</div>
+        ${noteTxt ? `<div class="lh-obj-note">💬 ${esc(noteTxt)}</div>` : ""}
+      </div>
+      <div class="lh-obj-acts">
+        ${live ? `<button type="button" class="chip sm" data-lh-modal="${esc(live.id)}" title="Открыть окно квартиры">Окно</button>` : ""}
+        ${url ? `<a class="chip sm lh-ext" href="${esc(url)}" target="_blank" rel="noopener" title="Открыть объявление на сайте">Сайт ↗</a>` : ""}
+      </div>
+    </div>`;
+  };
+
+  const listHtml = LAN_HIST_ITEMS.length
+    ? LAN_HIST_ITEMS.map(it => {
+        const [ico, kindLbl] = LH_KIND_BADGE[it.kind] || ["•", it.kind];
+        const cats = it.cats || {};
+        const catChips = MARK_DEFS
+          .filter(([ck]) => Array.isArray(cats[ck]) && cats[ck].length > 0)
+          .map(([ck]) => {
+            const cnt = _countDistinctObjectsForKeys(cats[ck]);
+            return `<button type="button" class="lh-cat-chip" data-lh-id="${it.id}" data-lh-cat="${ck}" title="Показать карточки этой категории в подборке">${MARK_SHORT[ck]} · <b>${fmt(cnt)}</b></button>`;
+          }).join("");
+
+        const prevs = Array.isArray(it.preview) ? it.preview : [];
+        const shownPrevs = prevs.slice(0, 3);
+        const restPrevs = prevs.slice(3);
+        const objsHtml = prevs.length
+          ? `<div class="lh-objs">
+               ${shownPrevs.map(pr => renderObjRow(it, pr)).join("")}
+               ${restPrevs.length ? `<details class="lh-more"><summary>Ещё ${restPrevs.length} ${plural(restPrevs.length, "объект", "объекта", "объектов")}…</summary><div class="lh-objs-rest">${restPrevs.map(pr => renderObjRow(it, pr)).join("")}</div></details>` : ""}
+             </div>`
+          : "";
+
+        const hasNav = (it.keys && it.keys.length > 0) || it.batch_id || it.pending_inbox || it.kind === "db_applied";
+        return `<article class="lh-card ${it.seen ? "" : "unread"} ${it.pending_inbox ? "pending" : ""}" data-lh-card="${it.id}">
+          <div class="lh-card-head ${hasNav ? "clickable" : ""}" data-lh-go="${it.id}" title="${hasNav ? "Нажмите, чтобы перейти к карточкам этого события" : ""}">
+            <span class="lh-ico">${ico}</span>
+            <div class="lh-meta">
+              <div class="lh-from"><b>${esc(it.peer_name || "Партнёр")}</b><span>${dtt(it.ts)}</span></div>
+              <div class="lh-title">${esc(it.title || kindLbl)}</div>
+              ${it.detail ? `<div class="lh-detail">${esc(it.detail)}</div>` : ""}
+            </div>
+          </div>
+          ${it.pending_inbox && it.req_id ? `<div class="lh-pending-bar">
+            <span class="st-badge partial">Ожидает решения</span>
+            <button type="button" class="btn-pri sm" data-lh-accept="${esc(it.req_id)}">Посмотреть и принять…</button>
+          </div>` : ""}
+          ${catChips ? `<div class="lh-chips">${catChips}</div>` : ""}
+          ${objsHtml}
+        </article>`;
+      }).join("")
+    : `<div class="lh-empty"><b>История сети пока пуста</b><span>Здесь появляются все входящие пинги карточек, лайки, дизлайки, заметки, ручные объединения и подборки от сопряжённых компьютеров — с переходом к конкретным объектам в один клик.</span></div>`;
+
+  dr.innerHTML = `
+    <div class="lh-top">
+      <div>
+        <b>История действий по сети</b>
+        <span class="meta">${LAN_HIST_ITEMS.length ? `${LAN_HIST_ITEMS.length} ${plural(LAN_HIST_ITEMS.length, "событие", "события", "событий")} · клик открывает объекты` : "Входящие действия партнёров"}</span>
+      </div>
+      <div class="lh-top-acts">
+        ${LAN_HIST_ITEMS.length ? `<button type="button" class="link sm" id="btnLanHistClear" title="Очистить историю сети">Очистить</button>` : ""}
+        <button type="button" class="modal-x lh-close" id="lanDrawerClose" title="Закрыть панель (Esc)">✕</button>
+      </div>
+    </div>
+    <div class="lh-list" id="lanHistList">${listHtml}</div>`;
+
+  $("#lanDrawerClose").onclick = closeLanDrawer;
+  const clrBtn = $("#btnLanHistClear");
+  if (clrBtn) {
+    clrBtn.onclick = async () => {
+      await post("/api/lan/history/clear", {});
+      LAN_HIST_ITEMS = [];
+      LAN_SUM.history_unread = 0;
+      renderLanDrawerBody();
+      toast("ok", "История сети очищена", "");
+    };
+  }
+
+  const byId = new Map(LAN_HIST_ITEMS.map(x => [String(x.id), x]));
+  dr.querySelectorAll("[data-lh-accept]").forEach(b => b.onclick = async e => {
+    e.stopPropagation();
+    const rid = b.dataset.lhAccept;
+    closeLanDrawer();
+    await openMarksOfferById(rid);
+  });
+  dr.querySelectorAll("[data-lh-modal]").forEach(b => b.onclick = e => {
+    e.stopPropagation();
+    const oid = b.dataset.lhModal;
+    closeLanDrawer();
+    openObject(oid);
+  });
+  dr.querySelectorAll(".lh-ext").forEach(a => a.onclick = e => e.stopPropagation());
+  dr.querySelectorAll("[data-lh-cat]").forEach(b => b.onclick = e => {
+    e.stopPropagation();
+    const it = byId.get(String(b.dataset.lhId));
+    if (it) navigateFromHistoryItem(it, { cat: b.dataset.lhCat });
+  });
+  dr.querySelectorAll("[data-lh-obj]").forEach(row => row.onclick = e => {
+    if (e.target.closest("button, a")) return;
+    e.stopPropagation();
+    const it = byId.get(String(row.dataset.lhId));
+    if (it) navigateFromHistoryItem(it, { singleKey: row.dataset.lhObj });
+  });
+  dr.querySelectorAll("[data-lh-go]").forEach(head => head.onclick = () => {
+    const it = byId.get(String(head.dataset.lhGo));
+    if (it) navigateFromHistoryItem(it);
+  });
+}
+
+async function navigateFromHistoryItem(it, { cat = null, singleKey = null } = {}) {
+  if (!it) return;
+  let pairs = [];
+  let label = `${it.peer_name || "Партнёр"} · ${it.title || "Событие сети"}`;
+
+  if (singleKey && singleKey.includes(":")) {
+    const [s, sid] = singleKey.split(":", 2);
+    pairs = [[s, sid]];
+  } else if (cat && it.cats && Array.isArray(it.cats[cat]) && it.cats[cat].length) {
+    pairs = it.cats[cat];
+    label = `${it.peer_name || "Партнёр"} · ${MARK_SHORT[cat] || cat}`;
+  } else if (Array.isArray(it.keys) && it.keys.length) {
+    pairs = it.keys;
+  }
+
+  if (!pairs.length) {
+    if (it.pending_inbox && it.req_id) {
+      closeLanDrawer();
+      await openMarksOfferById(it.req_id);
+      return;
+    }
+    if (it.batch_id) {
+      closeLanDrawer();
+      IMP_FILTER = "all";
+      setView("imports");
+      openImportBatch(it.batch_id);
+      return;
+    }
+    if (it.kind === "db_applied") {
+      closeLanDrawer();
+      setView("changes");
+      return;
+    }
+    return;
+  }
+
+  const keySet = new Set(pairs.map(p => `${p[0]}:${p[1]}`));
+  let matched = OBJS.filter(o => o.items.some(i => keySet.has(`${i.source}:${i.source_id}`)));
+
+  // Если карточка одна и её ещё нет в локальной базе — пробуем сразу догрузить её у онлайн-партнёра
+  if (!matched.length && (singleKey || pairs.length === 1) && it.peer_id) {
+    try {
+      await post("/api/lan/spotlight/import", {
+        from_device_id: it.peer_id,
+        source: pairs[0][0],
+        source_id: String(pairs[0][1]),
+      });
+      await loadData();
+      matched = OBJS.filter(o => o.items.some(i => keySet.has(`${i.source}:${i.source_id}`)));
+    } catch (e) { /* партнёр не в сети или предложение ожидает приёма */ }
+  }
+
+  if (!matched.length && it.pending_inbox && it.req_id) {
+    closeLanDrawer();
+    await openMarksOfferById(it.req_id);
+    return;
+  }
+
+  if (!matched.length) {
+    toast("warn", "Карточка пока не в базе", "Примите входящий пакет или дождитесь появления партнёра в сети");
+    return;
+  }
+
+  closeLanDrawer();
+  if (matched.length === 1 && (singleKey || (!cat && _countDistinctObjectsForKeys(pairs) === 1))) {
+    const targetObj = matched[0];
+    if (!matchObject(targetObj, readFilters()) || ($("#fArea") && $("#fArea").checked)) {
+      EVENT_FOCUS = {
+        title: label,
+        keySet: new Set(targetObj.items.map(i => `${i.source}:${i.source_id}`)),
+      };
+    } else {
+      EVENT_FOCUS = null;
+    }
+    jumpToSpotlightCard(targetObj.id, it.peer_name || "Партнёр");
+    return;
+  }
+
+  EVENT_FOCUS = { title: label, keySet };
+  setView("cards");
 }
 
 function spotBrief(s) {
@@ -2828,7 +3176,208 @@ async function pullDbFromPeer(peerId, peerName) {
   }
 }
 
+const MARK_DEFS = [
+  ["likes", "♥ Лайки (Избранное)", "квартиры, отмеченные сердечком"],
+  ["dislikes", "👎 Дизлайки (Скрытые)", "квартиры, скрытые из подборки"],
+  ["notes", "✎ Заметки", "личные и импортированные заметки к объектам"],
+  ["merges", "🔗 Ручные объединения в дубли", "карточки, объединённые вручную в один объект"],
+];
+const MARK_SHORT = { likes: "♥ лайки", dislikes: "👎 дизлайки", notes: "✎ заметки", merges: "🔗 дубли" };
+
+function marksSummaryText(items, counts) {
+  const sel = Array.isArray(items) && items.length ? items : Object.keys(MARK_SHORT);
+  const c = counts || {};
+  return sel
+    .filter(k => MARK_SHORT[k])
+    .map(k => `${MARK_SHORT[k]}${c[k] != null ? ` (${fmt(c[k])})` : ""}`)
+    .join(", ");
+}
+
+async function openMarksOfferById(reqId) {
+  try {
+    const st = await api("/api/lan/status");
+    syncLanIndicators(st);
+    const req = (st.inbox || []).find(x => x.req_id === reqId);
+    if (req) openLanAcceptModal(req);
+    else openLanModal(st);
+  } catch (e) {
+    toast("warn", "Не удалось открыть запрос", e.message || String(e));
+  }
+}
+
+async function openLanMarksModal(initialPeerId = null, initialTab = "pull") {
+  stopLanTimers();
+  let st;
+  try {
+    st = await api("/api/lan/status?refresh=true");
+    syncLanIndicators(st);
+  } catch (e) {
+    toast("warn", "Сеть (LAN) недоступна", e.message || String(e));
+    return;
+  }
+  if (!st.enabled || !st.peers.length) {
+    openLanModal(st);
+    toast("warn", "Нет сопряжённых устройств", !st.enabled
+      ? "Сначала включите локальную сеть и подключите второе устройство по PIN"
+      : "Подключите второе устройство по PIN, чтобы запрашивать и отправлять отметки");
+    return;
+  }
+
+  let curTab = initialTab === "push" ? "push" : "pull";
+  const onlinePeer = st.peers.find(p => p.online) || st.peers[0];
+  let curPeerId = (initialPeerId && st.peers.some(p => p.device_id === initialPeerId)) ? initialPeerId : onlinePeer.device_id;
+  let checkedSet = new Set(["likes", "dislikes", "notes", "merges"]);
+  let applyMode = "merge";
+  let localMarks = st.local_marks || { likes: 0, dislikes: 0, notes: 0, merges: 0 };
+  let remoteMarksByPeer = {};
+  for (const p of st.peers) {
+    if (p.marks_counts) remoteMarksByPeer[p.device_id] = p.marks_counts;
+  }
+  let loadingRemote = false;
+
+  const fetchPeerCounts = async (pid) => {
+    if (!pid) return;
+    loadingRemote = true;
+    paint();
+    try {
+      const info = await api(`/api/lan/marks/info?peer_id=${encodeURIComponent(pid)}`);
+      if (info.local) localMarks = info.local;
+      if (info.remote) remoteMarksByPeer[pid] = info.remote;
+    } catch (e) { /* используем кэш пира при наличии */ }
+    loadingRemote = false;
+    if (!$("#modal")?.classList.contains("hidden") && $("#lanMarksWin")) paint();
+  };
+
+  function paint() {
+    const peer = st.peers.find(p => p.device_id === curPeerId) || st.peers[0];
+    const rem = remoteMarksByPeer[curPeerId] || null;
+    const isPull = curTab === "pull";
+    const peerOpts = st.peers.map(p =>
+      `<option value="${esc(p.device_id)}" ${p.device_id === curPeerId ? "selected" : ""}>${esc(p.name)} (${p.online ? "онлайн" : "не в сети"} · ${esc(p.ip)}:${p.port})</option>`
+    ).join("");
+
+    const rowsHtml = MARK_DEFS.map(([k, title, sub]) => {
+      const myN = localMarks?.[k] ?? 0;
+      const remTxt = rem ? `у партнёра: <b>${fmt(rem[k] ?? 0)}</b>` : (loadingRemote ? "у партнёра: <i>запрос…</i>" : "у партнёра: —");
+      const cntBadge = isPull
+        ? `<span class="lm-counts">${remTxt} · у вас: <b>${fmt(myN)}</b></span>`
+        : `<span class="lm-counts">у вас: <b>${fmt(myN)}</b></span>`;
+      return `<label class="lm-item">
+        <input type="checkbox" class="lm-chk" data-mk="${k}" id="lmChk_${k}" ${checkedSet.has(k) ? "checked" : ""}>
+        <span class="lm-item-body"><b>${title}</b><i>${sub}</i></span>
+        ${cntBadge}
+      </label>`;
+    }).join("");
+
+    $("#modalBody").innerHTML = `<div class="lan-marks-win" id="lanMarksWin">
+      <div class="lan-head">
+        <div><h3>Импорт и экспорт отметок и дублей по сети</h3><div class="meta">Обмен лайками, дизлайками, заметками и ручными объединениями карточек</div></div>
+        <button type="button" class="btn-sec sm" id="btnLmBackLan">Все устройства</button>
+      </div>
+
+      <div class="seg lm-tabs">
+        <label><input type="radio" name="lmTab" id="lmTabPull" value="pull" ${isPull ? "checked" : ""}><span>⬇ Запросить у партнёра (Импорт)</span></label>
+        <label><input type="radio" name="lmTab" id="lmTabPush" value="push" ${!isPull ? "checked" : ""}><span>⬆ Отправить партнёру (Экспорт)</span></label>
+      </div>
+
+      <div class="lm-hint">${isPull
+        ? "Выбранные пункты скачаются с сопряжённого компьютера напрямую к вам, <b>не беспокоя партнёра никакими уведомлениями</b>."
+        : "На экране партнёра появится <b>уведомление с перечнем предлагаемых пунктов</b>, и он сам выберет — добавить их к своим или перезаписать."}</div>
+
+      <div class="lm-peer-row">
+        <label><span>Сопряжённое устройство</span><select id="lmPeerSel">${peerOpts}</select></label>
+      </div>
+
+      <div class="imp-prev-sec">
+        <div class="lm-sec-head">
+          <div class="imp-prev-lbl">${isPull ? "Что запросить у партнёра:" : "Что отправить партнёру:"}</div>
+          <div class="rp-tools">
+            <button type="button" class="chip" id="lmSelectAll">Выбрать все</button>
+            <button type="button" class="chip" id="lmSelectNone">Снять все</button>
+          </div>
+        </div>
+        <div class="lm-items">${rowsHtml}</div>
+      </div>
+
+      ${isPull ? `<div class="imp-prev-sec">
+        <div class="imp-prev-lbl">Как применить полученные данные у вас:</div>
+        <div class="imp-mode-list">
+          <label class="imp-mode-opt"><input type="radio" name="lmApplyMode" value="merge" ${applyMode === "merge" ? "checked" : ""}>
+            <span><b>Добавить к моим</b><i>Ваши текущие лайки, дизлайки, заметки и ручные объединения не заменяются — данные партнёра добавляются к ним</i></span></label>
+          <label class="imp-mode-opt"><input type="radio" name="lmApplyMode" value="replace" ${applyMode === "replace" ? "checked" : ""}>
+            <span><b>Перезаписать поверх моих</b><i>Сохранит резервную копию базы и заменит выбранные галочками пункты данными партнёра</i></span></label>
+        </div>
+      </div>` : ""}
+
+      <div class="confirm-acts">
+        <button type="button" class="btn-sec" id="btnLmCancel">Отмена</button>
+        <button type="button" class="btn-pri" id="btnLanMarksGo" ${checkedSet.size ? "" : "disabled"}>${isPull ? `⬇ Запросить у «${esc(peer.name)}»` : `⬆ Отправить на «${esc(peer.name)}»`}</button>
+      </div>
+    </div>`;
+    $("#modal").classList.remove("hidden");
+
+    $("#btnLmBackLan").onclick = () => openLanModal();
+    $("#btnLmCancel").onclick = closeModal;
+    $$('#lanMarksWin input[name="lmTab"]').forEach(r => r.onchange = () => {
+      curTab = r.value;
+      paint();
+    });
+    $("#lmPeerSel").onchange = e => {
+      curPeerId = e.target.value;
+      fetchPeerCounts(curPeerId);
+    };
+    $$("#lanMarksWin .lm-chk").forEach(chk => chk.onchange = () => {
+      if (chk.checked) checkedSet.add(chk.dataset.mk);
+      else checkedSet.delete(chk.dataset.mk);
+      const goBtn = $("#btnLanMarksGo");
+      if (goBtn) goBtn.disabled = !checkedSet.size;
+    });
+    $("#lmSelectAll").onclick = () => {
+      MARK_DEFS.forEach(([k]) => checkedSet.add(k));
+      paint();
+    };
+    $("#lmSelectNone").onclick = () => {
+      checkedSet.clear();
+      paint();
+    };
+    $$('#lanMarksWin input[name="lmApplyMode"]').forEach(r => r.onchange = () => {
+      applyMode = r.value;
+    });
+
+    $("#btnLanMarksGo").onclick = async () => {
+      const items = MARK_DEFS.map(([k]) => k).filter(k => checkedSet.has(k));
+      if (!items.length) return toast("warn", "Ничего не выбрано", "Отметьте хотя бы один пункт");
+      const goBtn = $("#btnLanMarksGo");
+      goBtn.disabled = true;
+      goBtn.textContent = isPull ? "Загружаю…" : "Отправляю…";
+      try {
+        if (isPull) {
+          const r = await post("/api/lan/pull/marks", { peer_id: curPeerId, items, mode: applyMode });
+          closeModal();
+          await loadData();
+          if (view === "settings") renderSettings();
+          toast("ok", `Данные получены от «${r.from_device_name || peer.name}»`,
+            `${applyMode === "replace" ? "Перезаписано" : "Добавлено к вашим"}: ${marksSummaryText(r.items, r.counts)}`);
+        } else {
+          const r = await post("/api/lan/send/marks", { peer_ids: [curPeerId], items });
+          closeModal();
+          toast("ok", `Предложение отправлено на «${peer.name}»`,
+            `Отправлено: ${marksSummaryText(r.items, r.counts)}. У партнёра открылось уведомление с выбором режима.`);
+        }
+      } catch (e) {
+        toast("warn", isPull ? "Не удалось запросить данные" : "Не удалось отправить данные", e.message || String(e));
+        goBtn.disabled = false;
+        goBtn.textContent = isPull ? `⬇ Запросить у «${peer.name}»` : `⬆ Отправить на «${peer.name}»`;
+      }
+    };
+  }
+
+  paint();
+  fetchPeerCounts(curPeerId);
+}
+
 function lanReqKindTitle(req) {
+  if (req.kind === "marks") return `Отметки и дубли (${marksSummaryText(req.items, req.counts)})`;
   if (req.kind === "favorites") return `Избранное (${req.summary?.total || 0} карт.)`;
   if (req.kind === "db") return `Полная база (${fmt(req.sender_counts?.listings || 0)} объявл.)`;
   return `Подборка карточек (${req.summary?.total || 0} шт.)`;
@@ -2843,7 +3392,9 @@ function renderLanInboxHtml(inbox, compact = false) {
     ${inbox.map(req => {
       const sub = req.kind === "db"
         ? `объявл. ${fmt(req.sender_counts?.listings || 0)} · фото ${fmt(req.images_received || 0)} догружено / ${fmt(req.images_total || 0)} всего`
-        : `новых ${req.summary?.new || 0} · в базе ${req.summary?.matched || 0} · дублей ${req.summary?.duplicate || 0}${req.summary?.stale ? ` · неактуальных ${req.summary.stale}` : ""}`;
+        : req.kind === "marks"
+          ? `предлагают принять: ${marksSummaryText(req.items, req.counts)}`
+          : `новых ${req.summary?.new || 0} · в базе ${req.summary?.matched || 0} · дублей ${req.summary?.duplicate || 0}${req.summary?.stale ? ` · неактуальных ${req.summary.stale}` : ""}`;
       return `<div class="lan-inbox-row" data-req="${esc(req.req_id)}">
         <div class="lan-inbox-info">
           <b>${esc(lanReqKindTitle(req))}</b>
@@ -2980,6 +3531,88 @@ function openLanAcceptModal(req, afterDone, inLanModal = false) {
       } catch (e) {
         toast("warn", "Не удалось принять Избранное", e.message || String(e));
         go.disabled = false; go.textContent = "Принять Избранное";
+      }
+    };
+    return;
+  }
+
+  if (req.kind === "marks") {
+    const avail = new Set(Array.isArray(req.items) && req.items.length ? req.items : MARK_DEFS.map(([k]) => k));
+    const incC = req.counts || {};
+    const locC = req.local_marks || {};
+    const offeredRows = MARK_DEFS.filter(([k]) => avail.has(k)).map(([k, title, sub]) => `
+      <label class="lm-item">
+        <input type="checkbox" class="lan-acc-mk" data-mk="${k}" checked>
+        <span class="lm-item-body"><b>${title}</b><i>${sub}</i></span>
+        <span class="lm-counts">предложено: <b>${fmt(incC[k] ?? 0)}</b> · у вас: <b>${fmt(locC[k] ?? 0)}</b></span>
+      </label>`).join("");
+
+    $("#modalBody").innerHTML = `<div class="imp-preview lan-accept" id="lanAcceptMarksWin">
+      <h3>Вам предлагают обновить отметки от «${esc(req.from_device_name || "устройства")}»</h3>
+      ${fromLine}
+      <div class="imp-prev-sec">
+        <div class="imp-prev-lbl">Что именно предлагается принять (можно отметить нужные пункты):</div>
+        <div class="lm-items">${offeredRows}</div>
+      </div>
+      <div class="imp-prev-sec">
+        <div class="imp-prev-lbl">Как применить к вашим данным:</div>
+        <div class="imp-mode-list">
+          <label class="imp-mode-opt"><input type="radio" name="lanMarksAcceptMode" value="merge" checked>
+            <span><b>Добавить к моим</b><i>Ваши текущие лайки, дизлайки, заметки и ручные объединения не заменяются — выбранные пункты добавляются к ним</i></span></label>
+          <label class="imp-mode-opt"><input type="radio" name="lanMarksAcceptMode" value="replace">
+            <span><b>Перезаписать поверх моих</b><i>Сохранит резервную копию базы и заменит выбранные галочками пункты данными отправителя</i></span></label>
+        </div>
+      </div>
+      ${req.busy && avail.has("merges") ? `<div class="lan-warn-box">${ICON.warn}<span>Сейчас идёт сбор объявлений — для применения ручных объединений дождитесь окончания (либо снимите галочку с ручных объединений).</span></div>` : ""}
+      <div class="confirm-acts">
+        <button type="button" class="btn-sec" data-c="no">Отмена</button>
+        <button type="button" class="btn-sec danger" id="btnLanAcceptReject">Отклонить</button>
+        <button type="button" class="btn-pri" id="btnLanAcceptGo">${ICON.ok}Принять выбранное</button>
+      </div>
+    </div>`;
+    $("#modal").classList.remove("hidden");
+    $('#modalBody [data-c="no"]').onclick = () => (inLanModal && afterDone ? afterDone() : closeModal());
+    const go = $("#btnLanAcceptGo");
+    const syncGoBtn = () => {
+      const anyOn = $$("#lanAcceptMarksWin .lan-acc-mk:checked").length > 0;
+      go.disabled = !anyOn;
+    };
+    $$("#lanAcceptMarksWin .lan-acc-mk").forEach(chk => chk.onchange = syncGoBtn);
+    $("#btnLanAcceptReject").onclick = async () => {
+      const rj = $("#btnLanAcceptReject");
+      rj.disabled = true;
+      try {
+        await post(`/api/lan/inbox/${encodeURIComponent(req.req_id)}/reject`);
+        closeModal();
+        const st = await api("/api/lan/status").catch(() => null);
+        if (st) syncLanIndicators(st);
+        toast("ok", "Предложение отклонено", "Входящий пакет удалён из очереди");
+        if (typeof afterDone === "function") await afterDone();
+      } catch (e) {
+        toast("warn", "Не удалось отклонить", e.message || String(e));
+        rj.disabled = false;
+      }
+    };
+    go.onclick = async () => {
+      const items = $$("#lanAcceptMarksWin .lan-acc-mk:checked").map(c => c.dataset.mk);
+      const mode = ($('#lanAcceptMarksWin input[name="lanMarksAcceptMode"]:checked') || {}).value || "merge";
+      if (!items.length) return toast("warn", "Ничего не выбрано", "Отметьте хотя бы один пункт");
+      go.disabled = true;
+      go.textContent = "Принимаю…";
+      try {
+        const r = await post(`/api/lan/inbox/${encodeURIComponent(req.req_id)}/accept`, { mode, items });
+        closeModal();
+        await loadData();
+        if (view === "settings") renderSettings();
+        const st = await api("/api/lan/status").catch(() => null);
+        if (st) syncLanIndicators(st);
+        toast("ok", `Данные от «${req.from_device_name || "партнёра"}» применены`,
+          `${mode === "replace" ? "Перезаписано" : "Добавлено к вашим"}: ${marksSummaryText(r.items, r.counts)}`);
+        if (typeof afterDone === "function" && view === "imports") await afterDone(true);
+      } catch (e) {
+        toast("warn", "Не удалось применить данные", e.message || String(e));
+        go.disabled = false;
+        go.textContent = "Принять выбранное";
       }
     };
     return;
@@ -3133,8 +3766,9 @@ function renderLanModalBody(st) {
             </div>
             <div class="lan-peer-acts">
               ${p.has_newer_db ? `<button type="button" class="btn-pri sm lan-pull-db" data-pid="${esc(p.device_id)}" data-pname="${esc(p.name)}">Забрать базу</button>` : ""}
+              <button type="button" class="btn-sec sm lan-pull-marks" data-pid="${esc(p.device_id)}" title="Тихо скачать к себе ♥ лайки, 👎 дизлайки, ✎ заметки и 🔗 дубли от партнёра (не беспокоя его)">⬇ Запросить отметки…</button>
+              <button type="button" class="btn-sec sm lan-push-marks" data-pid="${esc(p.device_id)}" title="Предложить партнёру принять ваши ♥ лайки, 👎 дизлайки, ✎ заметки и 🔗 дубли">⬆ Отправить отметки…</button>
               <button type="button" class="btn-sec sm lan-send-db" data-pid="${esc(p.device_id)}" ${!p.online ? "title=\"Устройство не ответило на последний опрос\"" : ""}>Передать базу</button>
-              <button type="button" class="btn-sec sm lan-send-fav" data-pid="${esc(p.device_id)}">Передать Избранное</button>
               <button type="button" class="btn-sec sm lan-live-btn" data-pid="${esc(p.device_id)}">Live-режим ▾</button>
               <button type="button" class="icon-btn sm lan-del-peer" data-pid="${esc(p.device_id)}" data-pname="${esc(p.name)}" title="Удалить устройство">${ICON.trash}</button>
             </div>
@@ -3350,18 +3984,8 @@ function renderLanModalBody(st) {
       toast("warn", "Не удалось передать базу", e.message || String(e));
     } finally { b.disabled = false; b.textContent = prev; }
   });
-  $$(".lan-send-fav").forEach(b => b.onclick = async () => {
-    const pid = b.dataset.pid;
-    b.disabled = true; const prev = b.textContent; b.textContent = "Отправляю…";
-    try {
-      const r = await post("/api/lan/send/favorites", { peer_ids: [pid] });
-      const first = (r.results || [])[0] || {};
-      if (!r.ok) throw new Error(first.error || "получатель не ответил");
-      toast("ok", "Избранное отправлено", `Карточек: ${r.cards}. На получателе нужно подтвердить приём.`);
-    } catch (e) {
-      toast("warn", "Не удалось передать Избранное", e.message || String(e));
-    } finally { b.disabled = false; b.textContent = prev; }
-  });
+  $$(".lan-pull-marks").forEach(b => b.onclick = () => openLanMarksModal(b.dataset.pid, "pull"));
+  $$(".lan-push-marks").forEach(b => b.onclick = () => openLanMarksModal(b.dataset.pid, "push"));
   $$(".lan-pull-db").forEach(b => b.onclick = () => pullDbFromPeer(b.dataset.pid, b.dataset.pname));
   $$(".lan-live-btn").forEach(b => b.onclick = () => {
     const pan = $(`.lan-live-panel[data-live-pid="${CSS.escape(b.dataset.pid)}"]`);
@@ -3568,6 +4192,7 @@ async function renderImports() {
   const topBar = `<div class="imp-bar panel">
     <button type="button" class="btn-pri" id="btnImportFile">${ICON.up}Импортировать файл…</button>
     <button type="button" class="btn-sec" id="btnImpLan" title="Подключение к устройствам в локальной сети (LAN)">${esc(lanLabel)}</button>
+    <button type="button" class="btn-sec" id="btnImpLanMarks" title="Запросить или отправить ♥ лайки, 👎 дизлайки, ✎ заметки и 🔗 дубли по сети">Обмен отметками по сети…</button>
     <span class="meta imp-bar-meta">${batches.length ? `Партий импорта: ${batches.length}` : "Импортированных подборок пока нет"}</span>
   </div>`;
   const inboxHtml = lanSt?.inbox?.length ? renderLanInboxHtml(lanSt.inbox, true) : "";
@@ -3621,6 +4246,8 @@ function bindImportListEvents(el, lanSt = null) {
   if (fBtn) fBtn.onclick = () => pickAndPreviewCardsImport();
   const lBtn = $("#btnImpLan");
   if (lBtn) lBtn.onclick = () => openLanModal();
+  const lmBtn = $("#btnImpLanMarks");
+  if (lmBtn) lmBtn.onclick = () => openLanMarksModal(null, "pull");
   if (lanSt?.inbox?.length) {
     bindLanInboxEvents(el.querySelector(".lan-inbox-panel"), lanSt.inbox, () => renderImports());
   }
@@ -3927,6 +4554,7 @@ function setView(v) {
   $("#btnSide").classList.toggle("hidden", v !== "cards");
   $("#btnGroup").classList.toggle("hidden", v !== "cards");
   $(".main").classList.toggle("inner-scroll", v === "cards");
+  if (!["cards", "table", "map"].includes(v)) renderEventFocusBar([]);
   if (v === "dashboard") { renderHeader([]); renderDashboard(); }
   else if (v === "changes") { renderHeader([]); renderChanges(); }
   else if (v === "runs") { renderHeader([]); renderRuns(); }
@@ -4054,6 +4682,7 @@ function renderPresets() {
   bar.querySelectorAll("[data-apply]").forEach(b => b.onclick = () => {
     const p = loadPresets()[+b.dataset.apply];
     if (!p) return;
+    EVENT_FOCUS = null;
     applyFilterState(p.state);
     saveFilterState();
     renderPresets();
@@ -4090,6 +4719,7 @@ function renderPresets() {
 
 function resetFilters() {
   clearTimeout(_filterTimer);
+  EVENT_FOCUS = null;
   // по умолчанию всё включено, кроме посёлков, «без координат», «объединённых», «Избранного» и «Скрытых»; «исключить дизлайки» — включено
   $$("#filters input[type=checkbox]").forEach(i => i.checked = !(i.value === "C" || i.id === "fManual" || ["fNoCoords", "fLiked", "fHidden"].includes(i.id)));
   $("#fPmin").value = $("#fPmax").value = $("#fAmin").value = $("#fKmin").value = $("#fKmax").value = $("#fYmin").value = $("#fYmax").value = $("#fText").value = "";
@@ -4119,6 +4749,7 @@ $("#fLiked").addEventListener("input", () => { if ($("#fLiked").checked) $("#fHi
 let _filterTimer = null;
 $("#filters").addEventListener("input", e => {
   if (e.target.closest("#presetBar")) return;
+  if (EVENT_FOCUS && e.target.id !== "fSort") EVENT_FOCUS = null;
   saveFilterState();
   renderPresets();
   clearTimeout(_filterTimer);
@@ -4150,6 +4781,13 @@ $("#btnRun").onclick = async () => {
 $("#btnStop").onclick = () => { post("/api/stop", {}); toast("warn", "Останавливаю сбор", "Текущая страница будет дочитана"); };
 $("#jToggle").onclick = () => { $("#journal").classList.toggle("collapsed"); $("#jDot").classList.add("hidden"); };
 if ($("#lanBtn")) $("#lanBtn").onclick = () => openLanModal();
+if ($("#lanHistBtn")) $("#lanHistBtn").onclick = () => toggleLanDrawer();
+if ($("#lanDrawerBackdrop")) $("#lanDrawerBackdrop").onclick = () => closeLanDrawer();
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && LAN_HIST_OPEN) {
+    closeLanDrawer();
+  }
+});
 $("#jClose").onclick = () => $("#journal").classList.add("collapsed");
 $("#btnSide").onclick = () => setSide(!sideOn());
 $("#btnGroup").onclick = () => setGroup(!groupOn());

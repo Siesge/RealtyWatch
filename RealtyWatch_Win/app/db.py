@@ -118,6 +118,22 @@ CREATE TABLE IF NOT EXISTS sync_outbox(
     created_at TEXT,
     tries INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS sync_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    direction TEXT DEFAULT 'in',
+    kind TEXT NOT NULL,
+    peer_id TEXT,
+    peer_name TEXT,
+    req_id TEXT,
+    batch_id INTEGER,
+    title TEXT,
+    detail TEXT,
+    keys_json TEXT DEFAULT '[]',
+    cats_json TEXT DEFAULT '{}',
+    preview_json TEXT DEFAULT '[]',
+    seen INTEGER DEFAULT 0
+);
 """
 
 # Колонки, добавленные после первой версии (ALTER TABLE для старых баз)
@@ -139,6 +155,8 @@ CREATE INDEX IF NOT EXISTS ix_imp_items_batch ON import_items(batch_id);
 CREATE INDEX IF NOT EXISTS ix_imp_items_key ON import_items(source, source_id);
 CREATE INDEX IF NOT EXISTS ix_imp_notes_key ON imported_notes(source, source_id);
 CREATE INDEX IF NOT EXISTS ix_runs_launch ON runs(launch_key);
+CREATE INDEX IF NOT EXISTS ix_sync_hist_ts ON sync_history(ts DESC, id DESC);
+CREATE INDEX IF NOT EXISTS ix_sync_hist_req ON sync_history(req_id);
 """
 
 FIELDS = [
@@ -187,7 +205,7 @@ def connect():
     return con
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Полный перечень колонок развивающихся таблиц: гарантирует бесконфликтную миграцию базы
 # с любой прошлой версии RealtyWatch без потери заметок, лайков, дизлайков и ручных объединений.
@@ -240,6 +258,12 @@ TABLE_MIGRATIONS = {
     "sync_outbox": {
         "peer_id": "TEXT", "kind": "TEXT", "event_id": "TEXT",
         "payload_path": "TEXT", "created_at": "TEXT", "tries": "INTEGER DEFAULT 0",
+    },
+    "sync_history": {
+        "ts": "TEXT", "direction": "TEXT DEFAULT 'in'", "kind": "TEXT",
+        "peer_id": "TEXT", "peer_name": "TEXT", "req_id": "TEXT", "batch_id": "INTEGER",
+        "title": "TEXT", "detail": "TEXT", "keys_json": "TEXT DEFAULT '[]'",
+        "cats_json": "TEXT DEFAULT '{}'", "preview_json": "TEXT DEFAULT '[]'", "seen": "INTEGER DEFAULT 0",
     },
 }
 

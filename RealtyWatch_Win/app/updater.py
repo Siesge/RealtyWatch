@@ -40,7 +40,7 @@ log = logging.getLogger("realtywatch")
 
 GITHUB_REPO = "Siesge/RealtyWatch"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-USER_AGENT = "RealtyWatch-Updater/1.6 (+https://github.com/Siesge/RealtyWatch)"
+USER_AGENT = "RealtyWatch-Updater/1.7 (+https://github.com/Siesge/RealtyWatch)"
 
 INTERVAL_SECONDS = {
     "day": 86400,
