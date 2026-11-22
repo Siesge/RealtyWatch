@@ -33,6 +33,7 @@ def default_name():
 def _snapshot(dest):
     """Согласованная копия базы (даже во время записи) через backup API SQLite."""
     src = db.connect()
+    history.ensure_snapshots_fresh(src)
     out = sqlite3.connect(dest)
     src.backup(out)
     out.close()
@@ -43,12 +44,14 @@ def stats():
     con = db.connect()
     r = con.execute("""SELECT COUNT(*) n, COUNT(DISTINCT object_id) objects, SUM(excluded IS NULL AND active=1) passing,
                        (SELECT COUNT(*) FROM likes) likes FROM listings""").fetchone()
+    manual_merges = len(dedupe.active_manual_merges(con)[0])
     con.close()
     img_files = [p for p in IMAGES.rglob("*") if p.is_file() and p.suffix != ".part"]
     db_size = sum(p.stat().st_size for p in DB_DIR.glob("realty.db*"))
     backups = sorted(BACKUPS.glob("*.zip"), key=lambda p: p.stat().st_mtime) if BACKUPS.exists() else []
     last = backups[-1] if backups else None
     return {"listings": r["n"], "objects": r["objects"], "passing": r["passing"] or 0, "likes": r["likes"],
+            "manual_merges": manual_merges,
             "images": len(img_files), "size_mb": round((db_size + sum(p.stat().st_size for p in img_files)) / 2**20, 1),
             "folder": str(DB_DIR), "backups": len(backups),
             "last_backup": {"name": last.name, "ts": datetime.fromtimestamp(last.stat().st_mtime).isoformat(timespec="seconds"),
@@ -219,11 +222,17 @@ def _merge(imported):
         col_list = ",".join(cols)
         added = con.execute(f"""INSERT INTO listings({col_list}) SELECT {col_list} FROM imp.listings i
             WHERE NOT EXISTS (SELECT 1 FROM listings m WHERE m.source=i.source AND m.source_id=i.source_id)""").rowcount
-        upd_cols = [c for c in cols if c not in ("source", "source_id", "first_seen")]
+        upd_cols = [c for c in cols if c not in ("source", "source_id", "first_seen", "imported_only")]
         updated = con.execute(f"""UPDATE listings SET ({",".join(upd_cols)}) =
             (SELECT {",".join("i." + c for c in upd_cols)} FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id)
             WHERE EXISTS (SELECT 1 FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id
                           AND i.last_seen > listings.last_seen)""").rowcount
+        if "imported_only" in imp_cols:
+            con.execute("""UPDATE listings SET imported_only=0
+                WHERE COALESCE(imported_only, 0) != 0
+                  AND EXISTS (SELECT 1 FROM imp.listings i
+                              WHERE i.source=listings.source AND i.source_id=listings.source_id
+                                AND COALESCE(i.imported_only, 0)=0)""")
         con.execute("""UPDATE listings SET first_seen = (SELECT MIN(i.first_seen) FROM imp.listings i
             WHERE i.source=listings.source AND i.source_id=listings.source_id AND i.first_seen < listings.first_seen)
             WHERE EXISTS (SELECT 1 FROM imp.listings i WHERE i.source=listings.source AND i.source_id=listings.source_id
@@ -244,8 +253,79 @@ def _merge(imported):
                   AND (NOT EXISTS (SELECT 1 FROM notes m WHERE m.source=i.source AND m.source_id=i.source_id)
                        OR COALESCE(i.ts, '') > COALESCE((SELECT m.ts FROM notes m WHERE m.source=i.source AND m.source_id=i.source_id), ''))
                 ON CONFLICT(source, source_id) DO UPDATE SET text=excluded.text, ts=excluded.ts""")
+        if con.execute("SELECT 1 FROM imp.sqlite_master WHERE type='table' AND name='imported_notes'").fetchone():
+            con.execute("""INSERT INTO imported_notes(source, source_id, origin_id, origin_name, text, ts, updated_at, batch_id)
+                SELECT i.source, i.source_id, i.origin_id, i.origin_name, i.text, i.ts, i.updated_at, NULL
+                FROM imp.imported_notes i
+                WHERE COALESCE(i.text, '') != ''
+                  AND (NOT EXISTS (SELECT 1 FROM imported_notes m
+                                   WHERE m.source=i.source AND m.source_id=i.source_id AND m.origin_id=i.origin_id)
+                       OR COALESCE(i.updated_at, i.ts, '') > COALESCE(
+                           (SELECT COALESCE(m.updated_at, m.ts, '') FROM imported_notes m
+                            WHERE m.source=i.source AND m.source_id=i.source_id AND m.origin_id=i.origin_id), ''))
+                ON CONFLICT(source, source_id, origin_id) DO UPDATE SET
+                    origin_name=excluded.origin_name, text=excluded.text, ts=excluded.ts, updated_at=excluded.updated_at""")
+        if con.execute("SELECT 1 FROM imp.sqlite_master WHERE type='table' AND name='manual_merges'").fetchone():
+            _merge_manual_merges(con)
         con.commit()
         con.execute("DETACH DATABASE imp")
         return {"added": added, "updated": updated}
     finally:
         con.close()
+
+
+def _merge_manual_merges(con):
+    """Объединяет таблицы manual_merges основной и импортируемой баз без разрыва пересекающихся связок."""
+    main_rows = [dict(r) for r in con.execute("SELECT source, source_id, group_id, is_primary, ts FROM manual_merges")]
+    imp_rows = [dict(r) for r in con.execute("SELECT source, source_id, group_id, is_primary, ts FROM imp.manual_merges")]
+    if not imp_rows:
+        return
+    if not main_rows:
+        con.executemany(
+            "INSERT OR IGNORE INTO manual_merges(source, source_id, group_id, is_primary, ts) VALUES(?,?,?,?,?)",
+            [(r["source"], r["source_id"], r["group_id"], r["is_primary"], r["ts"]) for r in imp_rows],
+        )
+        dedupe.clean_manual_merges(con)
+        return
+    by_key, by_tag, info = {}, {}, {}
+    for side, src_rows in (("main", main_rows), ("imp", imp_rows)):
+        for r in src_rows:
+            k = (r["source"], str(r["source_id"]))
+            tag = (side, r["group_id"])
+            by_key.setdefault(k, set()).add(tag)
+            by_tag.setdefault(tag, set()).add(k)
+            info.setdefault(k, []).append((side, r))
+    seen_k, used_gids, out = set(), set(), []
+    for k0 in sorted(by_key):
+        if k0 in seen_k:
+            continue
+        comp_keys, comp_tags = set(), set()
+        stack = [k0]
+        seen_k.add(k0)
+        while stack:
+            k = stack.pop()
+            comp_keys.add(k)
+            for tag in by_key[k]:
+                if tag in comp_tags:
+                    continue
+                comp_tags.add(tag)
+                for nk in by_tag[tag]:
+                    if nk not in seen_k:
+                        seen_k.add(nk)
+                        stack.append(nk)
+        if len(comp_keys) < 2:
+            continue
+        cands = [(1 if r["is_primary"] else 0, r["ts"] or "", 1 if side == "main" else 0, k, r["group_id"])
+                 for k in comp_keys for side, r in info[k]]
+        _, win_ts, _, prim_key, win_gid = max(cands)
+        if win_gid in used_gids:
+            win_gid = f"{prim_key[0]}:{prim_key[1]}"
+        used_gids.add(win_gid)
+        ts = max((r["ts"] or "" for k in comp_keys for _, r in info[k]), default=win_ts)
+        for src, sid in sorted(comp_keys):
+            out.append((src, sid, win_gid, 1 if (src, sid) == prim_key else 0, ts))
+    con.execute("DELETE FROM manual_merges")
+    con.executemany(
+        "INSERT OR REPLACE INTO manual_merges(source, source_id, group_id, is_primary, ts) VALUES(?,?,?,?,?)", out
+    )
+    dedupe.clean_manual_merges(con)

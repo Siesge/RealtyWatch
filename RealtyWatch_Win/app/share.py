@@ -14,7 +14,7 @@ import html
 import json
 from pathlib import Path
 
-from . import images
+from . import dedupe, images
 from .paths import WEB
 
 SRC = {"cian": "ЦИАН", "avito": "Авито", "yandex": "Яндекс"}
@@ -141,42 +141,54 @@ def liked_objects(con):
         hist.setdefault((h["source"], h["source_id"]), []).append((h["ts"], h["price"]))
     notes = {(r["source"], r["source_id"]): (r["text"] or "", r["ts"] or "")
              for r in con.execute("SELECT source, source_id, text, ts FROM notes")}
+    by_group, primaries = dedupe.active_manual_merges(con)
+    merged_keys = {k for ks in by_group.values() for k in ks}
     groups = {}
     for r in rows:
+        key = (r["source"], str(r["source_id"]))
         r["flags"] = json.loads(r["flags"]) if r["flags"] else {}
         r["raw"] = json.loads(r["raw"]) if r["raw"] else {}
-        r["history"] = hist.get((r["source"], r["source_id"]), [])
-        r["note"], r["note_ts"] = notes.get((r["source"], r["source_id"]), ("", ""))
+        r["history"] = hist.get(key, [])
+        r["note"], r["note_ts"] = notes.get(key, ("", ""))
         r["file"] = images.local_path(r["source"], r["source_id"])
+        r["manual_merged"] = key in merged_keys
+        r["manual_primary"] = key in primaries
         groups.setdefault(r["object_id"], []).append(r)
     objs = []
     for oid, items in groups.items():
-        items.sort(key=lambda i: (-((0 if i["excluded"] else 8) + (4 if i["active"] else 0)
-                                    + (2 if i["file"] else 0) + (1 if i["lat"] is not None else 0)), i["first_seen"]))
+        items.sort(key=lambda i: (not i["manual_primary"],
+                                    -((0 if i["excluded"] else 8) + (4 if i["active"] else 0)
+                                      + (2 if i["file"] else 0) + (1 if i["lat"] is not None else 0)),
+                                    i["first_seen"]))
         p = items[0]
+        manual_merged = any(i["manual_merged"] for i in items)
         live = [i for i in items if i["active"]]
         prices = [i["price"] for i in (live or items) if i["price"]]
         reno = sorted((i["renovation"] for i in items if i["renovation"]), key=lambda r: -RENO_RANK.get(r, 0))
         flags = {}
         for i in items:
             flags.update(i["flags"] or {})
-        note = max(((i["note_ts"], i["note"]) for i in items if i["note"]), default=("", ""))[1]
+        note = p["note"] if (manual_merged and p["note"]) else max(
+            ((i["note_ts"], i["note"]) for i in items if i["note"]), default=("", ""))[1]
         area = p["area"]
         price = min(prices) if prices else None
         objs.append({
-            "id": oid, "items": items, "p": p, "flags": flags,
-            "img": next((i for i in items if i["file"]), None),
+            "id": oid, "items": items, "p": p, "flags": flags, "manual_merged": manual_merged,
+            "img": p if (manual_merged and p["file"]) else next((i for i in items if i["file"]), None),
             "sources": sorted({i["source"] for i in items}),
             "price": price, "price_max": max(prices) if prices else None,
             "price_m2": price / area if price and area else None,
             "active": any(i["active"] for i in items),
             "excluded": p["excluded"] if all(i["excluded"] for i in items) else None,
-            "renovation": p["renovation"] if (p["excluded"] or not reno) else reno[0],
+            "renovation": (p["renovation"] or (reno[0] if reno else None)) if manual_merged
+            else (p["renovation"] if (p["excluded"] or not reno) else reno[0]),
             "relisted": _relisted(items, price),
             "note": note,
             "first_seen": min(i["first_seen"] for i in items),
             "zone": p["zone"], "rooms": p["rooms"], "area": area, "floor": p["floor"], "floors": p["floors"],
-            "address": sorted((i["address"] for i in items if i["address"]), key=len, reverse=True)[0] if any(i["address"] for i in items) else "",
+            "address": (p["address"] or next((i["address"] for i in items if i["address"]), "")) if manual_merged
+            else (sorted((i["address"] for i in items if i["address"]), key=len, reverse=True)[0]
+                  if any(i["address"] for i in items) else ""),
             "text": " ".join(
                 [*(f'{i["title"] or ""} {i["address"] or ""} {i["description"] or ""}' for i in items), note]
             ).lower(),
@@ -208,6 +220,8 @@ def _media(o):
 
 def _tags(o):
     t = []
+    if o.get("manual_merged"):
+        t.append('<span class="tag manual">объединено вручную</span>')
     if o["renovation"]:
         good = "bad" if o["renovation"] == "none" else "good"
         t.append(f'<span class="tag {good}">{RENO.get(o["renovation"], o["renovation"])}</span>')
@@ -284,6 +298,8 @@ def _card(o, n):
     rooms = "студия" if o["rooms"] == 0 else "—" if o["rooms"] is None else o["rooms"]
     n_items = len(o["items"])
     sites = f'<span class="pill multi">{len(o["sources"])} {plural(len(o["sources"]), "сайт", "сайта", "сайтов")}</span>' if len(o["sources"]) > 1 else ""
+    if not sites and o.get("manual_merged"):
+        sites = '<span class="pill manual">вручную</span>'
     return f"""<article class="card {"excl" if o["excluded"] else ""} {"" if o["active"] else "inactive"}" {_data(o, n)}>
     {_media(o)}
       <div class="media-top"><span class="left"><span class="pill zone-{o["zone"]}">{ZONE_SHORT.get(o["zone"], o["zone"])}</span>{sites}</span></div>

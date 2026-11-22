@@ -66,11 +66,20 @@ class Yandex(Scraper):
         return so.get("entities") or [], pager
 
     def listings(self):
-        index, pages, limit = 0, 1, self.site.get("max_pages", 40)
-        total, ids = None, set()
+        ck = self.checkpoint
+        if ck.get("pass_finished"):
+            ck.clear()
+        index = int(ck.get("index", 0))
+        pages = int(ck.get("pages", 1))
+        limit = self.site.get("max_pages", 40)
+        total = ck.get("total")
+        ids = set(ck.get("ids") or ())
+        if index > 0:
+            self.log(f"продолжение со страницы {index + 1}" + (f" из {min(pages, limit)}" if pages > 1 else ""))
+            self.progress(page=index, pages=min(pages, limit), total=total)
         while index < pages and index < limit:
             offers, pager = self._load(index)
-            pages = pager.get("totalPages") or 1
+            pages = pager.get("totalPages") or pages or 1
             total = pager.get("totalItems", total)
             if not offers and index + 1 < pages:
                 self.log(f"страница {index + 1}/{pages} пустая — повторяю")
@@ -78,16 +87,18 @@ class Yandex(Scraper):
                 offers, pager = self._load(index)
                 if not offers:
                     self.empty_page(index + 1, pages)
-            self.progress(page=index + 1, pages=min(pages, limit), total=pager.get("totalItems"))
+            self.progress(page=index + 1, pages=min(pages, limit), total=pager.get("totalItems", total))
             self.log(f"страница {index + 1}/{pages}: {len(offers)} объявлений")
             for o in offers:
                 ids.add(str(o.get("offerId")))
                 if o.get("offerType") == "SELL" and o.get("offerCategory") in (None, "APARTMENT"):
                     yield self._normalize(o)
             index += 1
+            self.save_checkpoint(index=index, pages=pages, total=total, ids=sorted(ids))
             if index < pages and index < limit:
                 self.wait()
         self.finish(index + 1, pages, limit, len(ids), total)
+        ck["pass_finished"] = True
 
     def verify(self, row):
         """Страница объявления: offerCard.card.active / obsolete."""

@@ -1,7 +1,9 @@
 """Настройки: значения по умолчанию + пользовательский data/settings.json."""
 import copy
 import json
+import socket
 import threading
+import uuid
 
 from .paths import DB_DIR
 
@@ -44,9 +46,12 @@ DEFAULTS = {
     # «Закрыть» закрывает программу (значок в трее и уведомления показываются, пока включена опция или расписание).
     "ui": {"tray_on_close": True},
     "server": {"port": 8765},
+    "lan": {"enabled": False, "port": 8766, "auto_discovery": True, "device_id": "", "device_name": ""},
+    "updates": {"auto_check": True, "interval": "week"},
 }
 
 _lock = threading.Lock()
+_id_lock = threading.Lock()
 _watchers = []
 
 
@@ -83,3 +88,30 @@ def save(cfg):
             fn(cfg)
         except Exception:
             pass
+
+
+def ensure_device_identity(con=None):
+    """Гарантирует наличие постоянного UUID (device_id) и понятного имени устройства для обмена и LAN."""
+    with _id_lock:
+        cfg = load()
+        lan = cfg.setdefault("lan", {})
+        dev_id = str(lan.get("device_id") or "").strip()
+        if not dev_id and con is not None:
+            row = con.execute("SELECT value FROM meta WHERE key='device_id'").fetchone()
+            if row and row[0]:
+                dev_id = str(row[0]).strip()
+        if not dev_id:
+            dev_id = str(uuid.uuid4())
+        dev_name = str(lan.get("device_name") or "").strip()
+        if not dev_name:
+            dev_name = (socket.gethostname() or "").strip() or "RealtyWatch"
+        if lan.get("device_id") != dev_id or lan.get("device_name") != dev_name:
+            lan["device_id"] = dev_id
+            lan["device_name"] = dev_name
+            save(cfg)
+        if con is not None:
+            row = con.execute("SELECT value FROM meta WHERE key='device_id'").fetchone()
+            if not row or str(row[0] or "") != dev_id:
+                con.execute("INSERT OR REPLACE INTO meta VALUES('device_id', ?)", (dev_id,))
+                con.commit()
+        return {"device_id": dev_id, "device_name": dev_name}

@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS likes(source TEXT, source_id TEXT, ts TEXT, PRIMARY K
 CREATE TABLE IF NOT EXISTS dislikes(source TEXT, source_id TEXT, ts TEXT, PRIMARY KEY(source, source_id));
 -- Личные заметки к квартире (по каждому объявлению объекта, как лайк/дизлайк — чтобы не терялись при пересборке)
 CREATE TABLE IF NOT EXISTS notes(source TEXT, source_id TEXT, text TEXT, ts TEXT, PRIMARY KEY(source, source_id));
+-- Ручное объединение карточек: объявления одной group_id склеиваются поверх автоматических правил;
+-- is_primary=1 — главное объявление первой карточки, от которого берутся описание и все параметры
+CREATE TABLE IF NOT EXISTS manual_merges(
+    source TEXT NOT NULL, source_id TEXT NOT NULL, group_id TEXT NOT NULL,
+    is_primary INTEGER DEFAULT 0, ts TEXT, PRIMARY KEY(source, source_id)
+);
 -- События рынка для экрана «Изменения»: new | price | removed | returned.
 -- baseline=1 — объявление попало в базу при первичной загрузке сайта (не новое для рынка)
 CREATE TABLE IF NOT EXISTS events(
@@ -44,6 +50,74 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE TABLE IF NOT EXISTS snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, run_id INTEGER, data TEXT);
 -- Служебные отметки базы: например, по какой версии правил собраны объекты (dedupe_rules)
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+-- Пакеты импорта карточек (.rwcards.zip или LAN)
+CREATE TABLE IF NOT EXISTS import_batches(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT,
+    channel TEXT,
+    origin_id TEXT,
+    origin_name TEXT,
+    source_file TEXT,
+    bundle_id TEXT,
+    likes_mode TEXT,
+    stats_json TEXT,
+    total_listings INTEGER DEFAULT 0,
+    total_cards INTEGER DEFAULT 0,
+    new_cards INTEGER DEFAULT 0,
+    matched_cards INTEGER DEFAULT 0,
+    duplicate_cards INTEGER DEFAULT 0,
+    stale_cards INTEGER DEFAULT 0,
+    updated_notes INTEGER DEFAULT 0
+);
+-- Элементы каждого пакета импорта (срез карточки для истории и просмотра неактуальных)
+CREATE TABLE IF NOT EXISTS import_items(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    export_card_id TEXT,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    status TEXT,
+    stale_reason TEXT,
+    sender_liked INTEGER DEFAULT 0,
+    sender_active INTEGER DEFAULT 1,
+    sender_last_seen TEXT,
+    sender_price INTEGER,
+    snapshot_json TEXT
+);
+-- Чужие заметки по объявлениям с указанием отправителя (личная таблица notes остаётся неприкосновенной)
+CREATE TABLE IF NOT EXISTS imported_notes(
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    origin_id TEXT NOT NULL,
+    origin_name TEXT,
+    text TEXT,
+    ts TEXT,
+    updated_at TEXT,
+    batch_id INTEGER,
+    PRIMARY KEY(source, source_id, origin_id)
+);
+-- Доверенные пиры локальной сети и очередь синхронизации (база для следующих этапов)
+CREATE TABLE IF NOT EXISTS sync_peers(
+    device_id TEXT PRIMARY KEY,
+    name TEXT,
+    ip TEXT,
+    port INTEGER,
+    token_hash TEXT,
+    peer_token TEXT,
+    paired_at TEXT,
+    last_seen TEXT,
+    last_db_ts TEXT,
+    live_cfg_json TEXT
+);
+CREATE TABLE IF NOT EXISTS sync_outbox(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer_id TEXT,
+    kind TEXT,
+    event_id TEXT,
+    payload_path TEXT,
+    created_at TEXT,
+    tries INTEGER DEFAULT 0
+);
 """
 
 # Колонки, добавленные после первой версии (ALTER TABLE для старых баз)
@@ -53,12 +127,18 @@ MIGRATIONS = {
     "missed": "INTEGER DEFAULT 0",     # полных прогонов подряд, где объявления не было в поиске
     "removed_at": "TEXT",              # когда снято
     "removed_reason": "TEXT",          # почему считается снятым (подсказка в интерфейсе)
+    "imported_only": "INTEGER DEFAULT 0",  # 1 — добавлено выборочным импортом, пока не встречалось в своём сборе
 }
 INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_obj ON listings(object_id);
 CREATE INDEX IF NOT EXISTS ix_match ON listings(rooms, floor);
 CREATE INDEX IF NOT EXISTS ix_ev ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_ev_l ON events(source, source_id);
+CREATE INDEX IF NOT EXISTS ix_mm_g ON manual_merges(group_id);
+CREATE INDEX IF NOT EXISTS ix_imp_items_batch ON import_items(batch_id);
+CREATE INDEX IF NOT EXISTS ix_imp_items_key ON import_items(source, source_id);
+CREATE INDEX IF NOT EXISTS ix_imp_notes_key ON imported_notes(source, source_id);
+CREATE INDEX IF NOT EXISTS ix_runs_launch ON runs(launch_key);
 """
 
 FIELDS = [
@@ -107,26 +187,83 @@ def connect():
     return con
 
 
+SCHEMA_VERSION = 4
+
+# Полный перечень колонок развивающихся таблиц: гарантирует бесконфликтную миграцию базы
+# с любой прошлой версии RealtyWatch без потери заметок, лайков, дизлайков и ручных объединений.
+TABLE_MIGRATIONS = {
+    "listings": {
+        "url": "TEXT", "title": "TEXT", "price": "INTEGER", "price_m2": "INTEGER",
+        "rooms": "INTEGER", "area": "REAL", "living_area": "REAL", "kitchen_area": "REAL",
+        "floor": "INTEGER", "floors": "INTEGER", "address": "TEXT", "lat": "REAL", "lon": "REAL", "zone": "TEXT",
+        "renovation": "TEXT", "renovation_raw": "TEXT", "building_type": "TEXT", "build_year": "INTEGER",
+        "is_new_building": "INTEGER", "seller_type": "TEXT", "description": "TEXT", "photo": "TEXT",
+        "published_at": "TEXT", "flags": "TEXT", "excluded": "TEXT", "fetch_mode": "TEXT",
+        "details_fetched": "INTEGER DEFAULT 0", "cluster_key": "TEXT", "raw": "TEXT",
+        "first_seen": "TEXT", "last_seen": "TEXT", "active": "INTEGER DEFAULT 1",
+        **MIGRATIONS,
+    },
+    "runs": {
+        "mode": "TEXT", "started": "TEXT", "finished": "TEXT", "status": "TEXT",
+        "pages": "INTEGER", "found": "INTEGER", "new": "INTEGER", "changed": "INTEGER",
+        "removed": "INTEGER", "message": "TEXT",
+        "declared": "INTEGER", "collected": "INTEGER", "requests": "INTEGER",
+        "launch_key": "TEXT", "resume_state": "TEXT",
+    },
+    "likes": {"ts": "TEXT"},
+    "dislikes": {"ts": "TEXT"},
+    "notes": {"text": "TEXT", "ts": "TEXT"},
+    "manual_merges": {"group_id": "TEXT", "is_primary": "INTEGER DEFAULT 0", "ts": "TEXT"},
+    "events": {
+        "ts": "TEXT", "run_id": "INTEGER", "source": "TEXT", "source_id": "TEXT",
+        "kind": "TEXT", "old_value": "INTEGER", "new_value": "INTEGER", "note": "TEXT", "baseline": "INTEGER DEFAULT 0",
+    },
+    "snapshots": {"ts": "TEXT", "run_id": "INTEGER", "data": "TEXT"},
+    "import_batches": {
+        "ts": "TEXT", "channel": "TEXT", "origin_id": "TEXT", "origin_name": "TEXT",
+        "source_file": "TEXT", "bundle_id": "TEXT", "likes_mode": "TEXT", "stats_json": "TEXT",
+        "total_listings": "INTEGER DEFAULT 0", "total_cards": "INTEGER DEFAULT 0",
+        "new_cards": "INTEGER DEFAULT 0", "matched_cards": "INTEGER DEFAULT 0",
+        "duplicate_cards": "INTEGER DEFAULT 0", "stale_cards": "INTEGER DEFAULT 0",
+        "updated_notes": "INTEGER DEFAULT 0",
+    },
+    "import_items": {
+        "export_card_id": "TEXT", "status": "TEXT", "stale_reason": "TEXT",
+        "sender_liked": "INTEGER DEFAULT 0", "sender_active": "INTEGER DEFAULT 1",
+        "sender_last_seen": "TEXT", "sender_price": "INTEGER", "snapshot_json": "TEXT",
+    },
+    "imported_notes": {"origin_name": "TEXT", "text": "TEXT", "ts": "TEXT", "updated_at": "TEXT", "batch_id": "INTEGER"},
+    "sync_peers": {
+        "name": "TEXT", "ip": "TEXT", "port": "INTEGER", "token_hash": "TEXT", "peer_token": "TEXT",
+        "paired_at": "TEXT", "last_seen": "TEXT", "last_db_ts": "TEXT", "live_cfg_json": "TEXT",
+    },
+    "sync_outbox": {
+        "peer_id": "TEXT", "kind": "TEXT", "event_id": "TEXT",
+        "payload_path": "TEXT", "created_at": "TEXT", "tries": "INTEGER DEFAULT 0",
+    },
+}
+
+
 def migrate(con):
-    """Создаёт таблицы и добавляет недостающие колонки (в т.ч. в импортируемой старой базе)."""
+    """Создаёт таблицы и добавляет недостающие колонки (в т.ч. в старой базе после обновления версии)."""
     con.executescript(SCHEMA)
-    cols = {r[1] for r in con.execute("PRAGMA table_info(listings)")}
-    for name, decl in MIGRATIONS.items():
-        if name not in cols:
-            con.execute(f"ALTER TABLE listings ADD COLUMN {name} {decl}")
-    run_cols = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
-    for name, decl in RUN_MIGRATIONS.items():
-        if name not in run_cols:
-            con.execute(f"ALTER TABLE runs ADD COLUMN {name} {decl}")
+    for table, expected in TABLE_MIGRATIONS.items():
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for name, decl in expected.items():
+            if name not in have:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
     con.executescript(INDEXES)
+    con.execute("INSERT OR REPLACE INTO meta VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
     con.commit()
 
 
 # Колонки прогонов, добавленные позже
 RUN_MIGRATIONS = {
-    "declared": "INTEGER",   # сколько объявлений заявил сайт
-    "collected": "INTEGER",  # сколько уникальных собрано
-    "requests": "INTEGER",   # запросов к сайту за прогон
+    "declared": "INTEGER",      # сколько объявлений заявил сайт
+    "collected": "INTEGER",     # сколько уникальных собрано
+    "requests": "INTEGER",      # запросов к сайту за прогон
+    "launch_key": "TEXT",       # идентификатор общего запуска (сохраняет принадлежность при донажатии «Продолжить»)
+    "resume_state": "TEXT",     # JSON чекпоинта незавершённого прогона (NULL — завершён или закрыт новым запуском)
 }
 
 
@@ -201,13 +338,14 @@ def upsert(con, item, run_id=None, baseline=0):
         event(con, item["source"], item["source_id"], "returned", new=row["price"], note=old.get("removed_reason"), run_id=run_id, ts=ts)
     con.execute(
         f"UPDATE listings SET {','.join(f'{k}=?' for k in FIELDS)}, last_seen=?, active=1, missed=0, "
-        f"removed_at=NULL, removed_reason=NULL WHERE source=? AND source_id=?",
+        f"imported_only=0, removed_at=NULL, removed_reason=NULL WHERE source=? AND source_id=?",
         [*[row[k] for k in FIELDS], ts, item["source"], item["source_id"]],
     )
     return "changed" if changed else "same"
 
 
 def missing(con, source, seen):
-    """Активные объявления сайта, которых не было в поиске этого (полного) прогона; seen — полученные номера."""
-    return [dict(r) for r in con.execute("SELECT * FROM listings WHERE source=? AND active=1", (source,))
+    """Активные объявления сайта (собранные локально), которых не было в поиске этого (полного) прогона; seen — полученные номера."""
+    return [dict(r) for r in con.execute(
+        "SELECT * FROM listings WHERE source=? AND active=1 AND COALESCE(imported_only, 0)=0", (source,))
             if str(r["source_id"]) not in seen]

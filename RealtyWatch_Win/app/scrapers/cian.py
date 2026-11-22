@@ -264,13 +264,16 @@ class Cian(Scraper):
 
         return self.fetch(via_http, via_browser)
 
-    def _pages(self, repair, label, first):
+    def _pages(self, repair, label, first, start_page=1):
         """Все страницы одной выдачи по очереди: (страница, всего страниц, заявлено сайтом, объявления).
         first — уже загруженная первая страница (объявления, заявлено сайтом). После последней страницы
         в self.last_pages — (следующая страница, всего страниц, ограничение) для finish()."""
-        page, limit = 1, self.site.get("max_pages", 40)
+        page, limit = max(1, int(start_page)), self.site.get("max_pages", 40)
         offers, total = first
         pages = self._count(total)
+        if page > pages or page > limit:
+            self.last_pages = (page, pages, limit)
+            return
         while True:
             if page > 1:
                 offers, total = self._load(page, repair)
@@ -383,49 +386,100 @@ class Cian(Scraper):
             pass
 
     def listings(self):
-        if self.mode == "auto" and not self.use_browser and self._http_recently_blocked():
+        ck = self.checkpoint
+        if ck.get("pass_finished"):
+            ck.clear()
+        if self.mode == "auto" and not self.use_browser and (ck.get("use_browser") or self._http_recently_blocked()):
             self.use_browser = True
-            self.log("HTTP ЦИАН блокировался менее 12 ч назад — сразу открываю браузер")
+            if not ck.get("use_browser"):
+                self.log("HTTP ЦИАН блокировался менее 12 ч назад — сразу открываю браузер")
         limit = self.site.get("max_pages", 40)
-        known = self._known_repairs()
-        if known:
+        mode_kind = ck.get("cian_mode")
+        if mode_kind == "incremental":
+            known = ck.get("known") or self._known_repairs() or {}
+            self._known_extra_ids = set(ck.get("known_extra_ids") or ())
             yield from self._listings_incremental(limit, known)
-        else:
+        elif mode_kind == "full":
             yield from self._listings_full(limit)
+        else:
+            known = self._known_repairs()
+            if known:
+                ck["cian_mode"] = "incremental"
+                ck["known"] = known
+                ck["known_extra_ids"] = sorted(getattr(self, "_known_extra_ids", set()))
+                yield from self._listings_incremental(limit, known)
+            else:
+                ck["cian_mode"] = "full"
+                yield from self._listings_full(limit)
+        ck["pass_finished"] = True
 
     def _listings_full(self, limit):
+        ck = self.checkpoint
         self.skip_missing_ids = set()
         queries = [(code, f"ремонт «{name}», ") for code, (_, name) in REPAIR.items()] + [(None, "")]
         # 0. Первые страницы всех выдач — по ним известно, сколько страниц всего, и полоса прогресса
         # идёт одна на весь сбор, а не заново для каждой выдачи
+        saved_first = ck.setdefault("first", {})
         first = {}
         for n, (code, _) in enumerate(queries):
+            k = "main" if code is None else str(code)
+            if k in saved_first:
+                first[code] = (saved_first[k][0], saved_first[k][1])
+                continue
             first[code] = self._load(1, code)
+            saved_first[k] = [first[code][0], first[code][1]]
+            self.save_checkpoint(first=saved_first)
             if n < len(queries) - 1:
                 self.wait()
         self.declared_main = first[None][1]
         self.planned = sum(min(self._count(t), limit) for _, t in first.values())
-        self.done = 0
-        self.log(f"выдачи по виду ремонта и основная: страниц всего {self.planned}")
-        self.progress(page=0, pages=self.planned, total=self.declared_main)
+        self.done = int(ck.get("done", 0))
+        if not ck.get("logged_plan"):
+            self.log(f"выдачи по виду ремонта и основная: страниц всего {self.planned}")
+            self.progress(page=0, pages=self.planned, total=self.declared_main)
+            ck["logged_plan"] = True
+        else:
+            self.log(f"продолжение сбора ЦИАН: шаг {self.done} из {self.planned}")
+            self.progress(page=min(self.done, self.planned), pages=self.planned, total=self.declared_main)
         # 1. Вид ремонта — по выдаче на каждый вид; запоминается, у какого объявления какой
-        self.repairs = {}   # id → код ремонта ЦИАН
-        extra = {}          # id → объявление из этих выдач, если основной выдаче оно вдруг не встретится
+        self.repairs = {sid: int(c) for sid, c in (ck.get("repairs") or {}).items()}
+        extra = dict(ck.get("extra") or {})
+        done_repairs = set(ck.get("done_repairs") or ())
+        cur_rep = ck.get("cur_rep") or {}
         for code, label in queries[:-1]:
-            for _page, _pages, _total, offers in self._pages(code, label, first[code]):
+            if code in done_repairs:
+                continue
+            start_p = int(cur_rep["next_page"]) if cur_rep.get("code") == code else 1
+            for _page, _pages, _total, offers in self._pages(code, label, first[code], start_page=start_p):
                 for o in offers:
                     sid = str(o.get("cianId") or o.get("id"))
                     self.repairs[sid] = code
                     extra[sid] = o
+                self.save_checkpoint(
+                    done=self.done, repairs=self.repairs, extra=extra,
+                    cur_rep={"code": code, "next_page": _page + 1},
+                )
+            done_repairs.add(code)
+            ck["done_repairs"] = sorted(done_repairs)
+            ck.pop("cur_rep", None)
         # 2. Основная выдача — все квартиры, в том числе те, где вид ремонта не указан
-        ids, total = set(), None
-        for _page, _pages, total, offers in self._pages(None, "", first[None]):
-            for o in offers:
-                item = self._normalize(o, in_main=True)
-                if item["source_id"] not in ids:
-                    ids.add(item["source_id"])
-                    yield item
-        last = self.last_pages
+        ids = set(ck.get("main_ids") or ())
+        total = ck.get("main_total", first[None][1])
+        main_start = int(ck.get("main_next_page", 1))
+        if not ck.get("main_done"):
+            for _page, _pages, total, offers in self._pages(None, "", first[None], start_page=main_start):
+                for o in offers:
+                    item = self._normalize(o, in_main=True)
+                    if item["source_id"] not in ids:
+                        ids.add(item["source_id"])
+                        yield item
+                self.save_checkpoint(
+                    done=self.done, main_ids=sorted(ids), main_total=total,
+                    main_next_page=_page + 1, last_pages=[_page + 1, _pages, limit],
+                )
+            ck["main_done"] = True
+            ck["last_pages"] = list(self.last_pages)
+        last = tuple(ck.get("last_pages") or self.last_pages)
         # Пришло в выдаче по ремонту, но не в основной: в поиске объявление есть, терять его незачем
         for sid, o in extra.items():
             if sid not in ids:
@@ -438,22 +492,48 @@ class Cian(Scraper):
 
     def _listings_incremental(self, limit, known):
         """Ускоренный сбор: основная выдача; выдачи по ремонту — только если встретились новые объявления."""
+        ck = self.checkpoint
         self.skip_missing_ids = set()
-        first_main = self._load(1, None)
+        if "first_main" in ck:
+            first_main = (ck["first_main"][0], ck["first_main"][1])
+        else:
+            first_main = self._load(1, None)
+            ck["first_main"] = [first_main[0], first_main[1]]
+            self.save_checkpoint(first_main=ck["first_main"])
         self.declared_main = first_main[1]
-        self.planned = min(self._count(self.declared_main), limit)
-        self.done = 0
-        self.progress(page=0, pages=self.planned, total=self.declared_main)
-        main_offers, seen_ids, main_total = [], set(), None
-        for _page, _pages, main_total, offers in self._pages(None, "", first_main):
-            for o in offers:
-                sid = str(o.get("cianId") or o.get("id"))
-                if sid not in seen_ids:
-                    seen_ids.add(sid)
-                    main_offers.append((sid, o))
-        last = self.last_pages
-        self.repairs = {sid: code for sid, code in known.items() if code in REPAIR}
-        extra_offers = {}
+        self.planned = max(int(ck.get("planned", 0)), min(self._count(self.declared_main), limit))
+        self.done = int(ck.get("done", 0))
+        if not ck.get("logged_inc"):
+            self.progress(page=0, pages=self.planned, total=self.declared_main)
+            ck["logged_inc"] = True
+        else:
+            self.log(f"продолжение ускоренного сбора ЦИАН: шаг {self.done} из {self.planned}")
+            self.progress(page=min(self.done, self.planned), pages=self.planned, total=self.declared_main)
+        main_offers = [(x[0], x[1]) for x in (ck.get("main_offers") or [])]
+        seen_ids = set(ck.get("seen_ids") or ())
+        main_total = ck.get("main_total", first_main[1])
+        main_start = int(ck.get("main_next_page", 1))
+        if not ck.get("main_done"):
+            for _page, _pages, main_total, offers in self._pages(None, "", first_main, start_page=main_start):
+                for o in offers:
+                    sid = str(o.get("cianId") or o.get("id"))
+                    if sid not in seen_ids:
+                        seen_ids.add(sid)
+                        main_offers.append((sid, o))
+                self.save_checkpoint(
+                    done=self.done, planned=self.planned, main_offers=main_offers,
+                    seen_ids=sorted(seen_ids), main_total=main_total,
+                    main_next_page=_page + 1, last_pages=[_page + 1, _pages, limit],
+                )
+            ck["main_done"] = True
+            ck["last_pages"] = list(self.last_pages)
+        last = tuple(ck.get("last_pages") or self.last_pages)
+        self.repairs = {sid: int(code) for sid, code in known.items() if code in REPAIR}
+        inc_repairs = {sid: int(code) for sid, code in (ck.get("inc_repairs") or {}).items()}
+        self.repairs.update(inc_repairs)
+        extra_offers = dict(ck.get("extra_offers") or {})
+        done_rep_codes = set(ck.get("inc_done_repairs") or ())
+        cur_rep = ck.get("inc_cur_rep") or {}
         unknown = [(sid, o) for sid, o in main_offers if sid not in known]
         if not unknown:
             self.log(f"выдачи по виду ремонта пропущены: все {len(main_offers)} объявлений уже есть в базе")
@@ -462,12 +542,17 @@ class Cian(Scraper):
             prices = [to_int((o.get("bargainTerms") or {}).get("priceRur") or (o.get("bargainTerms") or {}).get("price"))
                       for _, o in unknown]
             max_price = max(prices) if prices and all(prices) else None
-            self.log(f"новых объявлений ЦИАН без известного ремонта: {len(unknown_ids)} — уточняю вид ремонта")
+            if not ck.get("logged_unknown"):
+                self.log(f"новых объявлений ЦИАН без известного ремонта: {len(unknown_ids)} — уточняю вид ремонта")
+                ck["logged_unknown"] = True
             for code, (_, name) in REPAIR.items():
+                if code in done_rep_codes:
+                    continue
                 if unknown_ids <= self.repairs.keys():
                     break
                 label = f"ремонт «{name}», "
-                r_page, r_pages = 1, 1
+                r_page = int(cur_rep["next_page"]) if cur_rep.get("code") == code else 1
+                r_pages = int(cur_rep.get("r_pages", r_page))
                 while r_page <= r_pages:
                     self.wait()
                     offers, r_total = self._load(r_page, code)
@@ -478,7 +563,13 @@ class Cian(Scraper):
                     for o in offers:
                         r_sid = str(o.get("cianId") or o.get("id"))
                         self.repairs[r_sid] = code
+                        inc_repairs[r_sid] = code
                         extra_offers[r_sid] = o
+                    self.save_checkpoint(
+                        done=self.done, planned=self.planned, inc_repairs=inc_repairs,
+                        extra_offers=extra_offers,
+                        inc_cur_rep={"code": code, "next_page": r_page + 1, "r_pages": r_pages},
+                    )
                     if unknown_ids <= self.repairs.keys():
                         break
                     if max_price is not None and offers:
@@ -487,6 +578,9 @@ class Cian(Scraper):
                         if all(page_prices) and min(page_prices) > max_price * 1.05 + 50_000:
                             break
                     r_page += 1
+                done_rep_codes.add(code)
+                ck["inc_done_repairs"] = sorted(done_rep_codes)
+                ck.pop("inc_cur_rep", None)
         for _, o in main_offers:
             yield self._normalize(o, in_main=True)
         for sid, o in extra_offers.items():

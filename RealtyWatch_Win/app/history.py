@@ -1,12 +1,14 @@
 """История рынка: снимок после каждого запуска сбора (точка на графиках дашборда), события (для экрана «Изменения»),
 восстановление истории по уже собранным данным и повторная проверка «снятых» объявлений."""
+import bisect
+import heapq
 import json
 import math
 import statistics
 from collections import defaultdict
 from datetime import datetime
 
-from . import db
+from . import db, dedupe
 
 ZONES = ("A", "B", "C")
 ROOMS = (1, 2, 3)
@@ -28,8 +30,9 @@ def _objects(rows):
     out = []
     for items in objs.values():
         best = min(items, key=lambda r: r["price"] or 10**12)
-        out.append({"price": best["price"], "area": best["area"], "rooms": best["rooms"], "zone": best["zone"],
-                    "ppm": best["price"] / best["area"] if best["price"] and best["area"] else None,
+        head = next((r for r in items if r.get("manual_primary")), best)
+        out.append({"price": best["price"], "area": head["area"], "rooms": head["rooms"], "zone": head["zone"],
+                    "ppm": best["price"] / head["area"] if best["price"] and head["area"] else None,
                     "sources": {r["source"] for r in items}})
     return out
 
@@ -81,9 +84,15 @@ def _event_counts(con, since, until, zone=None):
 
 
 def snapshot(con, run_id=None):
+    ensure_snapshots_fresh(con)
     ts = db.now()
     rows = [dict(r) for r in con.execute(
-        "SELECT source, source_id, object_id, price, area, rooms, zone FROM listings WHERE active=1 AND excluded IS NULL")]
+        "SELECT source, source_id, object_id, price, area, rooms, zone FROM listings "
+        "WHERE active=1 AND excluded IS NULL AND COALESCE(imported_only, 0)=0")]
+    _, primaries = dedupe.active_manual_merges(con)
+    if primaries:
+        for r in rows:
+            r["manual_primary"] = (r["source"], str(r["source_id"])) in primaries
     prev = con.execute("SELECT ts FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
     since = prev["ts"] if prev else None
     data = compute(rows, _event_counts(con, since, ts), _event_counts(con, since, ts, zone="A"))
@@ -137,32 +146,347 @@ def backfill(con):
     merge_launches(con)  # история, снятая по снимку на каждый сайт, сводится к одной точке на запуск
 
 
+class _StatBucket:
+    """Поддерживает статистику среза с ленивой синхронизацией и кэшированием неизменных снимков."""
+
+    __slots__ = ("count", "sum_price", "_p", "_ppm", "_a", "_add_p", "_add_ppm", "_add_a",
+                 "_rem_p", "_rem_ppm", "_rem_a", "_dirty", "_cache")
+
+    def __init__(self):
+        self.count = 0
+        self.sum_price = 0
+        self._p = []
+        self._ppm = []
+        self._a = []
+        self._add_p = []
+        self._add_ppm = []
+        self._add_a = []
+        self._rem_p = []
+        self._rem_ppm = []
+        self._rem_a = []
+        self._dirty = False
+        self._cache = None
+
+    def add(self, price, ppm, area):
+        self.count += 1
+        self._dirty = True
+        self._cache = None
+        if price:
+            self._add_p.append(price)
+            self.sum_price += price
+        if ppm:
+            self._add_ppm.append(ppm)
+        if area:
+            self._add_a.append(area)
+
+    def remove(self, price, ppm, area):
+        self.count -= 1
+        self._dirty = True
+        self._cache = None
+        if price:
+            self._rem_p.append(price)
+            self.sum_price -= price
+        if ppm:
+            self._rem_ppm.append(ppm)
+        if area:
+            self._rem_a.append(area)
+
+    @staticmethod
+    def _sync(arr, adds, rems):
+        if not adds and not rems:
+            return arr
+        if rems:
+            # Пока удалений заметно меньше длины массива, C memmove (pop) и bisect быстрее словаря в Python
+            if not adds and len(rems) <= max(16, len(arr) >> 3):
+                for v in rems:
+                    arr.pop(bisect.bisect_left(arr, v))
+                rems.clear()
+                return arr
+            cnt = {}
+            for v in rems:
+                cnt[v] = cnt.get(v, 0) + 1
+            rems.clear()
+            kept = []
+            get_cnt = cnt.get
+            for x in arr:
+                c = get_cnt(x)
+                if c:
+                    if c == 1:
+                        del cnt[x]
+                    else:
+                        cnt[x] = c - 1
+                else:
+                    kept.append(x)
+            arr = kept
+            if adds:
+                if cnt:
+                    for x in adds:
+                        c = get_cnt(x)
+                        if c:
+                            if c == 1:
+                                del cnt[x]
+                            else:
+                                cnt[x] = c - 1
+                        else:
+                            arr.append(x)
+                else:
+                    arr.extend(adds)
+                arr.sort()
+                adds.clear()
+            return arr
+        if arr and len(adds) <= 12:
+            for v in adds:
+                bisect.insort(arr, v)
+            adds.clear()
+            return arr
+        arr.extend(adds)
+        arr.sort()
+        adds.clear()
+        return arr
+
+    @staticmethod
+    def _med_sorted(xs):
+        n = len(xs)
+        if not n:
+            return None
+        m = n >> 1
+        return round(xs[m] if n & 1 else (xs[m - 1] + xs[m]) / 2)
+
+    def dump(self):
+        if self._cache is not None:
+            return self._cache
+        if self._dirty:
+            self._p = self._sync(self._p, self._add_p, self._rem_p)
+            self._ppm = self._sync(self._ppm, self._add_ppm, self._rem_ppm)
+            self._a = self._sync(self._a, self._add_a, self._rem_a)
+            self._dirty = False
+        np = len(self._p)
+        npm = len(self._ppm)
+        self._cache = {
+            "count": self.count,
+            "median_price": self._med_sorted(self._p),
+            "mean_price": round(self.sum_price / np) if np else None,
+            "median_ppm": self._med_sorted(self._ppm),
+            "mean_ppm": round(sum(self._ppm) / npm) if npm else None,
+            "median_area": self._med_sorted(self._a),
+        }
+        return self._cache
+
+
+def _apply_bucket_delta(state, sign, b_all, b_city, b_z, b_city_r, b_zA_r, city_src, a_src, city_multi, a_multi):
+    price, ppm, area, rooms, zone, srcs = state
+    fn = b_all.add if sign > 0 else b_all.remove
+    fn(price, ppm, area)
+    zb = b_z.get(zone)
+    if zb is not None:
+        (zb.add if sign > 0 else zb.remove)(price, ppm, area)
+    if zone == "A" or zone == "B":
+        (b_city.add if sign > 0 else b_city.remove)(price, ppm, area)
+        rb = b_city_r.get(rooms)
+        if rb is not None:
+            (rb.add if sign > 0 else rb.remove)(price, ppm, area)
+        for s in srcs:
+            if s in city_src:
+                city_src[s] += sign
+        if len(srcs) > 1:
+            city_multi += sign
+    if zone == "A":
+        rb_a = b_zA_r.get(rooms)
+        if rb_a is not None:
+            (rb_a.add if sign > 0 else rb_a.remove)(price, ppm, area)
+        for s in srcs:
+            if s in a_src:
+                a_src[s] += sign
+        if len(srcs) > 1:
+            a_multi += sign
+    return city_multi, a_multi
+
+
+_REMOVED = object()
+
+
 def _write_snapshots(con, points):
     """Восстанавливает снимки рынка на моменты points [(ts, run_id)] по данным базы: какие объявления были
     в продаже на тот момент (появились раньше, сняты позже) и по какой цене (история цен).
     Зоны, отсев и объединение дублей — текущие, поэтому история согласована с нынешними правилами и кругом."""
-    rows = [dict(r) for r in con.execute(
-        "SELECT source, source_id, object_id, area, rooms, zone, first_seen, removed_at, excluded FROM listings")]
+    sorted_pts = sorted(points)
+    if not sorted_pts:
+        con.execute("DELETE FROM meta WHERE key='snapshots_dirty'")
+        con.commit()
+        return
+
+    _, primaries = dedupe.active_manual_merges(con)
     hist = defaultdict(list)
-    for h in con.execute("SELECT source, source_id, ts, price FROM price_history ORDER BY ts"):
-        hist[(h["source"], h["source_id"])].append((h["ts"], h["price"]))
-    rows = [r for r in rows if not r["excluded"]]
-    keys = [(r["source"], r["source_id"]) for r in rows]
-    pos = [0] * len(rows)   # точки идут по времени: указатель в истории цен каждого объявления только растёт
-    prev = None
-    for t, run_id in sorted(points):
-        live = []
-        for i, r in enumerate(rows):
-            h = hist[keys[i]]
-            while pos[i] < len(h) and h[pos[i]][0] <= t:
-                pos[i] += 1
-            if not pos[i] or r["first_seen"] > t or (r["removed_at"] and r["removed_at"] <= t):
+    unsorted_hist = set()
+    for source, sid, ts_h, price in con.execute("SELECT source, source_id, ts, price FROM price_history"):
+        k = (source, sid)
+        hl = hist[k]
+        if hl and ts_h < hl[-1][0]:
+            unsorted_hist.add(k)
+        hl.append((ts_h, price))
+    for k in unsorted_hist:
+        hist[k].sort(key=lambda x: x[0])
+
+    obj_items = defaultdict(list)
+    for src, sid, oid_raw, area, rooms, zone, fs_raw, rem_raw in con.execute(
+        "SELECT source, source_id, object_id, area, rooms, zone, first_seen, removed_at "
+        "FROM listings WHERE (excluded IS NULL OR excluded = '') AND COALESCE(imported_only, 0)=0"
+    ):
+        h = hist.get((src, sid))
+        if not h:
+            continue
+        fs = fs_raw or ""
+        rem = rem_raw or ""
+        birth = fs if fs > h[0][0] else h[0][0]
+        if rem and rem <= birth:
+            continue
+        k = 0
+        nh = len(h)
+        while k < nh and h[k][0] <= birth:
+            k += 1
+        tl = [(birth, h[k - 1][1])]
+        for idx_h in range(k, nh):
+            ts_h, pr_h = h[idx_h]
+            if rem and ts_h >= rem:
+                break
+            if ts_h == tl[-1][0]:
+                tl[-1] = (ts_h, pr_h)
+            elif pr_h != tl[-1][1]:
+                tl.append((ts_h, pr_h))
+        if rem:
+            tl.append((rem, _REMOVED))
+        oid = oid_raw or f"{src}:{sid}"
+        obj_items[oid].append((src, area, rooms, zone, (src, str(sid)) in primaries, tl))
+
+    objects = []
+    obj_ts_list = []
+    obj_pos_list = []
+    heap = []
+    for items in obj_items.values():
+        ts_set = {ts_e for it in items for ts_e, _ in it[5]}
+        ots = sorted(ts_set)
+        oid_idx = len(objects)
+        objects.append(items)
+        obj_ts_list.append(ots)
+        obj_pos_list.append([0] * len(items))
+        heapq.heappush(heap, (ots[0], oid_idx, 0))
+
+    cur_state = [None] * len(objects)
+    b_all = _StatBucket()
+    b_city = _StatBucket()
+    b_z = {z: _StatBucket() for z in ZONES}
+    b_city_r = {k: _StatBucket() for k in ROOMS}
+    b_zA_r = {k: _StatBucket() for k in ROOMS}
+    city_src = {"cian": 0, "avito": 0, "yandex": 0}
+    a_src = {"cian": 0, "avito": 0, "yandex": 0}
+    city_multi = 0
+    a_multi = 0
+
+    ev_rows = con.execute("""
+        SELECT e.ts, e.kind, e.old_value, e.new_value, l.zone
+        FROM events e LEFT JOIN listings l ON l.source=e.source AND l.source_id=e.source_id
+        WHERE e.baseline=0 AND e.ts > '' ORDER BY e.ts
+    """).fetchall()
+    ev_idx = 0
+    n_ev = len(ev_rows)
+
+    heappop = heapq.heappop
+    heappush = heapq.heappush
+    out_rows = []
+    for t, run_id in sorted_pts:
+        while heap and heap[0][0] <= t:
+            _, oid_idx, step_i = heappop(heap)
+            ots = obj_ts_list[oid_idx]
+            n_ots = len(ots)
+            while step_i + 1 < n_ots and ots[step_i + 1] <= t:
+                step_i += 1
+            if step_i + 1 < n_ots:
+                heappush(heap, (ots[step_i + 1], oid_idx, step_i + 1))
+
+            items = objects[oid_idx]
+            lpos = obj_pos_list[oid_idx]
+            best_price = None
+            best_key = 10**12
+            best_idx = -1
+            head_idx = -1
+            srcs = []
+            for li, (src, _area, _rooms, _zone, is_prim, tl) in enumerate(items):
+                ntl = len(tl)
+                p = lpos[li]
+                while p + 1 < ntl and tl[p + 1][0] <= t:
+                    p += 1
+                lpos[li] = p
+                if tl[0][0] > t:
+                    continue
+                pr = tl[p][1]
+                if pr is _REMOVED:
+                    continue
+                srcs.append(src)
+                pk = pr or 10**12
+                if best_idx < 0 or pk < best_key:
+                    best_idx = li
+                    best_key = pk
+                    best_price = pr
+                if is_prim and head_idx < 0:
+                    head_idx = li
+
+            if best_idx < 0:
+                new_state = None
+            else:
+                if head_idx < 0:
+                    head_idx = best_idx
+                _, area, rooms, zone, _, _ = items[head_idx]
+                ppm = best_price / area if best_price and area else None
+                new_state = (best_price, ppm, area, rooms, zone, frozenset(srcs))
+
+            old_state = cur_state[oid_idx]
+            if new_state == old_state:
                 continue
-            live.append(dict(r, price=h[pos[i] - 1][1]))
-        if live:
-            data = compute(live, _event_counts(con, prev, t), _event_counts(con, prev, t, zone="A"))
-            con.execute("INSERT INTO snapshots(ts, run_id, data) VALUES(?,?,?)", (t, run_id, json.dumps(data, ensure_ascii=False)))
-            prev = t
+            if old_state is not None:
+                city_multi, a_multi = _apply_bucket_delta(
+                    old_state, -1, b_all, b_city, b_z, b_city_r, b_zA_r, city_src, a_src, city_multi, a_multi
+                )
+            if new_state is not None:
+                city_multi, a_multi = _apply_bucket_delta(
+                    new_state, 1, b_all, b_city, b_z, b_city_r, b_zA_r, city_src, a_src, city_multi, a_multi
+                )
+            cur_state[oid_idx] = new_state
+
+        if b_all.count:
+            ev_all = {"new": 0, "removed": 0, "returned": 0, "price_down": 0, "price_up": 0}
+            ev_a = {"new": 0, "removed": 0, "returned": 0, "price_down": 0, "price_up": 0}
+            while ev_idx < n_ev and ev_rows[ev_idx][0] <= t:
+                _, kind, old_v, new_v, ez = ev_rows[ev_idx]
+                if kind == "price":
+                    kname = "price_down" if (new_v or 0) < (old_v or 0) else "price_up"
+                    ev_all[kname] += 1
+                    if ez == "A":
+                        ev_a[kname] += 1
+                elif kind in ev_all:
+                    ev_all[kind] += 1
+                    if ez == "A":
+                        ev_a[kind] += 1
+                ev_idx += 1
+            data = {
+                "city": b_city.dump(),
+                "all": b_all.dump(),
+                "zones": {z: b_z[z].dump() for z in ZONES},
+                "rooms": {str(k): b_city_r[k].dump() for k in ROOMS},
+                "sources": dict(city_src),
+                "multi": city_multi,
+                "a": {
+                    "all": b_z["A"].dump(),
+                    "rooms": {str(k): b_zA_r[k].dump() for k in ROOMS},
+                    "sources": dict(a_src),
+                    "multi": a_multi,
+                },
+                "events": ev_all,
+                "events_a": ev_a,
+            }
+            out_rows.append((t, run_id, json.dumps(data, ensure_ascii=False)))
+    if out_rows:
+        con.executemany("INSERT INTO snapshots(ts, run_id, data) VALUES(?,?,?)", out_rows)
+    con.execute("DELETE FROM meta WHERE key='snapshots_dirty'")
     con.commit()
 
 
@@ -172,11 +496,21 @@ LAUNCH_GAP = 120  # с: прогоны одного запуска старту�
 def _launch_points(con):
     """Моменты графика: по одной точке на запуск. Снимки, снятые после разных сайтов одного запуска,
     сводятся в последний из них — к этому моменту отработали все сайты и рынок виден целиком.
-    Запуск узнаём по времени старта прогонов: все сайты запуска стартуют вместе."""
-    rows = con.execute("""SELECT s.ts, s.run_id, r.started FROM snapshots s
+    Запуск узнаём по явному launch_key или по времени старта прогонов."""
+    rows = con.execute("""SELECT s.ts, s.run_id, r.started, r.launch_key FROM snapshots s
                           LEFT JOIN runs r ON r.id = s.run_id ORDER BY s.ts""").fetchall()
-    out, key = [], None
+    out, key, cur_lk = [], None, None
     for r in rows:
+        lk = r["launch_key"]
+        if lk:
+            if out and cur_lk == lk:
+                out[-1] = (r["ts"], r["run_id"])
+            else:
+                out.append((r["ts"], r["run_id"]))
+                cur_lk = lk
+                key = None
+            continue
+        cur_lk = None
         cur = r["started"] or r["ts"]
         if key is not None and 0 <= (datetime.fromisoformat(cur) - datetime.fromisoformat(key)).total_seconds() <= LAUNCH_GAP:
             out[-1] = (r["ts"], r["run_id"])  # тот же запуск: точка переезжает на последний снимок
@@ -196,6 +530,19 @@ def merge_launches(con):
     con.execute("DELETE FROM snapshots")
     _write_snapshots(con, points)
     return before - con.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+
+
+def mark_snapshots_dirty(con):
+    """Откладывает пересчёт снимков до обращения к дашборду, новому снимку или бэкапу."""
+    con.execute("INSERT OR REPLACE INTO meta VALUES('snapshots_dirty', '1')")
+    con.commit()
+    return con.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+
+
+def ensure_snapshots_fresh(con):
+    """Синхронизирует отложенные снимки, если они помечены устаревшими."""
+    if con.execute("SELECT 1 FROM meta WHERE key='snapshots_dirty'").fetchone():
+        rebuild_snapshots(con)
 
 
 def rebuild_snapshots(con):
@@ -289,7 +636,7 @@ def lifetime_days(con, source):
         """SELECT SUM(active=0 AND removed_at IS NOT NULL) n,
                   SUM(MAX(0, julianday(CASE WHEN active=0 AND removed_at IS NOT NULL THEN removed_at ELSE ? END)
                              - julianday(first_seen))) days
-           FROM listings WHERE source=?""", (now, source)).fetchone()
+           FROM listings WHERE source=? AND COALESCE(imported_only, 0)=0""", (now, source)).fetchone()
     n, days = r["n"] or 0, r["days"] or 0.0
     tau = (days + PRIOR_LIFETIME_DAYS * PRIOR_WEIGHT) / (n + PRIOR_WEIGHT)
     return min(max(tau, LIFETIME_RANGE[0]), LIFETIME_RANGE[1]), n
@@ -326,6 +673,7 @@ def _thin(snaps, limit=MAX_POINTS):
 
 def dashboard(con, days=None):
     """Сводка для дашборда; days — период графиков (None — всё время), не больше MAX_POINTS точек."""
+    ensure_snapshots_fresh(con)
     q, args = "SELECT ts, data FROM snapshots", ()
     if days:
         q, args = q + " WHERE ts >= ?", (_ago(con, days),)
@@ -338,7 +686,8 @@ def dashboard(con, days=None):
         """SELECT source, COUNT(*) total, SUM(active) active, SUM(active=1 AND excluded IS NULL) passing,
                   SUM(active=0) removed, MIN(first_seen) since,
                   SUM(zone='A' AND active=1) active_a, SUM(zone='A' AND active=1 AND excluded IS NULL) passing_a,
-                  SUM(zone='A' AND active=0) removed_a FROM listings GROUP BY source""")}
+                  SUM(zone='A' AND active=0) removed_a
+           FROM listings WHERE COALESCE(imported_only, 0)=0 GROUP BY source""")}
     d1, d7 = _ago(con, 1), _ago(con, 7)
     # две последние проверки целиком — для показателей «изменение к предыдущей проверке» и среза «сейчас»
     recent = [{"ts": r["ts"], **json.loads(r["data"])} for r in con.execute("SELECT ts, data FROM snapshots ORDER BY ts DESC LIMIT 2")][::-1]

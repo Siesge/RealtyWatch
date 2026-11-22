@@ -197,9 +197,18 @@ class Avito(Scraper):
         return count, entries, {"dom": len(cards), "raw": len(raw_cards) if raw is not None else None}
 
     def listings(self):
-        page, pages, limit = 1, 1, self.site.get("max_pages", 40)
-        seen, declared = set(), None
+        ck = self.checkpoint
+        if ck.get("pass_finished"):
+            ck.clear()
+        page = int(ck.get("page", 1))
+        pages = int(ck.get("pages", 1))
+        limit = self.site.get("max_pages", 40)
+        seen = set(ck.get("seen") or ())
+        declared = ck.get("declared")
         prefix = self._region_prefix()
+        if page > 1:
+            self.log(f"продолжение со страницы {page}" + (f" из {min(pages, limit)}" if pages > 1 else ""))
+            self.progress(page=page - 1, pages=min(pages, limit), total=declared)
         while page <= pages and page <= limit:
             count, entries, got = self._load_page(page)
             # Страница без счётчика и без объявлений — не выдача (после капчи сайт открывает другую страницу).
@@ -225,26 +234,31 @@ class Avito(Scraper):
                 self.runlog.snapshot(dom_html, f"страница {page} — {len(entries)} из {PER_PAGE}, после загрузки")
                 if raw_html:
                     self.runlog.snapshot(raw_html, f"страница {page} — {len(entries)} из {PER_PAGE}, ответ сервера")
+            page_seen = set(seen)
             batch = []
             for sid, offer, card in entries:
                 item = (self._from_list(card, prefix) if card is not None else None) or (self._from_ld(offer, prefix) if offer else None)
                 if item and offer and not item.get("price"):
                     item["price"] = to_int(offer.get("price"))
-                if item and item["source_id"] not in seen:
+                if item and item["source_id"] not in page_seen:
                     batch.append(item)
-                seen.add(sid)
-            self.progress(page=page, pages=min(pages, limit), total=count)
+                page_seen.add(sid)
+            self.progress(page=page, pages=min(pages, limit), total=count or declared)
             src = (f"в ответе сервера {got['raw']}, на странице {got['dom']}" if got["raw"] is not None
                    else f"карточек на странице {got['dom']}")
             self.log(f"страница {page}/{pages}: {len(entries)} объявлений ({src}), новых в прогоне {len(batch)}")
             yield from batch
+            seen = page_seen
             if not entries:  # пустая только последняя страница (пустая в середине — ошибка выше)
                 page = pages + 1
+                self.save_checkpoint(page=page, pages=pages, declared=declared, seen=sorted(seen))
                 break
             page += 1
+            self.save_checkpoint(page=page, pages=pages, declared=declared, seen=sorted(seen))
             if page <= pages and page <= limit:
                 self.wait()
         self.finish(page, pages, limit, len(seen), declared)
+        ck["pass_finished"] = True
 
     def _unknown_verify(self, html, sid):
         if html and not self._verify_snapped:

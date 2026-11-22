@@ -91,7 +91,11 @@ function barChart(id, labels, series, yFmt, o = {}) {
   });
 }
 
-const tsLabel = t => new Date(t).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+const DF_DASH_TS = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+const DF_DASH_DAY = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short" });
+const DF_DASH_MON = new Intl.DateTimeFormat("ru-RU", { month: "short", year: "2-digit" });
+const DF_DASH_HR = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit" });
+const tsLabel = t => DF_DASH_TS.format(new Date(t));
 const pct = (a, b) => (a && b ? (100 * (a - b) / b) : null);
 
 // ---------- шкала времени ----------
@@ -103,9 +107,9 @@ const midnight = t => { const d = new Date(t); d.setHours(0, 0, 0, 0); return +d
 const weekStart = t => { const d = new Date(midnight(t)); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return +d; };
 const monthStart = t => { const d = new Date(midnight(t)); d.setDate(1); return +d; };
 const addMonths = (t, n) => { const d = new Date(t); d.setMonth(d.getMonth() + n); return +d; };
-const dayLabel = t => new Date(t).toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
-const monthLabel = t => new Date(t).toLocaleDateString("ru-RU", { month: "short", year: "2-digit" }).replace(" г.", "");
-const hourLabel = t => new Date(t).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+const dayLabel = t => DF_DASH_DAY.format(new Date(t));
+const monthLabel = t => DF_DASH_MON.format(new Date(t)).replace(" г.", "");
+const hourLabel = t => DF_DASH_HR.format(new Date(t));
 
 // Подписи оси: круглые часы, дни или месяцы — столько, чтобы читались (не больше восьми)
 function timeTicks(min, max) {
@@ -628,6 +632,8 @@ function paintChanges() {
         ? "Последнее обновление: " + lastRuns.map(r => `<span><i class="sdot ${r.source}"></i>${SRC[r.source]} ${dtt(r.finished)}${r.status !== "done" ? ` <em class="st-badge ${r.status}">${STATE[r.status] || r.status}</em>` : ""}</span>`).join("")
         : "Сборов ещё не было"}</div>` : ""}
     </div>
+    ${mergeBannerHtml()}
+    ${exportBannerHtml()}
     ${tiles.length ? `<div class="ch-grid">${tiles.map(changeTile).join("")}</div>` : emptyMsg}`;
   el.querySelectorAll("input[name=chPeriod]").forEach(r => r.onchange = () => { CH_PERIOD = r.value; store.set("rw.chPeriod", r.value); renderChanges(); });
   el.querySelectorAll("input[name=chKind]").forEach(c => c.onchange = () => {
@@ -636,6 +642,12 @@ function paintChanges() {
   });
   el.querySelectorAll("[data-card]").forEach(b => b.onclick = () => goToCard(b.dataset.card));
   el.querySelectorAll("[data-open]").forEach(b => b.onclick = () => openObject(b.dataset.open));
+  el.querySelectorAll("[data-export]").forEach(b => b.onclick = () => toggleExportPick(b.dataset.export));
+  el.querySelectorAll("[data-unmerge]").forEach(b => b.onclick = () => unmergeObject(b.dataset.unmerge, b));
+  el.querySelectorAll("[data-merge]").forEach(b => b.onclick = () => toggleMerge(b.dataset.merge, b));
+  el.querySelectorAll("[data-spot]").forEach(b => b.onclick = () => spotlightObject(b.dataset.spot));
+  el.querySelectorAll(".merge-cancel").forEach(b => b.onclick = cancelMerge);
+  bindExportBarActions(el);
 }
 
 function eventText(e, o) {
@@ -658,17 +670,21 @@ function eventText(e, o) {
 }
 
 function changeTile(t) {
-  const o = t.o, e0 = t.list[0];
+  const o = t.o, e0 = t.list[0], picking = !!(o && MERGE_PICK === o.id), expOn = !!(o && EXPORT_PICK.has(o.id));
+  const spOn = typeof canSpotlight === "function" && canSpotlight();
+  const isSpot = !!(o && typeof SPOTLIGHT !== "undefined" && SPOTLIGHT && SPOTLIGHT.id === o.id);
   const head = o ? `${o.rooms ?? "?"}-к, ${o.area ?? "?"} м², ${o.floor ?? "?"}/${o.floors ?? "?"} эт.` : esc(e0.title || "");
   const img = o && o.img ? `<img src="/img/${encodeURIComponent(o.img.source)}/${encodeURIComponent(o.img.source_id)}" loading="lazy" alt="" onerror="this.remove()">` : "";
   const sites = [...new Set(t.list.map(e => e.source))];
-  return `<article class="ch-tile ${o && o.liked ? "liked" : ""}">
+  return `<article class="ch-tile ${o && o.liked ? "liked" : ""} ${picking ? "merging" : ""} ${expOn ? "exporting" : ""} ${isSpot ? "spotlighted" : ""}" ${o ? `data-id="${esc(o.id)}"` : ""}>
     <div class="ch-img">${img}${o ? `<span class="pill zone-${o.zone}" title="${esc(ZONE_TIP[o.zone])}">${ZONE_SHORT[o.zone]}</span>` : ""}</div>
     <div class="ch-body">
+      ${picking ? `<div class="merge-note ch" title="Нажмите значок объединения на второй карточке — она вольётся в эту. Повторный клик сюда или Esc — отмена">${ICON.merge}<span>Выберите вторую карточку (Esc — отмена)</span></div>` : ""}
+      ${isSpot ? `<div class="spot-note ch"><span>👁 ${esc(SPOTLIGHT.from)} показывает эту квартиру</span></div>` : ""}
       <div class="ch-title"><b>${head}</b>${o && o.liked ? ' <span class="lk" title="В избранном">♥</span>' : ""}
         <span class="ch-price" title="Текущая цена объекта (минимальная среди активных объявлений)">${o ? `${fmt(o.price)} ₽` : ""}</span></div>
-      <div class="addr" title="Адрес">${ICON.pin}<span>${esc((o && o.address) || e0.address || "")}</span></div>
-      <div class="ch-sum" title="На каких сайтах были изменения">${sites.length > 1 ? `изменения на ${sites.length} сайтах: ` : ""}${sites.map(s => `<i class="sdot ${s}"></i> ${SRC[s]}`).join(", ")}</div>
+      <div class="addr" title="${o && o.manual_merged ? "Адрес основной карточки" : "Адрес"}">${ICON.pin}<span>${esc((o && o.address) || e0.address || "")}</span></div>
+      <div class="ch-sum" title="На каких сайтах были изменения">${sites.length > 1 ? `изменения на ${sites.length} сайтах: ` : ""}${sites.map(s => `<i class="sdot ${s}"></i> ${SRC[s]}`).join(", ")}${o && o.manual_merged ? ` <span class="tag manual" title="${esc(manualTip(o))}">${ICON.merge}объединено вручную</span>` : ""}</div>
       <ul class="ch-list">${t.list.map(e => {
         const it = o && o.items.find(i => i.source === e.source && i.source_id === e.source_id);
         const link = it && it.off_site
@@ -679,7 +695,8 @@ function changeTile(t) {
         ${link}</li>`;
       }).join("")}</ul>
       ${o ? `<div class="ch-acts"><button class="btn-sec sm" data-card="${esc(o.id)}" title="Открыть эту квартиру в подборке">В подборке</button>
-        <button class="btn-sec sm" data-open="${esc(o.id)}" title="Окно с историей цен по каждому сайту">${ICON.chart}История цен</button></div>` : ""}
+        <button class="btn-sec sm" data-open="${esc(o.id)}" title="Окно с историей цен по каждому сайту">${ICON.chart}История цен</button>
+        <span class="ch-acts-r">${spOn ? `<button class="icon-btn sm spotlight-btn" data-spot="${esc(o.id)}" title="Подсветить партнёру по локальной сети">${ICON.spot}</button>` : ""}<button class="icon-btn sm export-btn ${expOn ? "on" : ""}" data-export="${esc(o.id)}" title="${esc(exportBtnTip(o))}">${ICON.share}</button>${o.manual_merged ? `<button class="icon-btn sm unmerge-btn" data-unmerge="${esc(o.id)}" title="${esc(unmergeBtnTip(o))}">${ICON.unmerge}</button>` : ""}<button class="icon-btn sm merge-btn ${picking ? "on" : ""}" data-merge="${esc(o.id)}" title="${esc(mergeBtnTip(o))}">${ICON.merge}</button></span></div>` : ""}
     </div></article>`;
 }
 
@@ -731,13 +748,14 @@ async function saveObjectNote(o, rawText) {
     o.note = r.text;
     o.note_ts = r.ts;
     o.items.forEach(i => { i.note = r.text; i.note_ts = r.ts; });
-    o.text = [...o.items.map(i => `${i.title} ${i.address} ${i.description}`), o.note].join(" ").toLowerCase();
+    o.text = [...o.items.map(i => `${i.title} ${i.address} ${i.description}`), o.note, o._impText || ""].join(" ").toLowerCase();
     const ta = $("#objNote");
     if (ta) ta.value = r.text;
     const st = $("#noteStatus");
     if (st) st.textContent = r.ts ? `сохранено ${tsLabel(r.ts)}` : "хранится только у вас, в базе";
     if (del) del.classList.toggle("hidden", !r.text);
     if (["cards", "table", "map", "changes"].includes(view)) render();
+    else if (view === "imports" && IMP_BATCH_ID) openImportBatch(IMP_BATCH_ID);
     toast("ok", r.text ? "Заметка сохранена" : "Заметка удалена", r.text ? "Она видна на карточке и в выгрузке избранного" : "");
   } catch (e) {
     toast("warn", "Не удалось сохранить заметку", e.message);
@@ -751,7 +769,10 @@ function openObject(id, focusNote = false) {
   const o = OBJS.find(x => x.id === id);
   if (!o) return;
   const changed = o.items.some(i => lastChange(i));
-  const desc = o.items.map(i => i.description || "").sort((a, b) => b.length - a.length)[0] || "";
+  const desc = o.manual_merged
+    ? (o.p.description || o.items.map(i => i.description || "").find(Boolean) || "")
+    : (o.items.map(i => i.description || "").sort((a, b) => b.length - a.length)[0] || "");
+  $("#modalBody").dataset.oid = o.id;
   $("#modalBody").innerHTML = `
     <div class="m-head">
       <div class="m-img">${o.img ? `<img src="/img/${encodeURIComponent(o.img.source)}/${encodeURIComponent(o.img.source_id)}" alt="">` : ""}</div>
@@ -760,7 +781,11 @@ function openObject(id, focusNote = false) {
         <div class="addr">${ICON.pin}<span>${esc(o.address)}</span></div>
         <div class="m-price" title="Минимальная цена среди активных объявлений">${fmt(o.price)} ₽ <span class="meta">${fmt(o.price_m2)} ₽/м²</span> ${oldPrice(o)}</div>
         <div class="tags">${tags(o)}</div>
-        ${offers(o)}
+        ${(typeof canSpotlight === "function" && canSpotlight()) ? `<div class="m-lan-acts" id="mLanActs">
+          <button type="button" class="btn-sec sm spotlight-btn" id="mSpotBtn" data-spot="${esc(o.id)}">${ICON.spot}Подсветить партнёру</button>
+          <button type="button" class="btn-sec sm" id="mSendPeer">${ICON.share}Отправить партнёру</button>
+        </div>` : ""}
+        ${offers(o, true)}
         <div class="m-note">
           <label for="objNote">Личная заметка</label>
           <textarea id="objNote" rows="2" maxlength="2000" placeholder="Впечатления от квартиры, контакты, итог звонка, условия торга…">${esc(o.note || "")}</textarea>
@@ -772,6 +797,12 @@ function openObject(id, focusNote = false) {
             </span>
           </div>
         </div>
+        ${(o.imported_notes && o.imported_notes.length) ? `<details class="m-imp-notes" open>
+          <summary>Импортированные заметки (${o.imported_notes.length})</summary>
+          <div class="min-list">${o.imported_notes.map(n => `<div class="min-item">
+            <div class="min-head"><b>💬 ${esc(n.origin_name || "Импорт")}</b>${n.ts ? `<span>${tsLabel(n.ts)}</span>` : ""}</div>
+            <div class="min-text">${esc(n.text)}</div></div>`).join("")}</div>
+        </details>` : ""}
       </div>
     </div>
     <div class="m-chart-head"><h3>История цен по сайтам</h3><span class="meta">${changed ? "ступенька — изменение цены" : "цена не менялась с момента появления в базе"}</span>
@@ -785,6 +816,8 @@ function openObject(id, focusNote = false) {
   $("#noteSave").onclick = () => saveObjectNote(o, ta.value);
   $("#noteDel").onclick = () => saveObjectNote(o, "");
   ta.onkeydown = e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveObjectNote(o, ta.value); } };
+  if ($("#mSpotBtn")) $("#mSpotBtn").onclick = () => spotlightObject(o.id);
+  if ($("#mSendPeer")) $("#mSendPeer").onclick = () => sendCardToPeersFlow(o.id);
   if (focusNote) requestAnimationFrame(() => ta.focus());
 }
 
@@ -851,16 +884,73 @@ function drawObjectChart(o) {
 
 function closeModal() {
   $("#modal").classList.add("hidden");
+  $("#tip")?.classList.remove("on");
   if (charts.chObj) { charts.chObj.destroy(); delete charts.chObj; }
+  if (typeof stopLanTimers === "function") stopLanTimers();
 }
 $("#modalX").onclick = closeModal;
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
-  if (!$("#modal").classList.contains("hidden")) closeModal();
+  if (!$("#expMenu")?.classList.contains("hidden")) closeExportMenu();
+  else if (!$("#modal").classList.contains("hidden")) closeModal();
   else if (ZE) endZoneEdit();  // Esc — отменить изменение круга
+  else if (MERGE_PICK && (view === "cards" || view === "changes")) cancelMerge();
+  else if (EXPORT_PICK.size && (view === "cards" || view === "changes" || view === "imports")) clearExportPick();
+});
+async function excludeOfferFromMerge(objectId, source, sourceId, triggerEl) {
+  if (!objectId || !source || !sourceId || mergeBusy) return;
+  $("#tip")?.classList.remove("on");
+  mergeBusy = true;
+  const busyOffer = (triggerEl || $(`#modalBody .offer-excl[data-src="${CSS.escape(source)}"][data-sid="${CSS.escape(sourceId)}"]`))?.closest(".offer");
+  if (busyOffer) busyOffer.classList.add("is-busy");
+  try {
+    const r = await post("/api/objects/exclude", { object_id: objectId, source, source_id: sourceId, defer_snapshots: true });
+    if (MERGE_PICK === objectId) MERGE_PICK = r.still_merged ? r.remaining_object_id : null;
+    if (PICK === objectId) PICK = r.still_merged ? r.remaining_object_id : null;
+    if (r.updated) applyListingUpdates(r.updated);
+    else await loadData();
+    if (view === "settings") renderDbInfo();
+    if (r.still_merged && OBJS.some(x => x.id === r.remaining_object_id)) {
+      openObject(r.remaining_object_id);
+      toast("ok", "Исключено из объединения", `Отделено ${r.excluded_count} ${plural(r.excluded_count, "объявление", "объявления", "объявлений")} в самостоятельную карточку`);
+    } else {
+      closeModal();
+      toast("ok", "Карточки разделены", "В объединении оставалась одна группа — все карточки вернулись к обычному виду");
+    }
+  } catch (e) {
+    if (busyOffer) busyOffer.classList.remove("is-busy");
+    toast("warn", "Не удалось исключить", e.message || String(e));
+  } finally {
+    mergeBusy = false;
+  }
+}
+
+const hlOfferGroup = ag => $$("#modalBody .offer[data-ag]").forEach(el => el.classList.toggle("excl-hl", !!ag && el.dataset.ag === ag));
+$("#modalBody").addEventListener("mouseover", e => {
+  const b = e.target.closest(".offer-excl");
+  if (b) hlOfferGroup(b.closest(".offer")?.dataset.ag || "");
+});
+$("#modalBody").addEventListener("mouseout", e => {
+  const b = e.target.closest(".offer-excl");
+  if (b && !b.contains(e.relatedTarget)) hlOfferGroup("");
+});
+$("#modalBody").addEventListener("focusin", e => {
+  const b = e.target.closest(".offer-excl");
+  if (b) hlOfferGroup(b.closest(".offer")?.dataset.ag || "");
+});
+$("#modalBody").addEventListener("focusout", e => {
+  const b = e.target.closest(".offer-excl");
+  if (b && !b.contains(e.relatedTarget)) hlOfferGroup("");
 });
 $("#modalBody").addEventListener("click", e => {
+  const ex = e.target.closest(".offer-excl");
+  if (ex) {
+    e.preventDefault();
+    e.stopPropagation();
+    excludeOfferFromMerge($("#modalBody").dataset.oid, ex.dataset.src, ex.dataset.sid, ex);
+    return;
+  }
   const h = e.target.closest(".heart");
   if (h) toggleLike(h.closest("[data-id]")?.dataset.id, h);
 });

@@ -275,6 +275,41 @@ class DesktopApi:
         path = self._dialog("OPEN", directory=str(Path.home() / "Desktop"))
         return {"path": path} if path else {"cancelled": True}
 
+    def export_cards(self, object_ids=None, liked_only=False, kind="cards"):
+        from . import exchange
+        from .runner import manager
+
+        kind = str(kind or ("favorites" if liked_only else "cards"))
+        path = self._dialog(
+            "SAVE",
+            file_types=("Карточки RealtyWatch (*.rwcards.zip)", "ZIP-архив (*.zip)"),
+            directory=str(Path.home() / "Desktop"),
+            save_filename=exchange.default_name(kind),
+        )
+        if not path:
+            return {"cancelled": True}
+        if not path.lower().endswith(".zip"):
+            path += exchange.EXT
+        try:
+            res = exchange.export_cards_zip(
+                path,
+                object_ids=object_ids,
+                liked_only=bool(liked_only),
+                kind=kind,
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+        manager.log("db", f"карточки выгружены (.rwcards.zip): {res['path']} ({res['cards']} карточек, фото {res['images']})")
+        return res
+
+    def pick_cards_import(self):
+        path = self._dialog(
+            "OPEN",
+            file_types=("Карточки RealtyWatch (*.rwcards.zip;*.zip)",),
+            directory=str(Path.home() / "Desktop"),
+        )
+        return {"path": path} if path else {"cancelled": True}
+
 
 def _clean_caches():
     """При закрытии убираем кэши браузера и окна: папку программы можно сразу заархивировать и переслать."""
@@ -314,17 +349,22 @@ def main():
     url = f"http://127.0.0.1:{port}/"
     RUNTIME_FILE.write_text(json.dumps({"pid": os.getpid(), "url": url}), encoding="utf-8")
     threading.Thread(target=_startup_maintenance, daemon=True, name="maintenance").start()
+    from . import lan_sync, updater
     from .runner import manager
     from .server import scheduler
 
+    lan_sync.start_if_enabled()
     sched = scheduler()  # автообновление по таймеру работает и при свёрнутом окне
     tray = None
+    stop_srv_evt = threading.Event()
     try:
         if server_only:
+            updater.service.set_hooks(shutdown_cb=stop_srv_evt.set)
+            updater.service.start_background()
             manager.on_launch_done.append(_notify_hook())
             print(f"RealtyWatch (сервер для отладки): {url}")
-            while True:
-                time.sleep(1)
+            while not stop_srv_evt.is_set():
+                stop_srv_evt.wait(1.0)
         else:
             import webview
 
@@ -353,6 +393,14 @@ def main():
                         tray.stop()
                         tray = None
 
+            def _quit_for_update():
+                if tray:
+                    tray.quitting = True
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
+
             def on_shown():
                 nonlocal hooked
                 if hooked:
@@ -366,15 +414,22 @@ def main():
                 window.events.closing += (lambda: tray.on_close() if tray else True)
                 settings.on_change(lambda cfg: _tray(bool(cfg.get("ui", {}).get("tray_on_close", True))))
                 _tray(wanted())
+                updater.service.set_hooks(
+                    shutdown_cb=_quit_for_update,
+                    notify_cb=lambda title, text: tray and tray.notify(title, text),
+                )
+                updater.service.start_background()
 
             window.events.shown += on_shown
             webview.start(private_mode=False, storage_path=str(paths.DATA / "webview"))
     except KeyboardInterrupt:
         pass
     finally:
+        updater.service.stop_background()
         if tray:
             tray.stop()
         _shutdown_runs()
+        lan_sync.stop()
         server.should_exit = True
         _clean_caches()
         try:

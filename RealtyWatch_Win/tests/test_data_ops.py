@@ -208,6 +208,31 @@ class PickRuns(Case):
         self.assertEqual(sorted(r["source"] for r in groups[0]["runs"]), ["cian", "yandex"])
         self.assertEqual(groups[1]["collected"], 120, "сколько собрал каждый сайт — из самого прогона")
         self.assertEqual(purge.launches(con(), "2026-10-21", None)[0]["started"], BAD, "период отбирает запуски")
+        by_id = {r["id"]: r["has_log"] for g in groups for r in g["runs"]}
+        self.assertEqual(by_id, {self.good: True, self.bad: True, self.yandex: False})
+        self.assertEqual(server.db_launches("", "", 400), groups)
+        self.assertEqual({r["id"]: r["has_log"] for r in server.runs()}, by_id)
+
+    def test_launches_split_repeated_same_source_and_ui_layout(self):
+        c = con()
+        c.execute("INSERT INTO runs(source, mode, started, finished, status, found) "
+                  "VALUES('cian','browser','2026-10-22T10:00:30','2026-10-22T10:05:00','done',42)")
+        c.commit()
+        groups = purge.launches(con())
+        self.assertEqual([len(g["runs"]) for g in groups], [1, 2, 1],
+                         "повторный запуск того же сайта в пределах 2 мин уходит в отдельную группу")
+        self.assertEqual(groups[0]["started"], "2026-10-22T10:00:30")
+
+        js = (paths.WEB / "app.js").read_text(encoding="utf-8")
+        css = (paths.WEB / "app.css").read_text(encoding="utf-8")
+        self.assertIn('api("/api/db/launches?limit=200")', js)
+        self.assertIn('class="runs-groups"', js)
+        self.assertIn('class="btn-sec danger" id="btnPickRuns"', js)
+        self.assertIn("Удалить выбранные прогоны", js)
+        self.assertLess(js.index('id="btnPickRuns"'), js.index('id="btnPurge"'))
+        self.assertLess(js.index('id="btnRestore"'), js.index('id="btnDropBackups"'))
+        self.assertIn(".s-purge > .btn-row, .purge-backups .btn-row", css)
+        self.assertIn("repeat(2, minmax(0, 1fr))", css)
 
     def test_delete_bad_run_restores_good_state_and_keeps_point(self):
         before = {r["source_id"]: r["price"] for r in self.rows}
@@ -386,3 +411,275 @@ class ListingsPayloadAndNotes(Case):
         # Пустой текст удаляет заметку
         server.note_set({"keys": ["cian:101", "avito:202"], "text": ""})
         self.assertEqual([r["note"] for r in server.listings()], ["", ""])
+
+
+class ManualMergeOps(Case):
+    """API ручного слияния/разделения, пересчёт снимков, очистка (purge), перенос (transfer) и выгрузка."""
+
+    def _seed_three(self):
+        c = con()
+        items = [
+            {
+                "source": "cian", "source_id": "10", "url": "https://cian.test/10",
+                "title": "1-к. первая", "price": 9_000_000, "rooms": 1, "area": 41.0, "floor": 2, "floors": 5,
+                "address": "Ялта, ул. Садовая, 1", "lat": 44.4838, "lon": 34.1433, "zone": "A",
+                "renovation": "euro", "description": "Описание первой карточки",
+            },
+            {
+                "source": "avito", "source_id": "20", "url": "https://avito.test/20",
+                "title": "2-к. вторая", "price": 12_000_000, "rooms": 2, "area": 62.0, "floor": 6, "floors": 9,
+                "address": "Ялта, ул. Ленина, дом номер 15, корпус 2", "lat": 44.4960, "lon": 34.1700, "zone": "B",
+                "renovation": "design", "description": "Гораздо более длинное описание второй карточки",
+            },
+            {
+                "source": "yandex", "source_id": "30", "url": "https://yandex.test/30",
+                "title": "3-к. третья", "price": 15_000_000, "rooms": 3, "area": 80.0, "floor": 8, "floors": 12,
+                "address": "Ялта, ул. Московская, 7", "lat": 44.4990, "lon": 34.1800, "zone": "B",
+                "renovation": "old", "description": "Третья карточка",
+            },
+        ]
+        for it in items:
+            db.upsert(c, it, baseline=1)
+        c.commit()
+        dedupe.rebuild(c)
+        history.snapshot(c)
+        c.close()
+
+    def test_api_merge_unmerge_keeps_marks_and_rebuilds_snapshots(self):
+        from app import share
+        self._seed_three()
+        server.like({"keys": ["cian:10"], "on": True})
+        server.dislike({"keys": ["avito:20"], "on": True})
+        server.note_set({"keys": ["cian:10"], "text": "Личная заметка первой"})
+
+        res = server.objects_merge({"primary_id": "cian:10", "secondary_id": "avito:20"})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["manual_merges"], 1)
+        self.assertEqual(server.db_info()["manual_merges"], 1)
+
+        rows = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertEqual(rows["cian:10"]["object_id"], rows["avito:20"]["object_id"])
+        self.assertTrue(rows["cian:10"]["manual_merged"])
+        self.assertTrue(rows["avito:20"]["manual_merged"])
+        self.assertTrue(rows["cian:10"]["manual_primary"])
+        self.assertFalse(rows["avito:20"]["manual_primary"])
+        self.assertFalse(rows["yandex:30"]["manual_merged"])
+
+        # В снимке дашборда после слияния стало 2 объекта и 1 на 2+ сайтах
+        snap = json.loads(con().execute("SELECT data FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()[0])
+        self.assertEqual(snap["city"]["count"], 2)
+        self.assertEqual(snap["multi"], 1)
+
+        # Выгрузка избранного берёт адрес, описание, ремонт и заметку первой карточки
+        c = con()
+        liked = share.liked_objects(c)
+        self.assertEqual(len(liked), 1)
+        self.assertTrue(liked[0]["manual_merged"])
+        self.assertEqual(liked[0]["address"], "Ялта, ул. Садовая, 1")
+        self.assertEqual(liked[0]["renovation"], "euro")
+        self.assertEqual(liked[0]["note"], "Личная заметка первой")
+        self.assertIn("объединено вручную", share.page(c, liked))
+        c.close()
+
+        # Сброс: 3 карточки, отметки (лайк, дизлайк, заметка) и снимки сохраняются и пересчитываются
+        un = server.db_unmerge()
+        self.assertEqual((un["unmerged"], un["objects"]), (1, 3))
+        self.assertEqual(server.db_info()["manual_merges"], 0)
+        rows2 = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertFalse(rows2["cian:10"]["manual_merged"])
+        self.assertTrue(rows2["cian:10"]["liked"])
+        self.assertTrue(rows2["avito:20"]["disliked"])
+        self.assertEqual(rows2["cian:10"]["note"], "Личная заметка первой")
+        snap2 = json.loads(con().execute("SELECT data FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()[0])
+        self.assertEqual(snap2["city"]["count"], 3)
+        self.assertEqual(snap2["multi"], 0)
+
+    def test_purge_and_transfer_preserve_and_clean_manual_merges(self):
+        self._seed_three()
+        # Объединяем все 3; затем одно (главное) удаляется очисткой прогона/периода — 2 оставшихся остаются с новым is_primary=1
+        r1 = server.objects_merge({"primary_id": "cian:10", "secondary_id": "avito:20"})
+        server.objects_merge({"primary_id": r1["object_id"], "secondary_id": "yandex:30"})
+
+        # Экспорт -> очистка -> импорт merge переносит manual_merges
+        zip_path = self.dir / "manual.zip"
+        transfer.export_zip(zip_path, with_images=False)
+        purge.clear_all()
+        self.assertEqual(con().execute("SELECT COUNT(*) FROM manual_merges").fetchone()[0], 0)
+        transfer.import_zip(zip_path, mode="merge")
+        c = con()
+        by_group, primaries = dedupe.active_manual_merges(c)
+        self.assertEqual(len(by_group), 1)
+        self.assertEqual(primaries, {("cian", "10")})
+        self.assertEqual(c.execute("SELECT COUNT(DISTINCT object_id) FROM listings").fetchone()[0], 1)
+
+        # Удаляем только первое объявление через purge() за его дату
+        c.execute("UPDATE listings SET first_seen='2026-10-01T10:00:00', last_seen='2026-10-01T10:00:00' "
+                  "WHERE source='cian' AND source_id='10'")
+        c.execute("UPDATE listings SET first_seen='2026-10-20T10:00:00', last_seen='2026-10-20T10:00:00' "
+                  "WHERE NOT (source='cian' AND source_id='10')")
+        c.commit()
+        c.close()
+        purge.purge("2026-10-01", "2026-10-01")
+        c2 = con()
+        by_group2, primaries2 = dedupe.active_manual_merges(c2)
+        self.assertEqual(len(by_group2), 1, "2 оставшихся объявления сохраняют ручную связку")
+        self.assertEqual(len(primaries2), 1, "одному из оставшихся автоматически назначено is_primary=1")
+
+        # Если удалить ещё одно и останется 1 объявление — группа расформируется
+        c2.execute("UPDATE listings SET first_seen='2026-10-15T10:00:00', last_seen='2026-10-15T10:00:00' "
+                   "WHERE source='avito' AND source_id='20'")
+        c2.commit()
+        c2.close()
+        purge.purge("2026-10-15", "2026-10-15")
+        self.assertEqual(con().execute("SELECT COUNT(*) FROM manual_merges").fetchone()[0], 0)
+
+    def test_manual_merge_ui_wiring(self):
+        html = (paths.WEB / "index.html").read_text(encoding="utf-8")
+        js = (paths.WEB / "app.js").read_text(encoding="utf-8")
+        dash = (paths.WEB / "dash.js").read_text(encoding="utf-8")
+        css = (paths.WEB / "app.css").read_text(encoding="utf-8")
+        acts = js.split('<span class="acts">')[1].split("</span>")[0]
+        self.assertLess(acts.index("unmerge-btn"), acts.index("merge-btn"), "кнопка «Разделить» слева от «Объединить»")
+        self.assertLess(acts.index("merge-btn"), acts.index("note-btn"), "кнопка объединения слева от заметок")
+        self.assertIn("MERGE_PICK", js)
+        self.assertNotIn("MERGE_PICK = null", js.split("function setView(v)")[1].split("function serializeFilters")[0])
+        self.assertIn('id="btnUnmergeAll"', js)
+        self.assertIn('id="fManual"', html)
+        self.assertIn("(!f.manual || o.manual_merged)", js)
+        self.assertIn('data-unmerge="', dash)
+        self.assertIn('data-merge="', dash)
+        self.assertIn("cancelMerge()", dash)
+        self.assertIn("excludeOfferFromMerge(", dash)
+        self.assertIn(".offer.excl-hl", css)
+
+    def test_api_unmerge_object_and_exclude_group_with_auto_group(self):
+        c = con()
+        # Группа A (cian:1 + avito:2 — авто-дубли), плюс yandex:3 и cian:4
+        for it in (
+            {"source": "cian", "source_id": "1", "url": "https://cian.test/1", "title": "A1", "price": 9_000_000,
+             "rooms": 1, "area": 41.0, "floor": 2, "floors": 5, "address": "Ялта, ул. Садовая, 1",
+             "lat": 44.4838, "lon": 34.1433, "zone": "A", "description": "Первая"},
+            {"source": "avito", "source_id": "2", "url": "https://avito.test/2", "title": "A2", "price": 9_100_000,
+             "rooms": 1, "area": 41.1, "floor": 2, "floors": 5, "address": "Ялта, ул. Садовая, 1",
+             "lat": 44.4838, "lon": 34.1433, "zone": "A", "description": "Дубль первой"},
+            {"source": "yandex", "source_id": "3", "url": "https://yandex.test/3", "title": "B", "price": 12_000_000,
+             "rooms": 2, "area": 62.0, "floor": 6, "floors": 9, "address": "Ялта, ул. Ленина, 15",
+             "lat": 44.4960, "lon": 34.1700, "zone": "B", "description": "Вторая"},
+            {"source": "cian", "source_id": "4", "url": "https://cian.test/4", "title": "C", "price": 15_500_000,
+             "rooms": 3, "area": 82.0, "floor": 8, "floors": 12, "address": "Ялта, ул. Московская, 7",
+             "lat": 44.4990, "lon": 34.1800, "zone": "B", "description": "Третья"},
+        ):
+            db.upsert(c, it, baseline=1)
+        c.commit()
+        dedupe.rebuild(c)
+        history.snapshot(c)
+        c.close()
+
+        m1 = server.objects_merge({"primary_id": "avito:2", "secondary_id": "yandex:3"})
+        m2 = server.objects_merge({"primary_id": m1["object_id"], "secondary_id": "cian:4"})
+        rows = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        # cian:1 и avito:2 имеют одинаковый auto_group, отличный от yandex:3 и cian:4
+        self.assertEqual(rows["cian:1"]["auto_group"], rows["avito:2"]["auto_group"])
+        self.assertNotEqual(rows["cian:1"]["auto_group"], rows["yandex:3"]["auto_group"])
+        self.assertNotEqual(rows["yandex:3"]["auto_group"], rows["cian:4"]["auto_group"])
+
+        # Исключаем группу A через ключ avito:2: отделяются сразу cian:1 и avito:2, а yandex:3 + cian:4 остаются вместе
+        ex = server.objects_exclude({"object_id": m2["object_id"], "source": "avito", "source_id": "2"})
+        self.assertTrue(ex["ok"])
+        self.assertTrue(ex["still_merged"])
+        self.assertEqual(set(ex["excluded_keys"]), {"cian:1", "avito:2"})
+        self.assertEqual(server.db_info()["manual_merges"], 1)
+        snap = json.loads(con().execute("SELECT data FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()[0])
+        self.assertEqual(snap["city"]["count"], 2)
+
+        # Точечно разделяем оставшуюся связку yandex:3 + cian:4
+        un = server.objects_unmerge({"object_id": ex["remaining_object_id"]})
+        self.assertTrue(un["ok"])
+        self.assertEqual((un["parts"], un["manual_merges"]), (2, 0))
+        self.assertEqual(server.db_info()["manual_merges"], 0)
+        snap2 = json.loads(con().execute("SELECT data FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()[0])
+        self.assertEqual(snap2["city"]["count"], 3)
+
+    def test_delta_updated_payload_and_fast_snapshots_match_compute(self):
+        """Ответы merge/exclude/unmerge содержат точный delta-массив updated, а _write_snapshots совпадает с compute."""
+        c = con()
+        items = [
+            {"source": "cian", "source_id": "10", "url": "https://cian.test/10", "title": "1-к", "price": 9_000_000,
+             "rooms": 1, "area": 40.0, "floor": 2, "floors": 5, "address": "Ялта, ул. Садовая, 1",
+             "lat": 44.4838, "lon": 34.1433, "zone": "A", "first_seen": "2026-01-01T10:00:00"},
+            {"source": "avito", "source_id": "20", "url": "https://avito.test/20", "title": "2-к", "price": 12_000_000,
+             "rooms": 2, "area": 60.0, "floor": 4, "floors": 9, "address": "Ялта, ул. Ленина, 10",
+             "lat": 44.4960, "lon": 34.1700, "zone": "B", "first_seen": "2026-01-01T10:00:00"},
+            {"source": "yandex", "source_id": "30", "url": "https://yandex.test/30", "title": "3-к", "price": 15_000_000,
+             "rooms": 3, "area": 80.0, "floor": 7, "floors": 12, "address": "Ливадия, 5",
+             "lat": 44.4600, "lon": 34.1400, "zone": "C", "first_seen": "2026-01-05T10:00:00"},
+        ]
+        for it in items:
+            db.upsert(c, it, baseline=1)
+        c.execute("UPDATE listings SET first_seen='2026-01-01T10:00:00'")
+        c.execute("UPDATE listings SET first_seen='2026-01-05T10:00:00' WHERE source='yandex' AND source_id='30'")
+        c.execute("UPDATE price_history SET ts='2026-01-01T10:00:00'")
+        c.execute("UPDATE price_history SET ts='2026-01-05T10:00:00' WHERE source='yandex' AND source_id='30'")
+        c.execute("UPDATE listings SET price=8_500_000, active=1 WHERE source='cian' AND source_id='10'")
+        c.execute("INSERT INTO price_history VALUES('cian','10','2026-01-10T10:00:00',8500000)")
+        c.execute("UPDATE listings SET active=0, removed_at='2026-01-15T10:00:00' WHERE source='yandex' AND source_id='30'")
+        db.event(c, "cian", "10", "price", old=9_000_000, new=8_500_000, ts="2026-01-10T10:00:00", baseline=0)
+        db.event(c, "yandex", "30", "removed", ts="2026-01-15T10:00:00", baseline=0)
+        c.commit()
+        dedupe.rebuild(c)
+        c.close()
+
+        m = server.objects_merge({"primary_id": "cian:10", "secondary_id": "avito:20"})
+        by_srv = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertTrue(len(m["updated"]) >= 2)
+        for u in m["updated"]:
+            k = f"{u['source']}:{u['source_id']}"
+            self.assertEqual(u, by_srv[k])
+
+        ex = server.objects_exclude({"object_id": m["object_id"], "source": "avito", "source_id": "20"})
+        by_srv2 = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertTrue({"cian:10", "avito:20"} <= {f"{u['source']}:{u['source_id']}" for u in ex["updated"]})
+        for u in ex["updated"]:
+            self.assertEqual(u, by_srv2[f"{u['source']}:{u['source_id']}"])
+
+        m2 = server.objects_merge({"primary_id": "avito:20", "secondary_id": "cian:10"})
+        un = server.objects_unmerge({"object_id": m2["object_id"]})
+        by_srv3 = {f"{r['source']}:{r['source_id']}": r for r in server.listings()}
+        self.assertEqual({f"{u['source']}:{u['source_id']}" for u in un["updated"]}, {"cian:10", "avito:20"})
+        for u in un["updated"]:
+            self.assertEqual(u, by_srv3[f"{u['source']}:{u['source_id']}"])
+
+        # Сравнение быстрого _write_snapshots с эталонным history.compute на нескольких точках
+        server.objects_merge({"primary_id": "avito:20", "secondary_id": "cian:10"})
+        c = con()
+        pts = [("2026-01-02T18:00:00", 1), ("2026-01-11T18:00:00", 2), ("2026-01-16T18:00:00", 3)]
+        c.execute("DELETE FROM snapshots")
+        history._write_snapshots(c, pts)
+        snaps = [(r["ts"], json.loads(r["data"])) for r in c.execute("SELECT ts, data FROM snapshots ORDER BY ts")]
+        self.assertEqual(len(snaps), 3)
+        _, primaries = dedupe.active_manual_merges(c)
+        prev = None
+        for ts_pt, got in snaps:
+            live = []
+            for r in c.execute("SELECT * FROM listings WHERE excluded IS NULL OR excluded=''"):
+                ph = c.execute("SELECT price FROM price_history WHERE source=? AND source_id=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+                               (r["source"], r["source_id"], ts_pt)).fetchone()
+                if not ph or r["first_seen"] > ts_pt or (r["removed_at"] and r["removed_at"] <= ts_pt):
+                    continue
+                live.append(dict(r, price=ph["price"], manual_primary=(r["source"], str(r["source_id"])) in primaries))
+            ref = history.compute(live, history._event_counts(c, prev, ts_pt), history._event_counts(c, prev, ts_pt, zone="A"))
+            self.assertEqual(got, ref)
+            prev = ts_pt
+        c.close()
+
+        # Отложенный пересчёт снимков (defer_snapshots=True) помечает meta и синхронизируется при обращении к дашборду
+        m3 = server.objects_merge({"primary_id": "yandex:30", "secondary_id": m2["object_id"], "defer_snapshots": True})
+        self.assertTrue(m3["ok"])
+        c2 = con()
+        self.assertIsNotNone(c2.execute("SELECT value FROM meta WHERE key='snapshots_dirty'").fetchone())
+        c2.close()
+        dash = server.dashboard()
+        self.assertEqual(dash["recent"][-1]["all"]["count"], 1)
+        c3 = con()
+        self.assertIsNone(c3.execute("SELECT value FROM meta WHERE key='snapshots_dirty'").fetchone())
+        c3.close()

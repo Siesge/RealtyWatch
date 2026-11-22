@@ -16,13 +16,16 @@ from pathlib import Path
 # Журнал тестов не пишется в logs/app.log: обработчик ставится до импорта runner (setup_logging его не трогает)
 logging.getLogger().addHandler(logging.NullHandler())
 
-from app import alerts, db, human, images, net, paths, runlog, settings, transfer  # noqa: E402
+from app import alerts, db, human, images, net, paths, runlog, settings, tiles, transfer, updater  # noqa: E402
 from app import runner  # noqa: E402
 
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(paths.BROWSERS))
+os.environ.setdefault("RW_NO_UPDATER", "1")
 
 TMP_ROOT = Path(tempfile.mkdtemp(prefix="rw-tests-"))
 _REQUEST = net.Http.request
+_TILE_FETCH = tiles._fetch_url
+_UPDATER_FETCH = updater._fetch_bytes
 
 
 def _local_only(self, method, url, **kw):
@@ -31,11 +34,25 @@ def _local_only(self, method, url, **kw):
     return _REQUEST(self, method, url, **kw)
 
 
+def _local_tile_only(url, timeout=tiles.FETCH_TIMEOUT_SEC):
+    if not url.startswith("http://127.0.0.1"):
+        raise OSError(f"тест обратился к внешнему серверу тайлов: {url}")
+    return _TILE_FETCH(url, timeout=timeout)
+
+
+def _local_updater_only(url, accept="*/*", timeout=updater.HTTP_TIMEOUT_SEC, max_bytes=updater.MAX_ZIP_BYTES):
+    if not url.startswith("http://127.0.0.1"):
+        raise OSError(f"тест обратился к внешнему серверу обновлений: {url}")
+    return _UPDATER_FETCH(url, accept=accept, timeout=timeout, max_bytes=max_bytes)
+
+
 def _no_real_browser(self):
     raise AssertionError("тест запустил браузер с настоящим профилем — подмените загрузку страницы")
 
 
 net.Http.request = _local_only
+tiles._fetch_url = _local_tile_only
+updater._fetch_bytes = _local_updater_only
 net.Browser.start = _no_real_browser
 
 
@@ -91,9 +108,13 @@ def isolate(test):
     net.PROFILES = d / "profiles"
     runlog.RUNS_DIR, runlog.SNAP_DIR = d / "runs", d / "snapshots"
     images.IMAGES = transfer.IMAGES = d / "images"
+    tiles.TILES = d / "tiles"
     transfer.BACKUPS, transfer.DB_DIR = d / "backups", d
     alerts.FILE = d / "sound.json"
-    for p in (db.DB_FILE, settings.SETTINGS_FILE, images.IMAGES, transfer.BACKUPS, alerts.FILE, runlog.RUNS_DIR):
+    updater.DATA_DIR = d / "data"
+    updater.APP_ROOT = d / "app_root"
+    (updater.APP_ROOT / "app").mkdir(parents=True, exist_ok=True)
+    for p in (db.DB_FILE, settings.SETTINGS_FILE, images.IMAGES, tiles.TILES, transfer.BACKUPS, alerts.FILE, runlog.RUNS_DIR, updater.DATA_DIR, updater.APP_ROOT):
         assert TMP_ROOT in Path(p).parents, f"тест работает вне временной папки: {p}"
     images.repair = lambda *a, **k: None
     runner.pause = lambda *a, **k: None
