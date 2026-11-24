@@ -1,6 +1,8 @@
 """Настройки: значения по умолчанию + пользовательский data/settings.json."""
 import copy
+import hashlib
 import json
+import os
 import socket
 import threading
 import uuid
@@ -46,7 +48,7 @@ DEFAULTS = {
     # «Закрыть» закрывает программу (значок в трее и уведомления показываются, пока включена опция или расписание).
     "ui": {"tray_on_close": True},
     "server": {"port": 8765},
-    "lan": {"enabled": False, "port": 8766, "auto_discovery": True, "device_id": "", "device_name": ""},
+    "lan": {"enabled": False, "port": 8766, "auto_discovery": True, "device_id": "", "device_name": "", "machine_fp": ""},
     "updates": {"auto_check": True, "interval": "day"},
 }
 
@@ -90,28 +92,84 @@ def save(cfg):
             pass
 
 
+def machine_fingerprint() -> str:
+    """Короткий отпечаток текущей ОС/машины (Windows MachineGuid / hostname), чтобы обнаруживать перенос папки или БД на другой ПК."""
+    raw = ""
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as k:
+                val, _ = winreg.QueryValueEx(k, "MachineGuid")
+                raw = str(val or "").strip().lower()
+        except OSError:
+            raw = ""
+    if not raw:
+        raw = f"{(socket.gethostname() or '').strip().lower()}:{uuid.getnode()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def ensure_device_identity(con=None):
-    """Гарантирует наличие постоянного UUID (device_id) и понятного имени устройства для обмена и LAN."""
+    """Гарантирует наличие постоянного уникального UUID (device_id) для этого ПК.
+    Если папка или settings.json были скопированы с другого компьютера (machine_fp не совпал),
+    автоматически генерирует новый device_id, чтобы две машины не считали друг друга «самим собой»."""
     with _id_lock:
         cfg = load()
         lan = cfg.setdefault("lan", {})
-        dev_id = str(lan.get("device_id") or "").strip()
-        if not dev_id and con is not None:
+        cur_fp = machine_fingerprint()
+        saved_fp = str(lan.get("machine_fp") or "").strip()
+        host_name = (socket.gethostname() or "").strip() or "RealtyWatch"
+        cloned_from_other_pc = bool(saved_fp and cur_fp and saved_fp != cur_fp)
+
+        dev_id = "" if cloned_from_other_pc else str(lan.get("device_id") or "").strip()
+        if not dev_id and not cloned_from_other_pc and con is not None:
             row = con.execute("SELECT value FROM meta WHERE key='device_id'").fetchone()
             if row and row[0]:
                 dev_id = str(row[0]).strip()
         if not dev_id:
             dev_id = str(uuid.uuid4())
+
         dev_name = str(lan.get("device_name") or "").strip()
-        if not dev_name:
-            dev_name = (socket.gethostname() or "").strip() or "RealtyWatch"
-        if lan.get("device_id") != dev_id or lan.get("device_name") != dev_name:
+        if not dev_name or cloned_from_other_pc:
+            dev_name = host_name
+
+        if (
+            lan.get("device_id") != dev_id
+            or lan.get("device_name") != dev_name
+            or lan.get("machine_fp") != cur_fp
+        ):
             lan["device_id"] = dev_id
             lan["device_name"] = dev_name
+            lan["machine_fp"] = cur_fp
             save(cfg)
+
         if con is not None:
+            if cloned_from_other_pc:
+                try:
+                    con.execute("DELETE FROM sync_peers")
+                    con.execute("DELETE FROM sync_outbox")
+                except Exception:
+                    pass
             row = con.execute("SELECT value FROM meta WHERE key='device_id'").fetchone()
-            if not row or str(row[0] or "") != dev_id:
+            if not row or str(row[0] or "") != dev_id or cloned_from_other_pc:
                 con.execute("INSERT OR REPLACE INTO meta VALUES('device_id', ?)", (dev_id,))
                 con.commit()
         return {"device_id": dev_id, "device_name": dev_name}
+
+
+def rotate_device_id(con=None) -> dict:
+    """Принудительно назначает этому компьютеру новый уникальный device_id (при обнаружении клона ID в локальной сети)."""
+    with _id_lock:
+        cfg = load()
+        lan = cfg.setdefault("lan", {})
+        new_id = str(uuid.uuid4())
+        cur_fp = machine_fingerprint()
+        dev_name = str(lan.get("device_name") or "").strip() or (socket.gethostname() or "").strip() or "RealtyWatch"
+        lan["device_id"] = new_id
+        lan["device_name"] = dev_name
+        lan["machine_fp"] = cur_fp
+        save(cfg)
+        if con is not None:
+            con.execute("INSERT OR REPLACE INTO meta VALUES('device_id', ?)", (new_id,))
+            con.commit()
+        return {"device_id": new_id, "device_name": dev_name}

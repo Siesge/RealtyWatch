@@ -632,12 +632,12 @@ table.grid td.num.bad { color: var(--bad); }
 .j-body { height: 230px; overflow: auto; padding: 8px 16px 12px; font: 12px/1.6 "Cascadia Mono", Consolas, monospace; }
 .jl .t { color: var(--muted); } .jl .s { font-weight: 700; margin: 0 8px; }
 .jl.warn { color: var(--warn); font-weight: 700; }
-.toasts { position: fixed; right: 24px; top: 24px; z-index: 2000; display: flex; flex-direction: column; gap: 10px; }
+.toasts { position: fixed; right: 24px; top: 24px; z-index: 4500; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
 .toasts { max-width: calc(100vw - 48px); }
 .toast {
   min-width: min(300px, 100%); max-width: min(420px, calc(100vw - 48px)); padding: 14px 16px; border-radius: 14px; background: var(--surface); color: var(--ink);
   border: 1px solid var(--line); box-shadow: var(--shadow-2); display: flex; gap: 12px; align-items: flex-start; animation: tin .3s ease;
-  cursor: pointer; transition: border-color .15s;
+  cursor: pointer; transition: border-color .15s; pointer-events: auto;
 }
 .toast:hover { border-color: var(--line-2); }
 .toast.out { animation: tout .18s ease forwards; pointer-events: none; }
@@ -1421,3 +1421,30 @@ tr.spotlighted td { background: color-mix(in srgb, var(--accent) 11%, transparen
   border: 1px solid color-mix(in srgb, var(--good) 36%, var(--line));
   color: var(--ink); font-size: 12.5px;
 }
+.upd-splash-overlay {
+  position: fixed; inset: 0; z-index: 4800; display: grid; place-items: center; padding: 24px;
+  background: rgba(8, 10, 14, .72); backdrop-filter: blur(6px);
+}
+.upd-splash-card {
+  width: min(470px, 100%); padding: 24px 26px; border-radius: 18px;
+  background: var(--surface); color: var(--ink); border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-2); display: grid; gap: 10px;
+}
+.upd-splash-title { font-size: 18px; font-weight: 800; letter-spacing: -.015em; }
+.upd-splash-sub { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+.upd-splash-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; }
+.upd-splash-step { color: var(--ink-2); }
+.upd-splash-pct { color: var(--accent); font-variant-numeric: tabular-nums; }
+.upd-splash-track {
+  height: 11px; border-radius: 99px; background: var(--sunken); border: 1px solid var(--line);
+  overflow: hidden; position: relative;
+}
+.upd-splash-fill {
+  height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 70%, #4de0f5));
+  transition: width .25s ease;
+}
+.upd-splash-track.indeterminate .upd-splash-fill {
+  width: 38%; animation: updSlide 1.25s ease-in-out infinite alternate;
+}
+.upd-dl-progress { display: grid; gap: 8px; padding: 4px 0; }
+@keyframes updSlide { from { margin-left: 0%; } to { margin-left: 62%; } }

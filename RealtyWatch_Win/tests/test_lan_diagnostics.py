@@ -392,7 +392,7 @@ class LanDiagnosticsAndRealNetUnitTests(Case):
         # Проверяем п. 1: зонд ушёл строго с основного порта my_lan_port + 1 и содержит app_version!
         self.assertTrue(seen_probe_src_ports)
         self.assertTrue(all(p == my_lan_port + 1 for p in seen_probe_src_ports), f"зонды должны идти с порта {my_lan_port + 1}, было: {seen_probe_src_ports}")
-        self.assertIn("1.8.1", seen_probe_versions)
+        self.assertIn(lan_sync.current_lan_app_version(), seen_probe_versions)
 
         # Проверяем п. 4: diagnose_network видит ответ на my_lan_port+1 и выдаёт оба предупреждения (старый протокол + только по запросу)
         lan_sync.service._udp_started_mono = time.monotonic() - 10.0
@@ -508,7 +508,171 @@ class LanDiagnosticsAndRealNetUnitTests(Case):
         self.assertEqual(len(target_ips), 253)
         self.assertIn("192.168.2.148", target_ips)
         self.assertNotIn("192.168.2.119", target_ips)
-        self.assertTrue(all(pkt["disc_port"] == my_port + 1 and pkt["app_version"] == "1.8.1" for pkt, _a in sent_packets))
+        expected_ver = lan_sync.current_lan_app_version()
+        self.assertTrue(all(pkt["disc_port"] == my_port + 1 and pkt["app_version"] == expected_ver for pkt, _a in sent_packets))
+
+    def test_v182_cloned_device_id_auto_heal_on_discovery_pairing_and_import_replace(self):
+        """1.8.2: автоматическое устранение клона device_id (после копирования папки/settings.json или импорта БД replace):
+        1) несовпадение machine_fp при запуске генерирует новый уникальный device_id;
+        2) transfer.import_zip(..., mode='replace') сохраняет собственный device_id целевого компьютера;
+        3) приход пакета RW_DISCOVER_V1 с нашим же device_id с чужого IP (192.168.2.148) автоматически меняет наш ID и добавляет партнёра в discovered;
+        4) pair_with при ответе 400 «Нельзя сопрячь устройство с самим собой» от второго экземпляра (напр. 1.8.1) сам меняет ID и завершает сопряжение с первой попытки, а PIN живёт 10 минут (600 с)."""
+        from app import transfer
+
+        self.assertEqual(lan_sync.PIN_TTL_SEC, 600)
+
+        # 1) Проверка смены device_id при переносе папки с чужим machine_fp
+        cloned_id = "9a724ad8-413a-41a4-9c57-0926809f857e"
+        cfg = settings.load()
+        cfg["lan"] = {
+            "enabled": True,
+            "port": _free_port(),
+            "auto_discovery": False,
+            "device_id": cloned_id,
+            "device_name": "Чужой-ПК",
+            "machine_fp": "0000foreign000000",
+        }
+        settings.save(cfg)
+        c = con()
+        healed_ident = settings.ensure_device_identity(c)
+        c.close()
+        self.assertNotEqual(healed_ident["device_id"], cloned_id, "при чужом machine_fp должен создаться новый device_id")
+        self.assertEqual(settings.load()["lan"]["machine_fp"], settings.machine_fingerprint())
+
+        # 2) Проверка сохранения собственного device_id при transfer.import_zip(..., mode='replace')
+        export_zip_path = self.dir / "exported_from_pc1.zip"
+        transfer.export_zip(export_zip_path, with_images=False)
+        pc1_id = healed_ident["device_id"]
+
+        # Переключаем локальную машину на собственный ID pc2_id и импортируем архив PC1 в режиме replace
+        c2 = con()
+        pc2_ident = settings.rotate_device_id(c2)
+        c2.close()
+        pc2_id = pc2_ident["device_id"]
+        self.assertNotEqual(pc2_id, pc1_id)
+
+        transfer.import_zip(export_zip_path, mode="replace")
+        c3 = con()
+        after_replace = settings.ensure_device_identity(c3)
+        meta_id = c3.execute("SELECT value FROM meta WHERE key='device_id'").fetchone()[0]
+        c3.close()
+        self.assertEqual(after_replace["device_id"], pc2_id, "импорт базы в режиме replace НЕ должен затирать device_id этого ПК!")
+        self.assertEqual(meta_id, pc2_id)
+
+        # 3) Живое автоустранение коллизии при приёме UDP RW_DISCOVER_V1 с тем же device_id с чужого IP (192.168.2.148)
+        my_port = _free_port()
+        cur_fp = settings.machine_fingerprint()
+        cfg = settings.load()
+        cfg["lan"] = {
+            "enabled": True,
+            "port": my_port,
+            "auto_discovery": False,
+            "device_id": cloned_id,
+            "device_name": "BB-Portable",
+            "machine_fp": cur_fp,
+        }
+        settings.save(cfg)
+        c4 = con()
+        c4.execute("INSERT OR REPLACE INTO meta VALUES('device_id', ?)", (cloned_id,))
+        c4.commit()
+        c4.close()
+
+        lan_sync.service._handle_discovery_packet(
+            json.dumps({
+                "magic": "RW_DISCOVER_V1",
+                "device_id": cloned_id,
+                "device_name": "Olga",
+                "port": 8766,
+                "disc_port": 8767,
+                "platform": "windows",
+                "app_version": "1.8.1",
+            }).encode("utf-8"),
+            "192.168.2.148",
+            8767,
+            my_lan_port=my_port,
+        )
+        new_my_id = lan_sync.service._identity()["device_id"]
+        self.assertNotEqual(new_my_id, cloned_id, "при получении пакета с нашим ID с другого IP наш ID должен автоматически смениться")
+        disc = {d["device_id"]: d for d in lan_sync.service.list_discovered()}
+        self.assertIn(cloned_id, disc, "компьютер партнёра (Olga) должен сразу появиться в списке найденных устройств!")
+        self.assertEqual(disc[cloned_id]["device_name"], "Olga")
+        self.assertEqual(disc[cloned_id]["ip"], "192.168.2.148")
+
+        # 4) Автоповтор pair_with при ответе 400 «Нельзя сопрячь устройство с самим собой» от партнёра 1.8.1 с таким же ID
+        import http.server
+
+        forced_same_id = "deadbeef-same-uuid-181"
+        cfg = settings.load()
+        cfg["lan"]["device_id"] = forced_same_id
+        cfg["lan"]["machine_fp"] = cur_fp
+        settings.save(cfg)
+        c5 = con()
+        c5.execute("INSERT OR REPLACE INTO meta VALUES('device_id', ?)", (forced_same_id,))
+        c5.commit()
+        c5.close()
+
+        calls_seen: list[str] = []
+
+        class _MockPeer181Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                ln = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(ln).decode("utf-8"))
+                calls_seen.append(body["device_id"])
+                if body["device_id"] == forced_same_id:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"detail": "Нельзя сопрячь устройство с самим собой"}, ensure_ascii=False).encode("utf-8"))
+                    return
+                assert body["pin"] == "654321"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "ok": True,
+                    "device_id": forced_same_id,
+                    "device_name": "Olga",
+                    "port": self.server.server_port,
+                    "platform": "windows",
+                    "token": "peer-secret-token-181",
+                }, ensure_ascii=False).encode("utf-8"))
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "ok": True,
+                    "device_id": forced_same_id,
+                    "device_name": "Olga",
+                    "port": self.server.server_port,
+                    "platform": "windows",
+                }).encode("utf-8"))
+
+        srv181 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockPeer181Handler)
+        threading.Thread(target=srv181.serve_forever, daemon=True).start()
+        self.addCleanup(srv181.server_close)
+        self.addCleanup(srv181.shutdown)
+
+        lan_sync.service._bind_host = "127.0.0.1"
+        self.assertTrue(lan_sync.start_if_enabled())
+
+        pair_ok = lan_sync.pair_with("127.0.0.1", srv181.server_port, "654321")
+        self.assertTrue(pair_ok["ok"])
+        self.assertEqual(pair_ok["name"], "Olga")
+        self.assertEqual(len(calls_seen), 2, "первый запрос поймал 400 клона ID, второй тут же прошёл с новым уникальным ID")
+        self.assertEqual(calls_seen[0], forced_same_id)
+        self.assertNotEqual(calls_seen[1], forced_same_id)
+
+        # 5) Истинное подключение к самому себе (тот же IP + тот же порт) по-прежнему отклоняется!
+        my_pin = lan_sync.create_pin()
+        self.assertGreaterEqual(my_pin["remaining_sec"], 590)
+        with self.assertRaises(ValueError) as ctx_self:
+            lan_sync.pair_with("127.0.0.1", my_port, my_pin["pin"])
+        self.assertIn("самим собой", str(ctx_self.exception).lower())
 
     @unittest.skipUnless(
         (paths.ROOT.parent / "dist" / "RealtyWatch-1.7-windows-portable.zip").is_file(),
@@ -754,6 +918,23 @@ class LanDiagnosticsBrowserUITests(Case):
         self.assertEqual(page.input_value("#lanPairIp"), "127.0.0.1")
         self.assertEqual(page.input_value("#lanPairPort"), str(peer_tcp_port))
         self.assertTrue(page.evaluate("() => document.querySelector('details.lan-manual-pair')?.open === true"))
+
+        # 1.8.2: проверяем, что уведомления (#toasts) лежат ПОВЕРХ размытого модального фона (#modal), а PIN действует 10 мин
+        page.click("#btnLanCopyAddr")
+        page.wait_for_selector("#toasts .toast", state="visible", timeout=5000)
+        z_check = page.evaluate("""() => {
+            const toastEl = document.querySelector('#toasts .toast');
+            const rect = toastEl.getBoundingClientRect();
+            const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+            const zToast = parseInt(getComputedStyle(document.getElementById('toasts')).zIndex || '0', 10);
+            const zModal = parseInt(getComputedStyle(document.getElementById('modal')).zIndex || '0', 10);
+            return { zToast, zModal, toastOnTop: !!(hit && toastEl.contains(hit)) };
+        }""")
+        self.assertGreater(z_check["zToast"], z_check["zModal"], f"уведомления должны быть выше модального окна: {z_check}")
+        self.assertTrue(z_check["toastOnTop"], f"тост должен быть кликабелен поверх модального окна: {z_check}")
+        page.click("#btnLanGenPin")
+        page.wait_for_selector("#lanPinBox:not(.hidden)", timeout=5000)
+        self.assertIn("мин", page.text_content("#lanPinTtl"))
 
         self.assertEqual(js_errors, [], f"ошибки JS в браузере: {js_errors}")
 

@@ -37,19 +37,36 @@ DB_PREFIX = "RealtyWatch/database/"
 
 
 def add_db(zout):
-    """Кладёт в архив базу: снимок realty.db, настройки и фотографии. Возвращает число файлов."""
+    """Кладёт в архив базу: снимок realty.db, настройки и фотографии (очищая привязанный к ПК device_id и сопряжения). Возвращает число файлов."""
+    import json
+
     with tempfile.TemporaryDirectory() as tmp:
         snap = Path(tmp) / "realty.db"
         src, out = sqlite3.connect(APP / "database" / "realty.db"), sqlite3.connect(snap)
         with out:  # снимок согласован, даже если программа сейчас пишет в базу
             src.backup(out)
-        out.close()
         src.close()
+        try:
+            out.execute("DELETE FROM meta WHERE key='device_id'")
+            out.execute("DELETE FROM sync_peers")
+            out.execute("DELETE FROM sync_outbox")
+            out.commit()
+        except sqlite3.Error:
+            pass
+        out.close()
         zout.write(snap, DB_PREFIX + "realty.db")
     n = 1
     cfg = APP / "database" / "settings.json"
     if cfg.exists():
-        zout.write(cfg, DB_PREFIX + "settings.json")
+        try:
+            cfg_obj = json.loads(cfg.read_text(encoding="utf-8"))
+            if isinstance(cfg_obj.get("lan"), dict):
+                cfg_obj["lan"]["device_id"] = ""
+                cfg_obj["lan"]["device_name"] = ""
+                cfg_obj["lan"]["machine_fp"] = ""
+            zout.writestr(DB_PREFIX + "settings.json", json.dumps(cfg_obj, ensure_ascii=False, indent=2))
+        except Exception:
+            zout.write(cfg, DB_PREFIX + "settings.json")
         n += 1
     images = APP / "database" / "images"
     for p in sorted(images.rglob("*")) if images.exists() else []:

@@ -74,7 +74,7 @@ def _normalize_live_cfg(raw) -> dict:
         cfg["live_merges"] = bool(src["live_merges"])
     return cfg
 
-PIN_TTL_SEC = 120
+PIN_TTL_SEC = 600  # 10 минут — чтобы спокойно перейти к другому компьютеру и ввести PIN без спешки
 PIN_MAX_TRIES = 5
 DISCOVERY_TTL_SEC = 45.0
 DISCOVERY_INTERVAL_SEC = 4.0
@@ -1852,6 +1852,54 @@ class LanService:
             if own:
                 c.close()
 
+    def _all_local_ips(self) -> set[str]:
+        """Возвращает множество ВСЕХ IPv4-адресов текущего компьютера (включая loopback, Wi-Fi, Ethernet, VPN и виртуальные адаптеры),
+        чтобы безошибочно отличать собственные пакеты от пакетов другого ПК с клонированным device_id."""
+        ips = {"127.0.0.1", "0.0.0.0", "::1"}
+        try:
+            for ad in _raw_win32_adapters():
+                for ip_s, _pref in ad.get("addresses") or ():
+                    if ip_s:
+                        ips.add(_clean_ip_str(ip_s))
+        except Exception:
+            pass
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                addr = info[4][0]
+                if addr:
+                    ips.add(_clean_ip_str(addr))
+        except OSError:
+            pass
+        return ips
+
+    def _is_self_endpoint(self, ip_str: str, port_val: int, my_lan_port: int) -> bool:
+        """True только если (ip_str, port_val) указывает на ЭТОТ ЖЕ экземпляр RealtyWatch."""
+        clean = _clean_ip_str(ip_str)
+        if clean not in self._all_local_ips():
+            return False
+        if port_val and int(port_val) != int(my_lan_port):
+            return False
+        return True
+
+    def _heal_collided_device_id(self, remote_ip: str, remote_name: str = "") -> dict:
+        """Если папка/база была перенесена на другой ПК и в сети встретился клон нашего device_id,
+        автоматически назначает этому компьютеру новый уникальный device_id и оповещает сеть."""
+        con = db.connect()
+        try:
+            new_ident = settings.rotate_device_id(con)
+        finally:
+            con.close()
+        who = f"«{remote_name}» ({remote_ip})" if remote_name else remote_ip
+        _lan_log(
+            f"Обнаружено совпадение device_id с другим компьютером {who} (перенос базы/настроек) — "
+            f"этому ПК назначен новый уникальный ID {new_ident['device_id']}"
+        )
+        runner.manager.log(
+            "lan",
+            f"обнаружен одинаковый ID устройства с {who} — автоматически назначен новый уникальный ID",
+        )
+        return new_ident
+
     def _lan_cfg(self):
         cfg = settings.load()
         lan = cfg.get("lan") or {}
@@ -2397,6 +2445,8 @@ class LanService:
                     try:
                         sock.sendto(payload, (dst, p))
                     except OSError as e:
+                        if dst == "255.255.255.255" and getattr(e, "winerror", None) in (10065, 10051):
+                            continue
                         _lan_log(
                             f"Ошибка broadcast присутствия с порта {disc_port} -> {dst}:{p}: {e}",
                             logging.WARNING,
@@ -2747,9 +2797,21 @@ class LanService:
         finally:
             con.close()
 
-        if dev_id == ident["device_id"]:
-            return
         eff_my_port = int(my_lan_port or self._running_port or self._lan_cfg()["port"])
+        try:
+            pkt_port_raw = int(pkt.get("port") or 0)
+        except (TypeError, ValueError):
+            pkt_port_raw = 0
+
+        if dev_id == ident["device_id"]:
+            if self._is_self_endpoint(clean_ip, pkt_port_raw, eff_my_port):
+                return
+            # На другом компьютере в сети клонирован наш device_id (например, после копирования папки или импорта базы):
+            # автоматически меняем свой ID на уникальный и продолжаем обработку пакета партнёра!
+            ident = self._heal_collided_device_id(clean_ip, str(pkt.get("device_name") or ""))
+            paired_row = None
+            if self._lan_cfg()["enabled"]:
+                self._broadcast_presence(eff_my_port, eff_my_port + 1)
 
         if magic == _PROBE_MAGIC:
             # Отвечаем с того же сокета rx (порт 8767), на который поступил зонд
@@ -2825,6 +2887,10 @@ class LanService:
             spontaneous_bcast = False
 
         with self._lock:
+            # Если тот же узел (ip:port) сменил device_id (например, при автоустранении клона ID), убираем старую запись
+            for old_id, old_v in list(self._discovered.items()):
+                if old_id != dev_id and old_v.get("ip") == clean_ip and int(old_v.get("port") or 0) == port:
+                    self._discovered.pop(old_id, None)
             prev = self._discovered.get(dev_id) or {}
             is_new = dev_id not in self._discovered
             app_ver = raw_ver or str(prev.get("app_version") or "")
@@ -3336,24 +3402,43 @@ class LanService:
             settings.save(full_cfg)
             self.reconfigure()
             my_cfg = self._lan_cfg()
+        my_port_now = int(self._running_port or my_cfg["port"])
         token_for_peer = secrets.token_urlsafe(32)
-        payload = json.dumps({
-            "pin": pin_s,
-            "device_id": ident["device_id"],
-            "device_name": ident["device_name"],
-            "port": self._running_port or my_cfg["port"],
-            "token": token_for_peer,
-            "platform": "windows",
-        }, ensure_ascii=False).encode("utf-8")
 
-        try:
-            st, data = _http_call(
-                clean_ip, p, "POST", "/sync/pair", body=payload,
+        def _send_pair_req(cur_ident: dict):
+            req_payload = json.dumps({
+                "pin": pin_s,
+                "device_id": cur_ident["device_id"],
+                "device_name": cur_ident["device_name"],
+                "port": my_port_now,
+                "token": token_for_peer,
+                "platform": "windows",
+            }, ensure_ascii=False).encode("utf-8")
+            return _http_call(
+                clean_ip, p, "POST", "/sync/pair", body=req_payload,
                 headers={"Content-Type": "application/json"}, timeout=5.0,
             )
+
+        try:
+            st, data = _send_pair_req(ident)
         except Exception as e:
             _lan_log(f"Ошибка сопряжения с {clean_ip}:{p}: {e}", logging.WARNING)
             raise ValueError(f"не удалось связаться с {clean_ip}:{p} — {e}")
+
+        # Если второй ПК (например, на 1.8.1) ответил 400 «Нельзя сопрячь устройство с самим собой» из-за клонированного device_id,
+        # а адрес/порт принадлежит ДРУГОМУ экземпляру — автоматически меняем свой device_id и сразу повторяем запрос!
+        detail_str = str((data or {}).get("detail") or "")
+        if (
+            st == 400
+            and "самим собой" in detail_str.lower()
+            and not self._is_self_endpoint(clean_ip, p, my_port_now)
+        ):
+            ident = self._heal_collided_device_id(clean_ip)
+            try:
+                st, data = _send_pair_req(ident)
+            except Exception as e:
+                _lan_log(f"Ошибка повторного сопряжения с {clean_ip}:{p}: {e}", logging.WARNING)
+                raise ValueError(f"не удалось связаться с {clean_ip}:{p} — {e}")
 
         if st != 200 or not data.get("ok"):
             _lan_log(f"Отказ сопряжения от {clean_ip}:{p}: HTTP {st} ({data.get('detail')})", logging.WARNING)
@@ -3366,7 +3451,9 @@ class LanService:
         if not peer_id or not peer_token:
             raise ValueError("удалённое устройство вернуло неполные данные сопряжения")
         if peer_id == ident["device_id"]:
-            raise ValueError("нельзя сопрячь устройство с самим собой")
+            if self._is_self_endpoint(clean_ip, peer_port, my_port_now):
+                raise ValueError("нельзя сопрячь устройство с самим собой")
+            ident = self._heal_collided_device_id(clean_ip, peer_name)
 
         now_s = _now_ts()
         con = db.connect()
@@ -3868,19 +3955,21 @@ class LanService:
             wake_evt = threading.Event()
 
             def _on_diag_pkt(pkt_p: dict, addr_ip: str, addr_port: int):
-                nonlocal self_replied
+                nonlocal self_replied, my_ident
                 if pkt_p.get("magic") != _DISCOVERY_MAGIC:
                     return
                 did = str(pkt_p.get("device_id") or "").strip()
                 if not did:
                     return
-                if did == my_ident["device_id"] or (addr_ip in my_ips and int(pkt_p.get("port") or 0) == lan_port):
+                dport = int(pkt_p.get("port") or 8766)
+                if self._is_self_endpoint(addr_ip, dport, lan_port):
                     self_replied = True
                     return
+                if did == my_ident["device_id"]:
+                    my_ident = self._heal_collided_device_id(addr_ip, str(pkt_p.get("device_name") or ""))
                 if did.startswith("diag-") or pkt_p.get("platform") == "diag":
                     return
                 dname = str(pkt_p.get("device_name") or addr_ip)
-                dport = int(pkt_p.get("port") or 8766)
                 dver = str(pkt_p.get("app_version") or "").strip()
                 rec = peer_replies.get(did)
                 if rec is None:
@@ -5876,12 +5965,16 @@ class LanService:
             if not peer_id or not peer_token or not (1 <= peer_port <= 65535):
                 raise HTTPException(400, "Отсутствуют обязательные параметры устройства")
 
+            client_ip = _clean_ip_str(request.client.host if request.client else "") or "127.0.0.1"
+            cfg = svc._lan_cfg()
+            eff_srv_port = int(svc._running_port or cfg["port"])
+
             con = db.connect()
             try:
                 ident = svc._identity(con)
             finally:
                 con.close()
-            if peer_id == ident["device_id"]:
+            if peer_id == ident["device_id"] and svc._is_self_endpoint(client_ip, peer_port, eff_srv_port):
                 raise HTTPException(400, "Нельзя сопрячь устройство с самим собой")
 
             with svc._lock:
@@ -5899,8 +5992,10 @@ class LanService:
                 # PIN одноразовый — после успешной проверки сразу гасим
                 svc._pin_state = None
 
+            if peer_id == ident["device_id"]:
+                ident = svc._heal_collided_device_id(client_ip, peer_name)
+
             token_from_me = secrets.token_urlsafe(32)
-            client_ip = _clean_ip_str(request.client.host if request.client else "") or "127.0.0.1"
             now_s = _now_ts()
 
             con = db.connect()

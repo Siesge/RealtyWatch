@@ -18,6 +18,7 @@ logging.getLogger().addHandler(logging.NullHandler())
 TMP_ROOT = Path(tempfile.mkdtemp(prefix="rw-tests-"))
 os.environ.setdefault("RW_LOGS_DIR", str(TMP_ROOT / "logs"))
 os.environ.setdefault("RW_NO_UPDATER", "1")
+os.environ.setdefault("RW_NO_UPDATE_SPLASH", "1")
 
 from app import alerts, db, human, images, net, paths, runlog, settings, tiles, transfer, updater  # noqa: E402
 from app import runner  # noqa: E402

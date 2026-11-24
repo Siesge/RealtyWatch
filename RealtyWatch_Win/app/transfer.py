@@ -15,7 +15,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from . import db, dedupe, history, trash
+from . import db, dedupe, history, settings, trash
 from .paths import BACKUPS, DB_DIR, IMAGES
 
 FORMAT = "realtywatch-db"
@@ -194,6 +194,21 @@ def import_zip(path, mode="merge", before="перед_импортом"):
 
 
 def _replace(imported, z):
+    # Сохраняем собственную сетевую идентичность и сопряжённые устройства ЭТОГО компьютера,
+    # чтобы импорт чужой резервной копии в режиме «Заменить базу» никогда не клонировал чужой device_id!
+    prev_cfg = settings.load()
+    prev_lan = dict(prev_cfg.get("lan") or {})
+    prev_srv = dict(prev_cfg.get("server") or {})
+    prev_con = db.connect()
+    try:
+        prev_ident = settings.ensure_device_identity(prev_con)
+        try:
+            prev_peers = [dict(r) for r in prev_con.execute("SELECT * FROM sync_peers")]
+        except sqlite3.Error:
+            prev_peers = []
+    finally:
+        prev_con.close()
+
     src = sqlite3.connect(imported)
     dst = db.connect()
     try:
@@ -203,9 +218,35 @@ def _replace(imported, z):
         src.close()
     db.reset()
     if "settings.json" in z.namelist():
-        (DB_DIR / "settings.json").write_bytes(z.read("settings.json"))
+        (settings.SETTINGS_FILE).write_bytes(z.read("settings.json"))
+        merged_cfg = settings.load()
+        merged_lan = dict(merged_cfg.get("lan") or {})
+        merged_lan.update({
+            "enabled": bool(prev_lan.get("enabled", merged_lan.get("enabled", False))),
+            "port": prev_lan.get("port", merged_lan.get("port", 8766)),
+            "auto_discovery": bool(prev_lan.get("auto_discovery", merged_lan.get("auto_discovery", True))),
+            "device_id": prev_ident["device_id"],
+            "device_name": prev_ident["device_name"],
+            "machine_fp": settings.machine_fingerprint(),
+        })
+        merged_cfg["lan"] = merged_lan
+        if prev_srv:
+            merged_cfg["server"] = prev_srv
+        settings.save(merged_cfg)
+
     con = db.connect()
     try:
+        con.execute("INSERT OR REPLACE INTO meta VALUES('device_id', ?)", (prev_ident["device_id"],))
+        try:
+            con.execute("DELETE FROM sync_peers")
+            con.execute("DELETE FROM sync_outbox")
+            for p in prev_peers:
+                cols = [k for k in p.keys()]
+                ph = ",".join("?" * len(cols))
+                con.execute(f"INSERT OR REPLACE INTO sync_peers({','.join(cols)}) VALUES({ph})", [p[c] for c in cols])
+        except sqlite3.Error:
+            pass
+        con.commit()
         n = con.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
     finally:
         con.close()

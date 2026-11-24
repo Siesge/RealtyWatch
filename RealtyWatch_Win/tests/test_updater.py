@@ -47,8 +47,11 @@ class UpdaterCoreAndCleanupTests(Case):
         self.assertEqual(updater.parse_version("RealtyWatch 1.5.0, сборка 2026-11-17, коммит abc"), (1, 5))
         self.assertEqual(updater.parse_version("1.8"), (1, 8))
         self.assertEqual(updater.parse_version("1.8.1"), (1, 8, 1))
+        self.assertEqual(updater.parse_version("1.8.2"), (1, 8, 2))
         self.assertGreater(updater.parse_version("1.8.1"), updater.parse_version("1.8"))
+        self.assertGreater(updater.parse_version("1.8.2"), updater.parse_version("1.8.1"))
         self.assertTrue(updater.is_newer_version("v1.8.1", "1.8"))
+        self.assertTrue(updater.is_newer_version("v1.8.2", "1.8.1"))
         self.assertTrue(updater.is_newer_version("1.8.1", "RealtyWatch 1.8, сборка 2026-11-24, коммит ad78e24"))
         self.assertTrue(updater.is_newer_version("v1.6", "1.5"))
         self.assertTrue(updater.is_newer_version("1.10", "1.9"))
@@ -553,6 +556,9 @@ sys.exit(0)
         env = os.environ.copy()
         env["RW_LOGS_DIR"] = str(self.dir / "logs")
         env["RW_NO_UPDATER"] = "1"
+        # Проверяем также реальную инициализацию и пошаговый прогресс WinForms сплэш-окна (с прозрачностью 0.01, чтобы не мешать экрану)
+        env["RW_NO_UPDATE_SPLASH"] = "0"
+        env["RW_SPLASH_OPACITY"] = "0.01"
         rc = subprocess.run([parent_exe, "-c", child_code], cwd=repo_win, env=env, timeout=20).returncode
         self.assertEqual(rc, 0)
         self.assertTrue(marker_parent_done.is_file(), "родительский pythonw должен успешно запустить powershell и выйти")
@@ -575,6 +581,7 @@ sys.exit(0)
         self.assertFalse((data_dir / "update_staging").exists(), "папка update_staging полностью очищена")
         log_txt = upd_log.read_text(encoding="utf-8", errors="replace")
         self.assertIn("[ps1] === Старт run_update.ps1", log_txt)
+        self.assertIn("Сплэш-окно обновления показано", log_txt)
         self.assertIn("[py] apply_staged.py: файлы версии v1.8 успешно применены", log_txt)
         self.assertIn("[ps1] === Завершение run_update.ps1 (код apply=0) ===", log_txt)
 
@@ -701,6 +708,15 @@ class UpdaterSettingsUITests(Case):
         page.wait_for_selector("#updModalClose", state="visible", timeout=3000)
         self.assertIn("раз в день, неделю и месяц", page.text_content("#modalBody"))
         page.click("#updModalClose")
+
+        # 1.8.2: при нажатии «Обновить и перезапустить» появляется полноэкранный сплэш-скрин с прогресс-баром
+        with patch.object(updater.service, "apply_update", return_value={"ok": True, "version": "1.6"}):
+            page.evaluate("() => document.querySelectorAll('#toasts .toast').forEach(t => t.remove())")
+            page.click("#btnApplyUpdate")
+            page.wait_for_selector("#updateSplash", state="visible", timeout=5000)
+            self.assertIn("1.6", page.text_content("#updateSplash"))
+            self.assertGreater(page.locator("#updSplashFill").count(), 0)
+            page.evaluate("() => document.getElementById('updateSplash')?.remove()")
 
         # A4: проверяем заметную плашку dev-режима (когда нет version.txt и есть .git) и в шапке, и в настройках
         (root / "version.txt").unlink(missing_ok=True)

@@ -1994,14 +1994,43 @@ function showUpdateNotesModal(u) {
   if (go) go.onclick = async () => { closeModal(); await applyStagedUpdate(go); };
 }
 
+function showUpdateSplash(ver = "", stepText = "Создаю резервную копию базы данных и запускаю установщик…", pct = 24) {
+  let el = $("#updateSplash");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "updateSplash";
+    el.className = "upd-splash-overlay";
+    document.body.appendChild(el);
+  }
+  const vLbl = ver ? ` → v${esc(ver)}` : "";
+  el.innerHTML = `<div class="upd-splash-card">
+    <div class="upd-splash-title">Обновление RealtyWatch${vLbl}</div>
+    <div class="upd-splash-sub">База данных, заметки, лайки и ручные объединения полностью сохраняются</div>
+    <div class="upd-splash-row">
+      <span class="upd-splash-step" id="updSplashStep">${esc(stepText)}</span>
+      <b class="upd-splash-pct" id="updSplashPct">${Math.round(pct)}%</b>
+    </div>
+    <div class="upd-splash-track"><div class="upd-splash-fill" id="updSplashFill" style="width:${Math.round(pct)}%"></div></div>
+  </div>`;
+  el.classList.remove("hidden");
+}
+
+function hideUpdateSplash() {
+  const el = $("#updateSplash");
+  if (el) el.remove();
+}
+
 async function applyStagedUpdate(btn = null) {
   if (btn) btn.disabled = true;
+  const targetVer = (UPD_SUM && UPD_SUM.available_version) || "";
+  showUpdateSplash(targetVer, "Создаю страховочную копию базы и готовлю пакет обновления…", 22);
   try {
     const r = await post("/api/update/apply", {});
-    toast("ok", `Устанавливаю RealtyWatch ${r.version || ""}…`, "Резервная копия базы создана. Сейчас окно закроется и перезапустится с новой версией.");
+    showUpdateSplash(r.version || targetVer, "Запускается установщик обновления — окно сейчас перезапустится…", 48);
     const bar = $("#updateBar");
     if (bar) bar.classList.add("hidden");
   } catch (e) {
+    hideUpdateSplash();
     toast("warn", "Не удалось запустить обновление", e.message || String(e));
     if (btn) btn.disabled = false;
   }
@@ -2093,7 +2122,10 @@ async function loadUpdateStatus() {
 async function checkUpdatesManual(btn) {
   if (btn) btn.disabled = true;
   if ($("#updStatusBox")) {
-    $("#updStatusBox").innerHTML = `<div class="upd-cur-line"><span class="meta">Обращаюсь к GitHub Releases…</span></div>`;
+    $("#updStatusBox").innerHTML = `<div class="upd-dl-progress">
+      <div class="upd-cur-line"><b>Проверяю GitHub Releases и загружаю обновление…</b></div>
+      <div class="upd-splash-track indeterminate"><div class="upd-splash-fill"></div></div>
+    </div>`;
   }
   try {
     const st = await post("/api/update/check", {});
@@ -3699,6 +3731,15 @@ async function openLanModal(prefetched = null) {
   renderLanModalBody(st);
 }
 
+function formatPinTtl(sec) {
+  const s = Math.max(0, Math.round(+sec || 0));
+  if (s >= 60) {
+    const m = Math.floor(s / 60), r = s % 60;
+    return r ? `действует ${m} мин ${r} с` : `действует ${m} мин`;
+  }
+  return `действует ${s} с`;
+}
+
 let LAN_LAST_SEARCH_EMPTY = false;
 let LAN_LAST_DIAG = null;
 
@@ -3972,7 +4013,7 @@ function renderLanModalBody(st) {
       <div class="lan-pin-box${pin.active ? "" : " hidden"}" id="lanPinBox">
         <span class="meta">Одноразовый PIN (сообщите другому устройству):</span>
         <b class="lan-pin-code" id="lanPinCode">${pin.active ? esc(String(pin.pin).replace(/(\d{3})(\d{3})/, "$1 $2")) : ""}</b>
-        <span class="lan-pin-ttl" id="lanPinTtl">${pin.active ? `действует ${pin.remaining_sec} с` : ""}</span>
+        <span class="lan-pin-ttl" id="lanPinTtl">${pin.active ? formatPinTtl(pin.remaining_sec) : ""}</span>
       </div>
     </div>
 
@@ -4017,7 +4058,7 @@ function renderLanModalBody(st) {
         if (lanPinTimer) { clearInterval(lanPinTimer); lanPinTimer = null; }
         boxEl.classList.add("hidden");
       } else {
-        ttlEl.textContent = `действует ${left} с`;
+        ttlEl.textContent = formatPinTtl(left);
       }
     }, 1000);
   }
