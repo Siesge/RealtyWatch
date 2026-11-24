@@ -1,6 +1,8 @@
 """Обмен и синхронизация по локальной сети (LAN): сервер /sync/* на отдельном порту,
 UDP-обнаружение устройств рядом, сопряжение по одноразовому PIN-коду,
 передача карточек, Избранного и полной базы с сохранением личных отметок."""
+import base64
+import ctypes
 import hashlib
 import hmac
 import http.client
@@ -8,11 +10,16 @@ import io
 import ipaddress
 import json
 import logging
+import os
 import re
 import secrets
+import select
 import shutil
 import socket
 import sqlite3
+import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,7 +35,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from . import db, dedupe, exchange, history, images, runner, settings, transfer
+from . import db, dedupe, exchange, history, images, paths, runlog, runner, settings, transfer
 
 log = logging.getLogger(__name__)
 
@@ -128,43 +135,771 @@ def _is_lan_ip(host: str) -> bool:
     return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
 
 
-def local_ipv4s():
-    """Локальные IPv4-адреса машины в LAN (первым идёт адрес основного маршрута)."""
-    found = []
-    seen = set()
+_LAN_LOG_RATE_LOCK = threading.Lock()
+_LAN_LOG_RATES: dict[str, float] = {}
 
-    def add(ip_str):
-        ip_str = (ip_str or "").strip()
-        if not ip_str or ip_str in seen:
-            return
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            return
-        if ip.version != 4 or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or not ip.is_private:
-            return
-        seen.add(ip_str)
-        found.append(ip_str)
 
-    # Сначала пробуем определить исходящий LAN-интерфейс (без реальной отправки пакетов)
-    for probe in ("192.168.1.1", "10.0.0.1", "8.8.8.8"):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect((probe, 80))
-                add(s.getsockname()[0])
-            finally:
-                s.close()
-        except OSError:
-            pass
-
+def _lan_log(msg: str, level: int = logging.INFO, *, rate_key: str = "", min_interval: float = 0.0):
+    """Пишет диагностические события и сетевые ошибки в ротируемый logs/lan.log с защитой от спама."""
+    if rate_key and min_interval > 0:
+        now_m = time.monotonic()
+        with _LAN_LOG_RATE_LOCK:
+            prev = _LAN_LOG_RATES.get(rate_key, 0.0)
+            if (now_m - prev) < min_interval:
+                return
+            _LAN_LOG_RATES[rate_key] = now_m
+            if len(_LAN_LOG_RATES) > 500:
+                cutoff = now_m - 600.0
+                for k in [k for k, ts in _LAN_LOG_RATES.items() if ts < cutoff]:
+                    _LAN_LOG_RATES.pop(k, None)
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            add(info[4][0])
-    except OSError:
+        lg = runlog.setup_lan_logging()
+        lg.log(level, msg)
+    except Exception:
         pass
 
-    return found
+
+_VPN_SUBSTR_HINTS = (
+    "vpn", "amnezia", "wireguard", "wintun", "openvpn", "tailscale", "zerotier",
+    "hamachi", "radmin", "outline", "nordlynx", "nordvpn", "protonvpn", "sing-box",
+    "nekoray", "clash", "v2ray", "xray", "cloudflare warp", "anyconnect", "fortissl",
+    "globalprotect", "kaspersky vpn", "hidemy", "surfshark", "expressvpn",
+)
+_VIRT_ONLY_SUBSTR_HINTS = (
+    "vmware", "vmnet", "virtualbox", "vbox", "hyper-v", "vethernet", "wsl", "docker",
+    "loopback", "wi-fi direct virtual", "hosted network", "bluetooth", "npcap",
+    "teredo", "isatap", "6to4", "virtual adapter", "pseudo-interface", "virtual ethernet",
+)
+_SHORT_TUN_RE = re.compile(r"\b(?:wg\d*|tap\d*|tun\d*)\b", re.IGNORECASE)
+
+
+def is_virtual_or_vpn_adapter(name: str, description: str = "", if_type: int = 0) -> tuple[bool, bool]:
+    """Возвращает (is_virtual, is_vpn) для сетевого адаптера Windows по имени, описанию и типу IANA."""
+    combined = f"{name or ''} {description or ''}".lower()
+    is_vpn = (
+        int(if_type or 0) in (23, 131)  # PPP, TUNNEL
+        or any(h in combined for h in _VPN_SUBSTR_HINTS)
+        or bool(_SHORT_TUN_RE.search(combined))
+    )
+    if int(if_type or 0) == 53 and not any(h in combined for h in _VIRT_ONLY_SUBSTR_HINTS):
+        # IF_TYPE_PROP_VIRTUAL (53) используется Wintun / AmneziaVPN / WireGuard
+        is_vpn = True
+    is_virt = (
+        is_vpn
+        or int(if_type or 0) in (24, 53)  # LOOPBACK, PROP_VIRTUAL
+        or any(h in combined for h in _VIRT_ONLY_SUBSTR_HINTS)
+    )
+    return is_virt, is_vpn
+
+
+def compute_subnet_broadcast(ip_str: str, prefix: int) -> str | None:
+    """Считает направленный broadcast-адрес подсети по реальной маске (префиксу), исключая /31 и /32."""
+    try:
+        plen = int(prefix)
+    except (TypeError, ValueError):
+        return None
+    if plen <= 0 or plen >= 31:
+        return None
+    try:
+        iface = ipaddress.IPv4Interface(f"{(ip_str or '').strip()}/{plen}")
+    except ValueError:
+        return None
+    bcast = str(iface.network.broadcast_address)
+    return bcast if bcast and bcast != ip_str else None
+
+
+def _raw_win32_adapters() -> list[dict]:
+    """Читает список сетевых адаптеров, их IPv4/маски и шлюзы через Win32 GetAdaptersAddresses (< 1 мс)."""
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes.wintypes as wt
+
+        class SOCKET_ADDRESS(ctypes.Structure):
+            _fields_ = [("lpSockaddr", ctypes.c_void_p), ("iSockaddrLength", ctypes.c_int)]
+
+        class IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
+            pass
+
+        IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
+            ("Length", wt.ULONG),
+            ("Flags", wt.DWORD),
+            ("Next", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+            ("Address", SOCKET_ADDRESS),
+            ("PrefixOrigin", ctypes.c_int),
+            ("SuffixOrigin", ctypes.c_int),
+            ("DadState", ctypes.c_int),
+            ("ValidLifetime", wt.ULONG),
+            ("PreferredLifetime", wt.ULONG),
+            ("LeaseLifetime", wt.ULONG),
+            ("OnLinkPrefixLength", ctypes.c_ubyte),
+        ]
+
+        class IP_ADAPTER_GATEWAY_ADDRESS(ctypes.Structure):
+            pass
+
+        IP_ADAPTER_GATEWAY_ADDRESS._fields_ = [
+            ("Length", wt.ULONG),
+            ("Reserved", wt.DWORD),
+            ("Next", ctypes.POINTER(IP_ADAPTER_GATEWAY_ADDRESS)),
+            ("Address", SOCKET_ADDRESS),
+        ]
+
+        class IP_ADAPTER_ADDRESSES(ctypes.Structure):
+            pass
+
+        IP_ADAPTER_ADDRESSES._fields_ = [
+            ("Length", wt.ULONG),
+            ("IfIndex", wt.DWORD),
+            ("Next", ctypes.POINTER(IP_ADAPTER_ADDRESSES)),
+            ("AdapterName", ctypes.c_char_p),
+            ("FirstUnicastAddress", ctypes.POINTER(IP_ADAPTER_UNICAST_ADDRESS)),
+            ("FirstAnycastAddress", ctypes.c_void_p),
+            ("FirstMulticastAddress", ctypes.c_void_p),
+            ("FirstDnsServerAddress", ctypes.c_void_p),
+            ("DnsSuffix", wt.LPWSTR),
+            ("Description", wt.LPWSTR),
+            ("FriendlyName", wt.LPWSTR),
+            ("PhysicalAddress", ctypes.c_ubyte * 8),
+            ("PhysicalAddressLength", wt.DWORD),
+            ("Flags", wt.DWORD),
+            ("Mtu", wt.DWORD),
+            ("IfType", wt.DWORD),
+            ("OperStatus", ctypes.c_int),
+            ("Ipv6IfIndex", wt.DWORD),
+            ("ZoneIndices", wt.DWORD * 16),
+            ("FirstPrefix", ctypes.c_void_p),
+            ("TransmitLinkSpeed", ctypes.c_uint64),
+            ("ReceiveLinkSpeed", ctypes.c_uint64),
+            ("FirstWinsServerAddress", ctypes.c_void_p),
+            ("FirstGatewayAddress", ctypes.POINTER(IP_ADAPTER_GATEWAY_ADDRESS)),
+        ]
+
+        def _sock_ipv4(sa) -> str | None:
+            if not sa.lpSockaddr or sa.iSockaddrLength < 8:
+                return None
+            raw = ctypes.string_at(sa.lpSockaddr, sa.iSockaddrLength)
+            fam = struct.unpack_from("<H", raw, 0)[0]
+            return socket.inet_ntoa(raw[4:8]) if fam == socket.AF_INET else None
+
+        iphlp = ctypes.windll.iphlpapi
+        flags = 0x0010 | 0x0080  # GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS
+        sz = wt.ULONG(65536)
+        buf = ctypes.create_string_buffer(sz.value)
+        rc = iphlp.GetAdaptersAddresses(socket.AF_INET, flags, None, ctypes.byref(buf), ctypes.byref(sz))
+        if rc == 111:  # ERROR_BUFFER_OVERFLOW
+            buf = ctypes.create_string_buffer(sz.value)
+            rc = iphlp.GetAdaptersAddresses(socket.AF_INET, flags, None, ctypes.byref(buf), ctypes.byref(sz))
+        if rc != 0:
+            return []
+
+        out: list[dict] = []
+        cur = ctypes.cast(buf, ctypes.POINTER(IP_ADAPTER_ADDRESSES))
+        while cur:
+            a = cur.contents
+            addrs: list[tuple[str, int]] = []
+            u = a.FirstUnicastAddress
+            while u:
+                ip_s = _sock_ipv4(u.contents.Address)
+                if ip_s:
+                    addrs.append((ip_s, int(u.contents.OnLinkPrefixLength or 24)))
+                u = u.contents.Next
+            gws: list[str] = []
+            g = a.FirstGatewayAddress
+            while g:
+                gw_s = _sock_ipv4(g.contents.Address)
+                if gw_s:
+                    gws.append(gw_s)
+                g = g.contents.Next
+            out.append({
+                "if_index": int(a.IfIndex),
+                "oper_status": int(a.OperStatus),
+                "if_type": int(a.IfType),
+                "name": str(a.FriendlyName or ""),
+                "description": str(a.Description or ""),
+                "addresses": addrs,
+                "gateways": gws,
+            })
+            cur = a.Next
+        return out
+    except Exception as e:
+        _lan_log(f"Ошибка чтения адаптеров GetAdaptersAddresses: {e}", logging.WARNING, rate_key="gaa_err", min_interval=60.0)
+        return []
+
+
+def _best_route_if_index(dest_ip: str) -> int | None:
+    """Определяет индекс интерфейса, через который Windows реально отправит пакет на dest_ip."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes.wintypes as wt
+
+        packed = socket.inet_aton((dest_ip or "").strip())
+        sa = struct.pack("<HH4s8x", socket.AF_INET, 0, packed)
+        idx = wt.DWORD(0)
+        rc = ctypes.windll.iphlpapi.GetBestInterfaceEx(sa, ctypes.byref(idx))
+        return int(idx.value) if rc == 0 else None
+    except Exception:
+        return None
+
+
+def _classify_adapter_kind(name: str, description: str, if_type: int) -> str:
+    combined = f"{name or ''} {description or ''}".lower()
+    if int(if_type or 0) == 71 or any(w in combined for w in ("wi-fi", "wifi", "wireless", "wlan", "802.11", "беспроводн")):
+        return "wifi"
+    if int(if_type or 0) == 6 or any(w in combined for w in ("ethernet", "gbe", "gigabit", "realtek pcie", "intel(r) ethernet", "локальн")):
+        return "ethernet"
+    return "lan"
+
+
+def local_ipv4s(raw_adapters: list[dict] | None = None) -> list[dict]:
+    """Возвращает физические LAN-интерфейсы машины [{ip, prefix, adapter, kind, ...}]:
+    - исключает VPN и виртуальные адаптеры (Amnezia/WireGuard/Wintun/TAP/VMware/Hyper-V/WSL/Docker и др.) и /32;
+    - первым ставит физический Wi-Fi/Ethernet, у которого есть шлюз по умолчанию."""
+    adapters = _raw_win32_adapters() if raw_adapters is None else list(raw_adapters)
+    candidates: list[tuple[tuple, dict]] = []
+    seen_ips: set[str] = set()
+
+    for ad in adapters:
+        if int(ad.get("oper_status") or 0) != 1:  # IfOperStatusUp == 1
+            continue
+        name = str(ad.get("name") or "").strip()
+        descr = str(ad.get("description") or "").strip()
+        if_type = int(ad.get("if_type") or 0)
+        if_index = int(ad.get("if_index") or 0)
+        is_virt, _ = is_virtual_or_vpn_adapter(name, descr, if_type)
+        if is_virt:
+            continue
+
+        real_gws = [
+            str(g).strip()
+            for g in (ad.get("gateways") or [])
+            if g and str(g).strip() not in ("", "0.0.0.0") and not str(g).strip().startswith("127.")
+        ]
+        has_gw = bool(real_gws)
+        kind = _classify_adapter_kind(name, descr, if_type)
+
+        for ip_raw, prefix_raw in (ad.get("addresses") or []):
+            ip_str = str(ip_raw or "").strip()
+            if not ip_str or ip_str in seen_ips:
+                continue
+            try:
+                plen = int(prefix_raw)
+                ip_obj = ipaddress.ip_address(ip_str)
+            except (TypeError, ValueError):
+                continue
+            if ip_obj.version != 4 or plen >= 32 or plen <= 0:
+                continue
+            if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_unspecified or ip_obj.is_multicast or not ip_obj.is_private:
+                continue
+            seen_ips.add(ip_str)
+            bcast = compute_subnet_broadcast(ip_str, plen) or ""
+            item = {
+                "ip": ip_str,
+                "prefix": plen,
+                "adapter": name or "Сеть",
+                "kind": kind,
+                "description": descr,
+                "broadcast": bcast,
+                "gateway": real_gws[0] if real_gws else "",
+                "has_gateway": has_gw,
+                "if_index": if_index,
+            }
+            sort_key = (
+                0 if has_gw else 1,
+                0 if kind in ("wifi", "ethernet") else 1,
+                if_index,
+                ip_str,
+            )
+            candidates.append((sort_key, item))
+
+    if candidates:
+        candidates.sort(key=lambda pair: pair[0])
+        return [item for _, item in candidates]
+
+    # Запасной кроссплатформенный путь (только если GetAdaptersAddresses недоступен и список не передан явно)
+    if raw_adapters is not None or os.name == "nt":
+        return []
+    fallback_out: list[dict] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip_s = str(info[4][0]).strip()
+            if ip_s in seen_ips:
+                continue
+            ip_o = ipaddress.ip_address(ip_s)
+            if ip_o.version == 4 and ip_o.is_private and not ip_o.is_loopback and not ip_o.is_link_local:
+                seen_ips.add(ip_s)
+                fallback_out.append({
+                    "ip": ip_s,
+                    "prefix": 24,
+                    "adapter": "LAN",
+                    "kind": "lan",
+                    "description": "",
+                    "broadcast": compute_subnet_broadcast(ip_s, 24) or "",
+                    "gateway": "",
+                    "has_gateway": False,
+                    "if_index": 0,
+                })
+    except OSError:
+        pass
+    return fallback_out
+
+
+def local_ip_strings(raw_adapters: list[dict] | None = None) -> list[str]:
+    """Список только IP-строк физических LAN-адаптеров в том же порядке приоритета."""
+    return [x["ip"] for x in local_ipv4s(raw_adapters)]
+
+
+def detect_vpn_route_hijack(
+    raw_adapters: list[dict] | None = None,
+    route_resolver=None,
+    extra_targets=(),
+) -> dict:
+    """Определяет, перехватывает ли VPN-туннель маршруты к локальной подсети физического адаптера."""
+    adapters = _raw_win32_adapters() if raw_adapters is None else list(raw_adapters)
+    resolver = _best_route_if_index if route_resolver is None else route_resolver
+    phys_list = local_ipv4s(adapters)
+    if not phys_list:
+        return {"hijacked": False, "vpn_adapter": "", "intercepted_targets": [], "message": ""}
+
+    by_idx = {int(a.get("if_index") or 0): a for a in adapters}
+    primary = phys_list[0]
+    phys_idx = int(primary.get("if_index") or 0)
+    if not phys_idx:
+        return {"hijacked": False, "vpn_adapter": "", "intercepted_targets": [], "message": ""}
+
+    try:
+        net_obj = ipaddress.IPv4Interface(f"{primary['ip']}/{primary['prefix']}").network
+        subnet_str = str(net_obj)
+    except ValueError:
+        net_obj = None
+        subnet_str = f"{primary['ip']}/{primary['prefix']}"
+
+    probe_ip = primary.get("gateway") or ""
+    if not probe_ip and net_obj is not None:
+        for host_ip in net_obj.hosts():
+            hs = str(host_ip)
+            if hs != primary["ip"]:
+                probe_ip = hs
+                break
+
+    subnet_targets: list[str] = []
+    for t in [probe_ip, primary.get("broadcast") or ""]:
+        if t and t not in subnet_targets:
+            subnet_targets.append(t)
+    for et in extra_targets or ():
+        et_s = _clean_ip_str(str(et or ""))
+        if et_s and _is_lan_ip(et_s) and not et_s.startswith("127.") and et_s not in subnet_targets:
+            subnet_targets.append(et_s)
+
+    intercepted: list[str] = []
+    hijack_adapter_name = ""
+    hijack_descr = ""
+
+    for target in subnet_targets:
+        out_idx = resolver(target)
+        if out_idx is None or int(out_idx) == phys_idx:
+            continue
+        out_ad = by_idx.get(int(out_idx)) or {}
+        out_name = str(out_ad.get("name") or f"ifIndex={out_idx}")
+        out_descr = str(out_ad.get("description") or "")
+        is_virt, is_vpn = is_virtual_or_vpn_adapter(out_name, out_descr, int(out_ad.get("if_type") or 0))
+        if is_vpn or is_virt or out_ad:
+            intercepted.append(target)
+            if not hijack_adapter_name:
+                hijack_adapter_name = out_name
+                hijack_descr = out_descr
+
+    if not intercepted:
+        return {
+            "hijacked": False,
+            "vpn_adapter": "",
+            "physical_adapter": primary["adapter"],
+            "physical_ip": primary["ip"],
+            "subnet": subnet_str,
+            "intercepted_targets": [],
+            "message": "",
+        }
+
+    # Если глобальный 255.255.255.255 тоже уходит в тот же туннель — добавим в список перехваченных для наглядности
+    bcast_global_idx = resolver("255.255.255.255")
+    if bcast_global_idx is not None and int(bcast_global_idx) != phys_idx:
+        intercepted.append("255.255.255.255")
+
+    msg = (
+        f"VPN «{hijack_adapter_name}» перехватывает локальную сеть — второй компьютер недоступен. "
+        f"Включите в VPN раздельное туннелирование: исключите 192.168.0.0/16 "
+        f"(и 10.0.0.0/8, 172.16.0.0/12) или временно отключите VPN."
+    )
+    return {
+        "hijacked": True,
+        "vpn_adapter": hijack_adapter_name,
+        "vpn_description": hijack_descr,
+        "physical_adapter": primary["adapter"],
+        "physical_ip": primary["ip"],
+        "subnet": subnet_str,
+        "intercepted_targets": intercepted,
+        "message": msg,
+    }
+
+
+def _norm_win_path(p: str) -> str:
+    raw = os.path.expandvars(str(p or "").strip().strip('"'))
+    if not raw:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(raw))
+    except Exception:
+        return raw.lower()
+
+
+def _firewall_target_programs(app_root: Path | None = None) -> tuple[str, list[str]]:
+    """Возвращает (основной_путь_pythonw, все_целевые_пути_python_для_правил)."""
+    root = Path(app_root or paths.ROOT)
+    pyw = root / "runtime" / "python" / "pythonw.exe"
+    py = root / "runtime" / "python" / "python.exe"
+    targets: list[str] = []
+    if pyw.is_file():
+        targets.append(str(pyw.resolve()))
+    if py.is_file():
+        targets.append(str(py.resolve()))
+    cur_exe = Path(sys.executable)
+    if cur_exe.is_file():
+        cur_s = str(cur_exe.resolve())
+        if cur_s not in targets:
+            targets.append(cur_s)
+    primary = targets[0] if targets else str(pyw)
+    if primary not in targets:
+        targets.insert(0, primary)
+    return primary, targets
+
+
+def _port_matches(rule_port, target_port: int) -> bool:
+    if rule_port is None:
+        return True
+    if isinstance(rule_port, list):
+        return any(_port_matches(x, target_port) for x in rule_port)
+    s = str(rule_port).strip().lower()
+    if not s or s == "any":
+        return True
+    for part in s.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo_s, _, hi_s = part.partition("-")
+            try:
+                if int(lo_s) <= int(target_port) <= int(hi_s):
+                    return True
+            except ValueError:
+                pass
+        else:
+            try:
+                if int(part) == int(target_port):
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
+def _profile_covers_priv_pub(profile_val) -> tuple[bool, bool]:
+    """Возвращает (covers_private, covers_public) для поля Profile из Get-NetFirewallRule."""
+    s = str(profile_val or "").strip().lower()
+    if not s or "any" in s:
+        return True, True
+    if s.isdigit():
+        mask = int(s)
+        if mask == 0 or mask >= 0x7FFFFFFF or mask == 65535:
+            return True, True
+        return bool(mask & 2), bool(mask & 4)
+    return ("private" in s), ("public" in s)
+
+
+def parse_firewall_and_profiles(
+    ps_data: dict | None,
+    primary_program: str,
+    tcp_port: int,
+    udp_port: int,
+    phys_adapters: list[dict] | None = None,
+) -> dict:
+    """Разбирает JSON от Get-NetConnectionProfile + Get-NetFirewallApplicationFilter (чистая функция для тестов)."""
+    data = ps_data if isinstance(ps_data, dict) else {}
+    raw_profiles = data.get("profiles") or []
+    if isinstance(raw_profiles, dict):
+        raw_profiles = [raw_profiles]
+    raw_rules = data.get("rules") or []
+    if isinstance(raw_rules, dict):
+        raw_rules = [raw_rules]
+
+    phys_indices = {int(a.get("if_index") or 0) for a in (phys_adapters or []) if a.get("if_index")}
+    phys_names = {str(a.get("adapter") or "").strip().lower() for a in (phys_adapters or []) if a.get("adapter")}
+
+    cat_map = {"0": "Public", "1": "Private", "2": "DomainAuthenticated"}
+    parsed_profiles: list[dict] = []
+    public_profiles: list[dict] = []
+    for pr in raw_profiles:
+        if not isinstance(pr, dict):
+            continue
+        alias = str(pr.get("InterfaceAlias") or "").strip()
+        net_name = str(pr.get("Name") or alias).strip()
+        if_idx = int(pr.get("InterfaceIndex") or 0)
+        cat_raw = str(pr.get("Category") if pr.get("Category") is not None else pr.get("NetworkCategory") or "").strip()
+        cat = cat_map.get(cat_raw, cat_raw)
+        is_virt, _ = is_virtual_or_vpn_adapter(alias, "", 0)
+        if is_virt:
+            continue
+        if (phys_indices or phys_names) and (if_idx not in phys_indices and alias.lower() not in phys_names):
+            continue
+        item = {"name": net_name, "adapter": alias, "if_index": if_idx, "category": cat}
+        parsed_profiles.append(item)
+        if cat.lower() == "public":
+            public_profiles.append(item)
+
+    target_norm = _norm_win_path(primary_program)
+    tcp_priv = tcp_pub = False
+    udp_priv = udp_pub = False
+    block_rules: list[dict] = []
+
+    for r in raw_rules:
+        if not isinstance(r, dict):
+            continue
+        prog_norm = _norm_win_path(r.get("Program") or "")
+        if not prog_norm or prog_norm != target_norm:
+            continue
+        enabled_s = str(r.get("Enabled") or "").strip().lower()
+        if enabled_s not in ("true", "1"):
+            continue
+        dir_s = str(r.get("Direction") or "").strip().lower()
+        if dir_s not in ("inbound", "1"):
+            continue
+        act_s = str(r.get("Action") or "").strip().lower()
+        cov_priv, cov_pub = _profile_covers_priv_pub(r.get("Profile"))
+        proto_s = str(r.get("Protocol") or "Any").strip().lower()
+        lport = r.get("LocalPort")
+
+        if act_s in ("block", "4"):
+            if cov_priv or cov_pub:
+                block_rules.append({
+                    "name": str(r.get("Name") or ""),
+                    "display_name": str(r.get("DisplayName") or r.get("Name") or "Блокирующее правило"),
+                    "profile": str(r.get("Profile") or ""),
+                })
+            continue
+
+        if act_s not in ("allow", "2"):
+            continue
+
+        if proto_s in ("any", "tcp", "6") and _port_matches(lport, int(tcp_port)):
+            if cov_priv:
+                tcp_priv = True
+            if cov_pub:
+                tcp_pub = True
+        if proto_s in ("any", "udp", "17") and _port_matches(lport, int(udp_port)):
+            if cov_priv:
+                udp_priv = True
+                # Примечание: Any покрывает оба протокола
+            if cov_pub:
+                udp_pub = True
+
+    tcp_ok = tcp_priv and tcp_pub
+    udp_ok = udp_priv and udp_pub
+    has_block = bool(block_rules)
+    return {
+        "checked": bool(ps_data is not None),
+        "program": primary_program,
+        "tcp_port": int(tcp_port),
+        "udp_port": int(udp_port),
+        "tcp_allowed": tcp_ok,
+        "udp_allowed": udp_ok,
+        "has_block_rules": has_block,
+        "block_rules": block_rules,
+        "ok": bool(tcp_ok and udp_ok and not has_block),
+        "profiles": parsed_profiles,
+        "has_public_profile": bool(public_profiles),
+        "public_profiles": public_profiles,
+    }
+
+
+def query_firewall_and_profiles(lan_port: int, app_root: Path | None = None, phys_adapters: list[dict] | None = None) -> dict:
+    """Проверяет без прав администратора правила брандмауэра Windows для pythonw.exe и профиль сети."""
+    tcp_p = int(lan_port)
+    udp_p = tcp_p + 1
+    primary_prog, _ = _firewall_target_programs(app_root)
+    eff_phys = local_ipv4s() if phys_adapters is None else phys_adapters
+    if os.name != "nt":
+        return parse_firewall_and_profiles({"profiles": [], "rules": []}, primary_prog, tcp_p, udp_p, eff_phys)
+
+    ps_cmd = (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "$profs = @(Get-NetConnectionProfile | Select-Object Name,InterfaceAlias,InterfaceIndex,@{N='Category';E={[string]$_.NetworkCategory}}); "
+        "$rules = @(Get-NetFirewallApplicationFilter | Where-Object { $_.Program -like '*python*' } | ForEach-Object { "
+        "$app = $_; $r = Get-NetFirewallRule -AssociatedNetFirewallApplicationFilter $app; $pf = $r | Get-NetFirewallPortFilter; "
+        "[pscustomobject]@{Name=$r.Name;DisplayName=$r.DisplayName;Program=$app.Program;Direction=[string]$r.Direction;"
+        "Action=[string]$r.Action;Enabled=[string]$r.Enabled;Profile=[string]$r.Profile;Protocol=[string]$pf.Protocol;LocalPort=$pf.LocalPort} "
+        "}); "
+        "[pscustomobject]@{profiles=$profs;rules=$rules} | ConvertTo-Json -Depth 4 -Compress"
+    )
+    try:
+        cflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        res = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=12.0,
+            creationflags=cflags,
+        )
+        txt = (res.stdout or "").strip()
+        ps_json = json.loads(txt) if txt else {"profiles": [], "rules": []}
+    except Exception as e:
+        _lan_log(f"Не удалось проверить правила брандмауэра через PowerShell: {e}", logging.WARNING, rate_key="fw_q", min_interval=60.0)
+        return {
+            "checked": False,
+            "program": primary_prog,
+            "tcp_port": tcp_p,
+            "udp_port": udp_p,
+            "tcp_allowed": True,
+            "udp_allowed": True,
+            "has_block_rules": False,
+            "block_rules": [],
+            "ok": True,
+            "profiles": [],
+            "has_public_profile": False,
+            "public_profiles": [],
+        }
+    return parse_firewall_and_profiles(ps_json, primary_prog, tcp_p, udp_p, eff_phys)
+
+
+def build_firewall_netsh_script(
+    program_paths: list[str],
+    tcp_port: int,
+    udp_port: int,
+    *,
+    remove_blocking: bool = False,
+    block_rule_names: list[str] | None = None,
+) -> str:
+    """Формирует скрипт для однократного UAC-запуска netsh advfirewall (TCP lan.port + UDP lan.port+1, Private+Public)."""
+    q = lambda s: str(s).replace("'", "''")
+    lines = ["$ErrorActionPreference = 'Continue'"]
+    if remove_blocking:
+        for rname in block_rule_names or []:
+            if rname:
+                lines.append(f"Remove-NetFirewallRule -Name '{q(rname)}' -ErrorAction SilentlyContinue")
+        for prog in program_paths:
+            lines.append(f"& netsh.exe advfirewall firewall delete rule name=all dir=in program=\"{prog}\" | Out-Null")
+
+    for idx, prog in enumerate(program_paths):
+        suffix = "" if idx == 0 else f" ({Path(prog).name})"
+        tcp_name = f"RealtyWatch LAN TCP{suffix}"
+        udp_name = f"RealtyWatch LAN UDP{suffix}"
+        lines.extend([
+            f"& netsh.exe advfirewall firewall delete rule name=\"{tcp_name}\" program=\"{prog}\" | Out-Null",
+            f"& netsh.exe advfirewall firewall delete rule name=\"{udp_name}\" program=\"{prog}\" | Out-Null",
+            f"& netsh.exe advfirewall firewall add rule name=\"{tcp_name}\" dir=in action=allow program=\"{prog}\" protocol=TCP localport={int(tcp_port)} profile=private,public",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            f"& netsh.exe advfirewall firewall add rule name=\"{udp_name}\" dir=in action=allow program=\"{prog}\" protocol=UDP localport={int(udp_port)} profile=private,public",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        ])
+    lines.append("exit 0")
+    return "\n".join(lines)
+
+
+def _run_elevated_powershell(ps_script: str, timeout_sec: float = 30.0) -> int:
+    """Запускает PowerShell через ShellExecuteExW('runas') с одним запросом UAC и ждёт код возврата."""
+    if os.name != "nt":
+        raise RuntimeError("Настройка брандмауэра Windows доступна только на Windows")
+    import ctypes.wintypes as wt
+
+    encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+    params = f"-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wt.DWORD),
+            ("fMask", wt.ULONG),
+            ("hwnd", wt.HWND),
+            ("lpVerb", wt.LPCWSTR),
+            ("lpFile", wt.LPCWSTR),
+            ("lpParameters", wt.LPCWSTR),
+            ("lpDirectory", wt.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wt.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wt.LPCWSTR),
+            ("hkeyClass", wt.HKEY),
+            ("dwHotKey", wt.DWORD),
+            ("hIconOrMonitor", wt.HANDLE),
+            ("hProcess", wt.HANDLE),
+        ]
+
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
+    sei.hwnd = None
+    sei.lpVerb = "runas"
+    sei.lpFile = "powershell.exe"
+    sei.lpParameters = params
+    sei.lpDirectory = None
+    sei.nShow = 0  # SW_HIDE
+
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wt.BOOL
+
+    ok = shell32.ShellExecuteExW(ctypes.byref(sei))
+    if not ok:
+        err = ctypes.get_last_error() or kernel32.GetLastError()
+        if err == 1223:  # ERROR_CANCELLED
+            raise ValueError("Запрос прав администратора (UAC) был отменён пользователем")
+        raise RuntimeError(f"Не удалось запустить настройку брандмауэра (код Win32: {err})")
+
+    hproc = sei.hProcess
+    if not hproc:
+        return 0
+    try:
+        wait_ms = max(1000, int(timeout_sec * 1000))
+        wres = kernel32.WaitForSingleObject(hproc, wait_ms)
+        if wres == 0x00000102:  # WAIT_TIMEOUT
+            raise TimeoutError("Превышено время ожидания завершения настройки брандмауэра")
+        exit_code = wt.DWORD(1)
+        kernel32.GetExitCodeProcess(hproc, ctypes.byref(exit_code))
+        return int(exit_code.value)
+    finally:
+        kernel32.CloseHandle(hproc)
+
+
+def _probe_gateway_reachable(gw_ip: str, timeout_sec: float = 0.9) -> bool:
+    """Проверяет доступность шлюза по умолчанию (ICMP ping + быстрый TCP-фолбэк на случай запрета ICMP)."""
+    gw = (gw_ip or "").strip()
+    if not gw or gw == "0.0.0.0":
+        return False
+    if os.name == "nt":
+        try:
+            cflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            r = subprocess.run(
+                ["ping", "-n", "1", "-w", str(int(timeout_sec * 1000)), gw],
+                capture_output=True,
+                text=True,
+                encoding="cp866",
+                errors="replace",
+                timeout=timeout_sec + 1.5,
+                creationflags=cflags,
+            )
+            out_up = (r.stdout or "").upper()
+            if "TTL=" in out_up:
+                return True
+        except Exception:
+            pass
+    for p in (80, 443, 53):
+        try:
+            with socket.create_connection((gw, p), timeout=0.45):
+                return True
+        except ConnectionRefusedError:
+            # Ответ RST от роутера доказывает, что он физически доступен по L2/L3!
+            return True
+        except OSError:
+            continue
+    return False
 
 
 def _safe_img_rel(rel: str):
@@ -646,6 +1381,11 @@ class LanService:
         self._history_rev: int = 0
         self._history_unread: int = 0
         self._history_db_key: str | None = None
+        self._rx_sock = None
+        self._udp_listening: bool = False
+        self._fw_cache: dict | None = None
+        self._fw_cache_ts: float = 0.0
+        self._fw_refreshing: bool = False
         self.sync_app = self._build_app()
 
     # ---------- хранилище очереди входящих (привязано к текущему db.DB_FILE) ----------
@@ -713,6 +1453,9 @@ class LanService:
             self._history_rev = 0
             self._history_unread = 0
             self._history_db_key = None
+            self._fw_cache = None
+            self._fw_cache_ts = 0.0
+            self._fw_refreshing = False
 
     def _ensure_history_unread(self) -> int:
         cur_key = str(db.DB_FILE)
@@ -1169,13 +1912,20 @@ class LanService:
             if srv.started:
                 break
             if not t.is_alive():
+                _lan_log(f"ОШИБКА запуска HTTP LAN-сервера на {self._bind_host}:{int(port)}", logging.ERROR)
                 self.stop()
                 return False
             time.sleep(0.02)
+        if srv.started:
+            ifaces_desc = ", ".join(f"{x['adapter']}={x['ip']}/{x['prefix']}" for x in local_ipv4s()) or "нет физических адаптеров"
+            _lan_log(f"HTTP LAN-сервер запущен на {self._bind_host}:{int(port)} (auto_discovery={bool(auto_discovery)}; адаптеры: {ifaces_desc})")
+            if self._bind_host != "127.0.0.1":
+                self.refresh_firewall_async(int(port))
         return bool(srv.started)
 
     def stop(self):
         with self._lock:
+            was_port = self._running_port
             self._stop_evt.set()
             self._hb_evt.set()
             self._outbox_evt.set()
@@ -1188,6 +1938,8 @@ class LanService:
             self._disc_thread = None
             self._running_port = None
             self._running_disc = False
+            self._udp_listening = False
+            self._rx_sock = None
             self._newer_db_peer = None
             self._bootstrapped_peers.clear()
             for rt in self._peer_runtime.values():
@@ -1201,6 +1953,8 @@ class LanService:
             if thr is not None and thr.is_alive():
                 thr.join(timeout=2.5)
         self.cleanup_stale_sessions(max_age_sec=0)
+        if was_port is not None:
+            _lan_log(f"LAN-сервер на порту {was_port} остановлен")
 
     def is_listening(self) -> bool:
         with self._lock:
@@ -1211,15 +1965,73 @@ class LanService:
                 and self._server_thread.is_alive()
             )
 
+    def is_udp_listening(self) -> bool:
+        with self._lock:
+            return bool(
+                self._udp_listening
+                and self._disc_thread is not None
+                and self._disc_thread.is_alive()
+            )
+
     def _broadcast_targets(self) -> set[str]:
         if self._bind_host == "127.0.0.1":
             return {"127.0.0.1"}
         targets = {"255.255.255.255", "127.0.0.1"}
-        for ip in local_ipv4s():
-            parts = ip.split(".")
-            if len(parts) == 4:
-                targets.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+        for iface in local_ipv4s():
+            bcast = iface.get("broadcast") or compute_subnet_broadcast(iface.get("ip") or "", int(iface.get("prefix") or 24))
+            if bcast:
+                targets.add(bcast)
         return targets
+
+    def _open_bound_bcast_sockets(self) -> list[tuple[str, list[str], socket.socket]]:
+        """Открывает по одному UDP-сокету с SO_BROADCAST, привязанному к IP каждого физического адаптера (bind((ip, 0))).
+        Это гарантирует уход широковещательных пакетов в реальную Wi-Fi/Ethernet сеть, а не только в интерфейс с меньшей метрикой."""
+        out: list[tuple[str, list[str], socket.socket]] = []
+        if self._bind_host == "127.0.0.1":
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                s.bind(("127.0.0.1", 0))
+                s.settimeout(0.25)
+                out.append(("127.0.0.1", ["127.0.0.1"], s))
+            except OSError as e:
+                _lan_log(f"Ошибка открытия loopback UDP-сокета: {e}", logging.WARNING, rate_key="bcast_lo", min_interval=30.0)
+            return out
+
+        ifaces = local_ipv4s()
+        for iface in ifaces:
+            ip_s = str(iface.get("ip") or "").strip()
+            if not ip_s:
+                continue
+            bcast = str(iface.get("broadcast") or "").strip()
+            dsts = []
+            if bcast:
+                dsts.append(bcast)
+            if "255.255.255.255" not in dsts:
+                dsts.append("255.255.255.255")
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.bind((ip_s, 0))
+                s.settimeout(0.25)
+                out.append((f"{iface.get('adapter') or 'LAN'}({ip_s})", dsts, s))
+            except OSError as e:
+                _lan_log(
+                    f"Ошибка привязки UDP broadcast-сокета к {iface.get('adapter')} ({ip_s}): {e}",
+                    logging.WARNING,
+                    rate_key=f"bind_bcast_{ip_s}",
+                    min_interval=30.0,
+                )
+
+        if not out:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.bind(("", 0))
+                s.settimeout(0.25)
+                out.append(("fallback(0.0.0.0)", ["255.255.255.255", "127.0.0.1"], s))
+            except OSError as e:
+                _lan_log(f"Ошибка открытия резервного UDP-сокета: {e}", logging.WARNING, rate_key="bcast_fb", min_interval=30.0)
+        return out
 
     def _discovery_loop(self, lan_port: int):
         disc_port = lan_port + 1
@@ -1230,13 +2042,21 @@ class LanService:
             rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             rx.bind((bind_ip, disc_port))
             rx.settimeout(0.8)
-        except OSError:
+            with self._lock:
+                self._rx_sock = rx
+                self._udp_listening = True
+            _lan_log(f"UDP discovery слушает {bind_ip or '0.0.0.0'}:{disc_port}")
+        except OSError as e:
+            _lan_log(f"ОШИБКА bind UDP discovery на {bind_ip or '0.0.0.0'}:{disc_port}: {e}", logging.ERROR)
             if rx is not None:
                 try:
                     rx.close()
                 except OSError:
                     pass
             rx = None
+            with self._lock:
+                self._rx_sock = None
+                self._udp_listening = False
 
         # Активный зонд сразу при запуске LAN + публикация собственного присутствия
         self._send_udp_probe(lan_port, reply_disc_port=disc_port)
@@ -1251,10 +2071,12 @@ class LanService:
             if rx is not None:
                 try:
                     raw, addr = rx.recvfrom(2048)
-                    self._handle_discovery_packet(raw, addr[0], addr[1], my_lan_port=lan_port)
+                    self._handle_discovery_packet(raw, addr[0], addr[1], my_lan_port=lan_port, reply_sock=rx)
                 except socket.timeout:
                     pass
-                except OSError:
+                except OSError as e:
+                    if not self._stop_evt.is_set():
+                        _lan_log(f"Ошибка чтения UDP discovery сокета: {e}", logging.WARNING, rate_key="rx_recv", min_interval=30.0)
                     break
             else:
                 self._stop_evt.wait(0.8)
@@ -1266,52 +2088,107 @@ class LanService:
                 for k in stale:
                     self._discovered.pop(k, None)
 
+        with self._lock:
+            self._udp_listening = False
+            self._rx_sock = None
         if rx is not None:
             try:
                 rx.close()
             except OSError:
                 pass
 
-    def _broadcast_presence(self, lan_port: int, disc_port: int, unicast_to: tuple[str, int] | None = None):
+    def _presence_payload(self, lan_port: int) -> bytes | None:
         try:
             ident = self._identity()
         except Exception:
-            return
-        payload = json.dumps({
+            return None
+        return json.dumps({
             "magic": _DISCOVERY_MAGIC,
             "device_id": ident["device_id"],
             "device_name": ident["device_name"],
-            "port": lan_port,
+            "port": int(lan_port),
             "platform": "windows",
         }, ensure_ascii=False).encode("utf-8")
+
+    def _send_probe_reply(
+        self,
+        lan_port: int,
+        primary_dst: tuple[str, int],
+        *,
+        reply_sock=None,
+        extra_dst: tuple[str, int] | None = None,
+    ):
+        """Отвечает на RW_PROBE_V1 с того же сокета rx (порт 8767), на который пришёл зонд,
+        чтобы ответ проходил stateful-фильтр брандмауэра на ищущем компьютере."""
+        payload = self._presence_payload(lan_port)
+        if not payload:
+            return
+        sock = reply_sock
+        if sock is None:
+            with self._lock:
+                sock = self._rx_sock
+        own_sock = False
+        if sock is None:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.settimeout(0.5)
+                own_sock = True
+            except OSError as e:
+                _lan_log(f"Не удалось создать UDP-сокет для ответа на зонд {primary_dst}: {e}", logging.WARNING, rate_key="rep_sock", min_interval=30.0)
+                return
+        try:
+            targets = [primary_dst]
+            if extra_dst and extra_dst != primary_dst and 1 <= int(extra_dst[1]) <= 65535:
+                targets.append(extra_dst)
+            for dst in targets:
+                try:
+                    sock.sendto(payload, dst)
+                    src_port = sock.getsockname()[1] if hasattr(sock, "getsockname") else "?"
+                    _lan_log(f"Ответ RW_DISCOVER_V1 отправлен с порта {src_port} -> {dst[0]}:{dst[1]}", rate_key=f"rep_{dst[0]}_{dst[1]}", min_interval=2.0)
+                except OSError as e:
+                    _lan_log(f"Ошибка отправки ответа на зонд -> {dst[0]}:{dst[1]}: {e}", logging.WARNING, rate_key=f"rep_err_{dst[0]}", min_interval=30.0)
+        finally:
+            if own_sock and sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _broadcast_presence(self, lan_port: int, disc_port: int, unicast_to: tuple[str, int] | None = None, reply_sock=None):
+        payload = self._presence_payload(lan_port)
+        if not payload:
+            return
+        if unicast_to is not None:
+            self._send_probe_reply(lan_port, unicast_to, reply_sock=reply_sock)
+
         ports = {int(disc_port)}
         if self._bind_host != "127.0.0.1":
             ports.add(8767)
+
+        bound_list = self._open_bound_bcast_sockets()
         try:
-            tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            if self._bind_host != "127.0.0.1":
-                tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            tx.settimeout(0.5)
-            try:
-                if unicast_to is not None:
-                    try:
-                        tx.sendto(payload, unicast_to)
-                    except OSError:
-                        pass
-                for dst in self._broadcast_targets():
+            for label, dst_ips, tx in bound_list:
+                for dst in dst_ips:
                     for p in ports:
                         try:
                             tx.sendto(payload, (dst, p))
-                        except OSError:
-                            pass
-            finally:
-                tx.close()
-        except OSError:
-            pass
+                        except OSError as e:
+                            _lan_log(
+                                f"Ошибка broadcast присутствия с {label} -> {dst}:{p}: {e}",
+                                logging.WARNING,
+                                rate_key=f"bcast_err_{label}_{dst}",
+                                min_interval=60.0,
+                            )
+        finally:
+            for _lbl, _dsts, tx in bound_list:
+                try:
+                    tx.close()
+                except OSError:
+                    pass
 
     def _send_udp_probe(self, lan_port: int, reply_disc_port: int | None = None,
-                        extra_ports=(), tx_sock=None):
-        """Отправляет активный UDP-запрос RW_PROBE_V1 устройствам в LAN и известным сопряжённым пирам."""
+                        extra_ports=(), tx_sock=None, log_probe: bool = False):
+        """Отправляет активный UDP-запрос RW_PROBE_V1 с каждого физического адаптера и известным сопряжённым пирам."""
         con = db.connect()
         try:
             ident = self._identity(con)
@@ -1320,16 +2197,6 @@ class LanService:
             return
         finally:
             con.close()
-
-        rport = int(reply_disc_port or (int(lan_port) + 1))
-        payload = json.dumps({
-            "magic": _PROBE_MAGIC,
-            "device_id": ident["device_id"],
-            "device_name": ident["device_name"],
-            "port": int(lan_port),
-            "disc_port": rport,
-            "platform": "windows",
-        }, ensure_ascii=False).encode("utf-8")
 
         ports = {int(lan_port) + 1}
         if self._bind_host != "127.0.0.1":
@@ -1342,7 +2209,7 @@ class LanService:
             except (TypeError, ValueError):
                 pass
 
-        dests = {(dst, p) for dst in self._broadcast_targets() for p in ports}
+        peer_unicast: set[tuple[str, int]] = set()
         for pr in peer_rows:
             pip = _clean_ip_str(pr.get("ip") or "")
             if not _is_lan_ip(pip):
@@ -1350,29 +2217,62 @@ class LanService:
             try:
                 pport = int(pr.get("port") or 8766)
                 if 1 <= pport + 1 <= 65535:
-                    dests.add((pip, pport + 1))
+                    peer_unicast.add((pip, pport + 1))
                 if self._bind_host != "127.0.0.1":
-                    dests.add((pip, 8767))
+                    peer_unicast.add((pip, 8767))
             except (TypeError, ValueError):
                 pass
 
-        own_sock = tx_sock is None
-        sock = tx_sock
-        try:
-            if own_sock:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-                if self._bind_host != "127.0.0.1":
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                sock.settimeout(0.5)
+        def _make_probe(rport_val: int) -> bytes:
+            return json.dumps({
+                "magic": _PROBE_MAGIC,
+                "device_id": ident["device_id"],
+                "device_name": ident["device_name"],
+                "port": int(lan_port),
+                "disc_port": int(rport_val),
+                "platform": "windows",
+            }, ensure_ascii=False).encode("utf-8")
+
+        if tx_sock is not None:
+            rport = int(reply_disc_port or (int(lan_port) + 1))
+            payload = _make_probe(rport)
+            dests = {(dst, p) for dst in self._broadcast_targets() for p in ports} | peer_unicast
             for addr_pair in dests:
                 try:
-                    sock.sendto(payload, addr_pair)
-                except OSError:
-                    pass
-        except OSError:
-            pass
+                    tx_sock.sendto(payload, addr_pair)
+                    if log_probe:
+                        _lan_log(f"UDP зонд отправлен -> {addr_pair[0]}:{addr_pair[1]} (reply_port={rport})")
+                except OSError as e:
+                    _lan_log(
+                        f"Ошибка отправки UDP зонда -> {addr_pair[0]}:{addr_pair[1]}: {e}",
+                        logging.WARNING,
+                        rate_key=f"probe_err_{addr_pair[0]}",
+                        min_interval=30.0,
+                    )
+            return
+
+        bound_list = self._open_bound_bcast_sockets()
+        rport_def = int(reply_disc_port or (int(lan_port) + 1))
+        payload_def = _make_probe(rport_def)
+        try:
+            for idx_s, (label, dst_ips, sock) in enumerate(bound_list):
+                targets = {(dst, p) for dst in dst_ips for p in ports}
+                if idx_s == 0:
+                    targets |= peer_unicast
+                for addr_pair in targets:
+                    try:
+                        sock.sendto(payload_def, addr_pair)
+                        if log_probe:
+                            _lan_log(f"UDP зонд с {label} -> {addr_pair[0]}:{addr_pair[1]}")
+                    except OSError as e:
+                        _lan_log(
+                            f"Ошибка отправки UDP зонда с {label} -> {addr_pair[0]}:{addr_pair[1]}: {e}",
+                            logging.WARNING,
+                            rate_key=f"probe_err_{label}_{addr_pair[0]}",
+                            min_interval=30.0,
+                        )
         finally:
-            if own_sock and sock is not None:
+            for _lbl, _dsts, sock in bound_list:
                 try:
                     sock.close()
                 except OSError:
@@ -1405,7 +2305,8 @@ class LanService:
                 },
                 timeout=HEARTBEAT_TIMEOUT_SEC,
             )
-        except Exception:
+        except Exception as e:
+            _lan_log(f"Проверка нового адреса пира {cand_ip}:{cand_port} не прошла: {e}", logging.WARNING, rate_key=f"reconn_{cand_ip}", min_interval=30.0)
             return False
 
         if st != 200 or not isinstance(data, dict) or not data.get("ok"):
@@ -1425,13 +2326,14 @@ class LanService:
         finally:
             con.close()
 
+        _lan_log(f"Обновлён адрес сопряжённого устройства «{new_name}» -> {cand_ip}:{int(cand_port)}")
         runner.manager.log("lan", f"обновлён адрес устройства «{new_name}» -> {cand_ip}:{int(cand_port)}")
         self._hb_evt.set()
         self._outbox_evt.set()
         return True
 
     def _handle_discovery_packet(self, raw: bytes, sender_ip: str, sender_udp_port: int = 0,
-                                 my_lan_port: int | None = None, sync_verify: bool = False):
+                                 my_lan_port: int | None = None, sync_verify: bool = False, reply_sock=None):
         if not _is_lan_ip(sender_ip):
             return
         try:
@@ -1464,7 +2366,7 @@ class LanService:
         eff_my_port = int(my_lan_port or self._running_port or self._lan_cfg()["port"])
 
         if magic == _PROBE_MAGIC:
-            # Отвечаем собственным присутствием по UDP (включая unicast на порт отправителя зонда)
+            # Отвечаем с того же сокета rx (порт 8767), на который поступил зонд
             if self._lan_cfg()["enabled"]:
                 try:
                     reply_port = int(pkt.get("disc_port") or sender_udp_port or (eff_my_port + 1))
@@ -1478,7 +2380,17 @@ class LanService:
                     if should_reply:
                         self._probe_reply_ts[tkey] = now_m
                 if should_reply and (1 <= reply_port <= 65535):
-                    self._broadcast_presence(eff_my_port, eff_my_port + 1, unicast_to=(clean_ip, reply_port))
+                    extra_dst = (
+                        (clean_ip, int(sender_udp_port))
+                        if sender_udp_port and 1 <= int(sender_udp_port) <= 65535 and int(sender_udp_port) != reply_port
+                        else None
+                    )
+                    self._send_probe_reply(
+                        eff_my_port,
+                        (clean_ip, reply_port),
+                        reply_sock=reply_sock,
+                        extra_dst=extra_dst,
+                    )
             if paired_row is None:
                 return
 
@@ -1509,6 +2421,7 @@ class LanService:
             return
 
         with self._lock:
+            is_new = dev_id not in self._discovered
             self._discovered[dev_id] = {
                 "device_id": dev_id,
                 "device_name": name,
@@ -1517,9 +2430,11 @@ class LanService:
                 "platform": str(pkt.get("platform") or "desktop"),
                 "seen_ts": time.time(),
             }
+        if is_new:
+            _lan_log(f"Обнаружено устройство в сети: «{name}» ({clean_ip}:{port}, id={dev_id})")
 
     def discover_now(self, wait_sec: float = 1.5, auto_enable: bool = True, target_ports=()):
-        """Активный поиск устройств в локальной сети (при необходимости автоматически включает LAN)."""
+        """Активный поиск устройств в локальной сети с отправкой зондов с каждого физического адаптера."""
         wait_f = max(0.2, min(float(wait_sec or 1.5), 5.0))
         cfg = self._lan_cfg()
         if not cfg["enabled"] and auto_enable:
@@ -1533,42 +2448,99 @@ class LanService:
             cfg = self._lan_cfg()
 
         if cfg["enabled"]:
-            bind_ip = self._bind_host if self._bind_host == "127.0.0.1" else ""
             lan_port = int(self._running_port or cfg["port"])
-            sock = None
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-                if self._bind_host != "127.0.0.1":
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                sock.bind((bind_ip, 0))
-                sock.settimeout(0.2)
-                ephem_port = int(sock.getsockname()[1])
+            ports = {lan_port + 1}
+            if self._bind_host != "127.0.0.1":
+                ports.add(8767)
+            for ep in (target_ports or ()):
+                try:
+                    ep_i = int(ep)
+                    if 1 <= ep_i <= 65535:
+                        ports.add(ep_i)
+                except (TypeError, ValueError):
+                    pass
 
-                self._send_udp_probe(lan_port, reply_disc_port=ephem_port, extra_ports=target_ports, tx_sock=sock)
+            con = db.connect()
+            try:
+                ident = self._identity(con)
+                peer_rows = [dict(r) for r in con.execute("SELECT ip, port FROM sync_peers")]
+            finally:
+                con.close()
+
+            peer_unicast: set[tuple[str, int]] = set()
+            for pr in peer_rows:
+                pip = _clean_ip_str(pr.get("ip") or "")
+                if _is_lan_ip(pip):
+                    try:
+                        pp = int(pr.get("port") or 8766)
+                        if 1 <= pp + 1 <= 65535:
+                            peer_unicast.add((pip, pp + 1))
+                        if self._bind_host != "127.0.0.1":
+                            peer_unicast.add((pip, 8767))
+                    except (TypeError, ValueError):
+                        pass
+
+            bound_list = self._open_bound_bcast_sockets()
+            _lan_log(f"Старт активного поиска устройств (ожидание {wait_f:.1f} с, сокетов={len(bound_list)}, порты={sorted(ports)})")
+
+            def _send_all_probes(log_it: bool):
+                for idx_s, (label, dst_ips, sock) in enumerate(bound_list):
+                    try:
+                        ephem = int(sock.getsockname()[1])
+                    except OSError:
+                        continue
+                    probe_bytes = json.dumps({
+                        "magic": _PROBE_MAGIC,
+                        "device_id": ident["device_id"],
+                        "device_name": ident["device_name"],
+                        "port": lan_port,
+                        "disc_port": ephem,
+                        "platform": "windows",
+                    }, ensure_ascii=False).encode("utf-8")
+                    targets = {(dst, p) for dst in dst_ips for p in ports}
+                    if idx_s == 0:
+                        targets |= peer_unicast
+                    for addr_pair in targets:
+                        try:
+                            sock.sendto(probe_bytes, addr_pair)
+                            if log_it:
+                                _lan_log(f"Активный зонд с {label}:{ephem} -> {addr_pair[0]}:{addr_pair[1]}")
+                        except OSError as e:
+                            _lan_log(
+                                f"Ошибка отправки активного зонда с {label} -> {addr_pair[0]}:{addr_pair[1]}: {e}",
+                                logging.WARNING,
+                                rate_key=f"disc_send_{label}_{addr_pair[0]}",
+                                min_interval=15.0,
+                            )
+
+            try:
+                _send_all_probes(log_it=True)
                 self._broadcast_presence(lan_port, lan_port + 1)
 
+                socks = [s for _lbl, _dsts, s in bound_list]
                 deadline = time.monotonic() + wait_f
                 mid = time.monotonic() + wait_f * 0.45
                 resent = False
-                while time.monotonic() < deadline and not self._stop_evt.is_set():
+                while time.monotonic() < deadline and not self._stop_evt.is_set() and socks:
                     if not resent and time.monotonic() >= mid:
                         resent = True
-                        self._send_udp_probe(lan_port, reply_disc_port=ephem_port, extra_ports=target_ports, tx_sock=sock)
+                        _send_all_probes(log_it=False)
                     try:
-                        raw, addr = sock.recvfrom(2048)
-                        self._handle_discovery_packet(
-                            raw, addr[0], addr[1], my_lan_port=lan_port, sync_verify=True,
-                        )
-                    except socket.timeout:
-                        pass
-                    except OSError:
+                        ready_socks, _, _ = select.select(socks, [], [], 0.15)
+                    except (OSError, ValueError):
                         break
-            except OSError:
-                pass
+                    for rs in ready_socks:
+                        try:
+                            raw, addr = rs.recvfrom(2048)
+                            self._handle_discovery_packet(
+                                raw, addr[0], addr[1], my_lan_port=lan_port, sync_verify=True,
+                            )
+                        except OSError:
+                            pass
             finally:
-                if sock is not None:
+                for _lbl, _dsts, s in bound_list:
                     try:
-                        sock.close()
+                        s.close()
                     except OSError:
                         pass
             try:
@@ -1576,7 +2548,9 @@ class LanService:
             except Exception:
                 pass
 
-        return self.status(refresh=False)
+        res = self.status(refresh=False)
+        _lan_log(f"Активный поиск завершён: новых={len(res.get('discovered') or [])}, онлайн сопряжённых={res.get('online_peers', 0)}")
+        return res
 
     def _heartbeat_loop(self):
         # Первый опрос почти сразу после старта
@@ -1639,6 +2613,12 @@ class LanService:
                     "error": data.get("detail") or f"HTTP {st}",
                 }
             except Exception as e:
+                _lan_log(
+                    f"Не удалось опросить пира «{p['name']}» ({p['ip']}:{p['port']}): {e}",
+                    logging.WARNING,
+                    rate_key=f"hb_err_{dev_id}_{p['ip']}",
+                    min_interval=120.0,
+                )
                 return dev_id, {
                     "online": False,
                     "last_check": _now_ts(),
@@ -1873,11 +2853,19 @@ class LanService:
 
     def pair_with(self, ip: str, port: int, pin: str):
         """Сопрягается с устройством по IP:port и одноразовому 6-значному PIN."""
-        clean_ip = _clean_ip_str(ip)
+        raw_ip = (ip or "").strip()
+        eff_port_in = port
+        # Если пользователь скопировал и вставил '192.168.2.15:8766' прямо в поле IP — аккуратно отделяем порт
+        if raw_ip.count(":") == 1 and not raw_ip.startswith("["):
+            host_part, port_part = raw_ip.rsplit(":", 1)
+            if port_part.isdigit():
+                raw_ip = host_part.strip()
+                eff_port_in = int(port_part)
+        clean_ip = _clean_ip_str(raw_ip)
         if not _is_lan_ip(clean_ip):
             raise ValueError("разрешено подключение только к устройствам в локальной сети (LAN)")
         try:
-            p = int(port)
+            p = int(eff_port_in)
         except (TypeError, ValueError):
             raise ValueError("некорректный порт устройства")
         if not (1 <= p <= 65535):
@@ -1918,9 +2906,11 @@ class LanService:
                 headers={"Content-Type": "application/json"}, timeout=5.0,
             )
         except Exception as e:
+            _lan_log(f"Ошибка сопряжения с {clean_ip}:{p}: {e}", logging.WARNING)
             raise ValueError(f"не удалось связаться с {clean_ip}:{p} — {e}")
 
         if st != 200 or not data.get("ok"):
+            _lan_log(f"Отказ сопряжения от {clean_ip}:{p}: HTTP {st} ({data.get('detail')})", logging.WARNING)
             raise ValueError(data.get("detail") or f"ошибка сопряжения (HTTP {st})")
 
         peer_id = str(data.get("device_id") or "").strip()
@@ -1959,6 +2949,7 @@ class LanService:
                 "platform": data.get("platform") or "",
                 "error": None,
             }
+        _lan_log(f"Успешно сопряжено устройство «{peer_name}» ({clean_ip}:{peer_port}, id={peer_id})")
         runner.manager.log("lan", f"сопряжено устройство «{peer_name}» ({clean_ip}:{peer_port})")
         # Сразу подтягиваем свежий статус пира
         try:
@@ -2089,6 +3080,468 @@ class LanService:
             "newer_db_peer": newer_peer,
         }
 
+    def refresh_firewall_async(self, lan_port: int | None = None):
+        """Фоново проверяет правила брандмауэра и профиль сети без блокировки основного потока."""
+        port_i = int(lan_port or self._running_port or self._lan_cfg()["port"])
+        with self._lock:
+            if self._fw_refreshing:
+                return
+            self._fw_refreshing = True
+
+        def _worker():
+            try:
+                res = query_firewall_and_profiles(port_i)
+                with self._lock:
+                    self._fw_cache = res
+                    self._fw_cache_ts = time.monotonic()
+                if not res.get("ok"):
+                    _lan_log(
+                        f"Брандмауэр Windows: требуются правила для {res.get('program')} "
+                        f"(TCP {res.get('tcp_port')}={res.get('tcp_allowed')}, UDP {res.get('udp_port')}={res.get('udp_allowed')}, "
+                        f"block={res.get('has_block_rules')})",
+                        logging.WARNING,
+                        rate_key="fw_warn",
+                        min_interval=300.0,
+                    )
+            finally:
+                with self._lock:
+                    self._fw_refreshing = False
+
+        threading.Thread(target=_worker, daemon=True, name="lan-fw-check").start()
+
+    def get_firewall_status(self, lan_port: int | None = None, *, force: bool = False, sync_if_empty: bool = False) -> dict:
+        port_i = int(lan_port or self._running_port or self._lan_cfg()["port"])
+        if self._bind_host == "127.0.0.1" and not force:
+            primary_prog, _ = _firewall_target_programs()
+            return {
+                "checked": False,
+                "program": primary_prog,
+                "tcp_port": port_i,
+                "udp_port": port_i + 1,
+                "tcp_allowed": True,
+                "udp_allowed": True,
+                "has_block_rules": False,
+                "block_rules": [],
+                "ok": True,
+                "profiles": [],
+                "has_public_profile": False,
+                "public_profiles": [],
+            }
+        now_m = time.monotonic()
+        with self._lock:
+            cached = self._fw_cache
+            age = now_m - self._fw_cache_ts
+        if not force and cached is not None and cached.get("tcp_port") == port_i and age < 30.0:
+            return dict(cached)
+        if force or sync_if_empty:
+            fresh = query_firewall_and_profiles(port_i)
+            with self._lock:
+                self._fw_cache = fresh
+                self._fw_cache_ts = time.monotonic()
+            return dict(fresh)
+        self.refresh_firewall_async(port_i)
+        if cached is not None:
+            return dict(cached)
+        primary_prog, _ = _firewall_target_programs()
+        return {
+            "checked": False,
+            "program": primary_prog,
+            "tcp_port": port_i,
+            "udp_port": port_i + 1,
+            "tcp_allowed": True,
+            "udp_allowed": True,
+            "has_block_rules": False,
+            "block_rules": [],
+            "ok": True,
+            "profiles": [],
+            "has_public_profile": False,
+            "public_profiles": [],
+        }
+
+    def allow_firewall(self, remove_blocking: bool = False) -> dict:
+        """Запрашивает права администратора (UAC) и создаёт входящие правила брандмауэра для pythonw.exe (TCP + UDP)."""
+        cfg = self._lan_cfg()
+        tcp_p = int(self._running_port or cfg["port"])
+        udp_p = tcp_p + 1
+        primary_prog, all_progs = _firewall_target_programs()
+        cur_fw = query_firewall_and_profiles(tcp_p)
+        block_names = [b.get("name") or "" for b in (cur_fw.get("block_rules") or []) if b.get("name")]
+
+        if cur_fw.get("has_block_rules") and not remove_blocking:
+            raise ValueError(
+                "Для программы найдены блокирующие правила брандмауэра — они перекрывают разрешающие правила. "
+                "Отметьте галочку «Удалить блокирующие правила» и нажмите кнопку ещё раз."
+            )
+
+        ps_script = build_firewall_netsh_script(
+            all_progs,
+            tcp_p,
+            udp_p,
+            remove_blocking=bool(remove_blocking),
+            block_rule_names=block_names,
+        )
+        _lan_log(f"Запуск настройки брандмауэра через UAC: program={primary_prog}, TCP={tcp_p}, UDP={udp_p}, remove_blocking={bool(remove_blocking)}")
+        rc = _run_elevated_powershell(ps_script)
+        if rc != 0:
+            _lan_log(f"Настройка брандмауэра через UAC завершилась с кодом {rc}", logging.ERROR)
+            raise RuntimeError(f"Не удалось добавить правила брандмауэра (код netsh: {rc})")
+
+        updated = query_firewall_and_profiles(tcp_p)
+        with self._lock:
+            self._fw_cache = updated
+            self._fw_cache_ts = time.monotonic()
+        _lan_log(f"Правила брандмауэра успешно применены: ok={updated.get('ok')}")
+        runner.manager.log("lan", f"правила брандмауэра Windows добавлены (TCP {tcp_p}, UDP {udp_p})")
+        return {"ok": True, "firewall": updated}
+
+    def open_network_settings(self) -> dict:
+        """Открывает системное окно Параметров Windows «Состояние сети» (ms-settings:network-status)."""
+        if os.name != "nt":
+            raise ValueError("Открытие параметров сети Windows доступно только на Windows")
+        os.startfile("ms-settings:network-status")
+        return {"ok": True}
+
+    def diagnose_network(self, peer_ip: str = "", peer_port: int | None = None) -> dict:
+        """Выполняет полную пошаговую диагностику LAN (адаптер, порты, профиль, брандмауэр, VPN, шлюз, UDP-зонд, TCP пира)."""
+        cfg = self._lan_cfg()
+        lan_port = int(self._running_port or cfg["port"])
+        disc_port = lan_port + 1
+
+        clean_peer = ""
+        eff_peer_port = int(peer_port or lan_port)
+        raw_peer = (peer_ip or "").strip()
+        if raw_peer:
+            if raw_peer.count(":") == 1 and not raw_peer.startswith("["):
+                hp, pp = raw_peer.rsplit(":", 1)
+                if pp.isdigit():
+                    raw_peer = hp.strip()
+                    eff_peer_port = int(pp)
+            clean_peer = _clean_ip_str(raw_peer)
+
+        raw_adapters = _raw_win32_adapters()
+        ifaces = local_ipv4s(raw_adapters)
+        checks: list[dict] = []
+
+        # 1. LAN включена, физический адаптер и локальные порты
+        listening_tcp = self.is_listening()
+        listening_udp = self.is_udp_listening()
+        if not ifaces and self._bind_host != "127.0.0.1":
+            checks.append({
+                "id": "lan_ports",
+                "status": "fail",
+                "title": "Не найден подключённый физический адаптер Wi-Fi / Ethernet",
+                "detail": "Нет активного IPv4-адреса локальной сети (виртуальные и VPN-адаптеры исключены).",
+                "hint": "Проверьте подключение к роутеру по Wi-Fi или кабелю Ethernet.",
+                "action": None,
+            })
+        elif not cfg["enabled"] or not listening_tcp:
+            checks.append({
+                "id": "lan_ports",
+                "status": "fail",
+                "title": f"LAN выключена или порт TCP {lan_port} не слушается",
+                "detail": "По умолчанию обмен по локальной сети выключен.",
+                "hint": "Включите переключатель «Разрешить обмен по локальной сети» на ОБОИХ компьютерах.",
+                "action": "enable_lan",
+            })
+        elif cfg["auto_discovery"] and not listening_udp:
+            checks.append({
+                "id": "lan_ports",
+                "status": "warn",
+                "title": f"HTTP порт {lan_port} открыт, но UDP порт обнаружения {disc_port} занят",
+                "detail": ", ".join(f"{x['adapter']}: {x['ip']}/{x['prefix']}" for x in ifaces),
+                "hint": "Автопоиск может не работать — используйте подключение вручную по IP или смените LAN-порт в настройках.",
+                "action": None,
+            })
+        else:
+            iface_txt = ", ".join(f"{x['adapter']} ({x['ip']}/{x['prefix']})" for x in ifaces) or "loopback (127.0.0.1)"
+            checks.append({
+                "id": "lan_ports",
+                "status": "ok",
+                "title": f"LAN включена, порты TCP {lan_port} и UDP {disc_port} открыты",
+                "detail": f"Физические адаптеры: {iface_txt}",
+                "hint": "",
+                "action": None,
+            })
+
+        # 2. Профиль сети (Public / Private)
+        fw_info = self.get_firewall_status(lan_port, force=(self._bind_host != "127.0.0.1"))
+        if fw_info.get("has_public_profile"):
+            pub_names = ", ".join(f"«{p['name']}» ({p['adapter']})" for p in (fw_info.get("public_profiles") or []))
+            checks.append({
+                "id": "profile",
+                "status": "warn" if fw_info.get("ok") else "fail",
+                "title": f"Сеть {pub_names} имеет профиль «Общедоступная» (Public)",
+                "detail": "В общедоступной сети брандмауэр Windows по умолчанию блокирует входящие подключения.",
+                "hint": "Переключите профиль сети на «Частная» (Private) в Параметрах Windows (на обоих ПК) и разрешите брандмауэр.",
+                "action": "open_net_settings",
+            })
+        else:
+            prof_names = ", ".join(f"«{p['name']}» ({p['category']})" for p in (fw_info.get("profiles") or [])) or "Частная / Локальная"
+            checks.append({
+                "id": "profile",
+                "status": "ok",
+                "title": "Профиль сетевого подключения в порядке",
+                "detail": prof_names,
+                "hint": "",
+                "action": None,
+            })
+
+        # 3. Брандмауэр Windows
+        if fw_info.get("has_block_rules"):
+            bnames = ", ".join(b.get("display_name") or b.get("name") or "" for b in (fw_info.get("block_rules") or []))
+            checks.append({
+                "id": "firewall",
+                "status": "fail",
+                "title": "Найдены блокирующие входящие правила брандмауэра для RealtyWatch",
+                "detail": f"Блокирующие правила ({bnames}) имеют приоритет над разрешающими.",
+                "hint": "Отметьте удаление блокирующих правил и нажмите «Разрешить в брандмауэре».",
+                "action": "allow_firewall_unblock",
+            })
+        elif not fw_info.get("ok"):
+            missing = []
+            if not fw_info.get("tcp_allowed"):
+                missing.append(f"TCP {lan_port}")
+            if not fw_info.get("udp_allowed"):
+                missing.append(f"UDP {disc_port}")
+            checks.append({
+                "id": "firewall",
+                "status": "fail",
+                "title": f"В брандмауэре нет входящих разрешений ({', '.join(missing)})",
+                "detail": f"Программа: {fw_info.get('program')}",
+                "hint": "Нажмите «Разрешить в брандмауэре (права администратора)», чтобы открыть входящие подключения в профилях Частная и Публичная.",
+                "action": "allow_firewall",
+            })
+        else:
+            checks.append({
+                "id": "firewall",
+                "status": "ok",
+                "title": f"Правила брандмауэра Windows разрешают TCP {lan_port} и UDP {disc_port}",
+                "detail": f"Проверена программа: {Path(fw_info.get('program') or 'pythonw.exe').name}",
+                "hint": "",
+                "action": None,
+            })
+
+        # 4. Перехват локальной подсети активным VPN
+        extra_t = [clean_peer] if clean_peer else []
+        vpn_info = (
+            detect_vpn_route_hijack(raw_adapters, extra_targets=extra_t)
+            if self._bind_host != "127.0.0.1"
+            else {"hijacked": False, "vpn_adapter": "", "intercepted_targets": [], "message": ""}
+        )
+        if vpn_info.get("hijacked"):
+            checks.append({
+                "id": "vpn_route",
+                "status": "fail",
+                "title": f"VPN «{vpn_info['vpn_adapter']}» перехватывает локальную сеть ({vpn_info.get('subnet')})",
+                "detail": f"Пакеты на {', '.join(vpn_info.get('intercepted_targets') or [])} уходят в туннель вместо «{vpn_info.get('physical_adapter')}».",
+                "hint": "Включите в настройках VPN раздельное туннелирование: добавьте в исключения 192.168.0.0/16 (и 10.0.0.0/8, 172.16.0.0/12) — либо отключите VPN на время обмена.",
+                "action": None,
+            })
+        else:
+            phys_lbl = ifaces[0]["adapter"] if ifaces else "локальный интерфейс"
+            checks.append({
+                "id": "vpn_route",
+                "status": "ok",
+                "title": f"Маршрутизация в локальную сеть идёт напрямую через «{phys_lbl}»",
+                "detail": "Перехвата локальных маршрутов со стороны VPN не обнаружено.",
+                "hint": "",
+                "action": None,
+            })
+
+        # 5. Доступность шлюза по умолчанию (роутера)
+        gw_ip = ifaces[0].get("gateway") if ifaces else ""
+        if self._bind_host == "127.0.0.1":
+            checks.append({
+                "id": "gateway",
+                "status": "ok",
+                "title": "Локальный стенд (127.0.0.1) доступен",
+                "detail": "Режим loopback",
+                "hint": "",
+                "action": None,
+            })
+        elif not gw_ip:
+            checks.append({
+                "id": "gateway",
+                "status": "warn",
+                "title": "У сетевого адаптера не указан основной шлюз",
+                "detail": "Прямое соединение без роутера или сеть без выхода в интернет.",
+                "hint": "Если оба ПК подключены к одному роутеру — проверьте получение адреса по DHCP.",
+                "action": None,
+            })
+        else:
+            gw_ok = _probe_gateway_reachable(gw_ip)
+            if gw_ok:
+                checks.append({
+                    "id": "gateway",
+                    "status": "ok",
+                    "title": f"Роутер (шлюз {gw_ip}) отвечает",
+                    "detail": "Связь с локальной сетью подтверждена.",
+                    "hint": "",
+                    "action": None,
+                })
+            else:
+                checks.append({
+                    "id": "gateway",
+                    "status": "fail",
+                    "title": f"Роутер (шлюз {gw_ip}) не отвечает",
+                    "detail": "Пакеты в локальную сеть блокируются на уровне системы или Wi-Fi.",
+                    "hint": "Частая причина — активный VPN Kill-Switch (например, в AmneziaVPN / WireGuard) или изоляция клиентов гостевой Wi-Fi сети на роутере.",
+                    "action": None,
+                })
+
+        # 6. Активный UDP-зонд RW_PROBE_V1
+        if cfg["enabled"]:
+            con = db.connect()
+            try:
+                my_ident = self._identity(con)
+            finally:
+                con.close()
+            my_ips = {x["ip"] for x in ifaces} | {"127.0.0.1"}
+            bound_socks = self._open_bound_bcast_sockets()
+            replies_other: dict[str, str] = {}
+            self_replied = False
+            try:
+                for idx_s, (_lbl, dst_ips, s) in enumerate(bound_socks):
+                    ep = int(s.getsockname()[1])
+                    probe_b = json.dumps({
+                        "magic": _PROBE_MAGIC,
+                        "device_id": f"diag-{uuid.uuid4().hex[:8]}",
+                        "device_name": f"diag@{my_ident['device_name']}",
+                        "port": lan_port,
+                        "disc_port": ep,
+                        "platform": "diag",
+                    }, ensure_ascii=False).encode("utf-8")
+                    targets = {(d, disc_port) for d in dst_ips}
+                    if idx_s == 0 and clean_peer and _is_lan_ip(clean_peer):
+                        targets.add((clean_peer, int(eff_peer_port) + 1))
+                        targets.add((clean_peer, disc_port))
+                    for dst_pair in targets:
+                        try:
+                            s.sendto(probe_b, dst_pair)
+                        except OSError:
+                            pass
+                socks_list = [s for _l, _d, s in bound_socks]
+                end_t = time.monotonic() + (0.45 if self._bind_host == "127.0.0.1" else 1.4)
+                while time.monotonic() < end_t and socks_list:
+                    try:
+                        rdy, _, _ = select.select(socks_list, [], [], 0.15)
+                    except (OSError, ValueError):
+                        break
+                    for rs in rdy:
+                        try:
+                            raw_p, addr_p = rs.recvfrom(4096)
+                            pkt_p = json.loads(raw_p.decode("utf-8"))
+                        except Exception:
+                            continue
+                        if not isinstance(pkt_p, dict) or pkt_p.get("magic") != _DISCOVERY_MAGIC:
+                            continue
+                        did = str(pkt_p.get("device_id") or "")
+                        dname = str(pkt_p.get("device_name") or addr_p[0])
+                        if did == my_ident["device_id"] or (addr_p[0] in my_ips and int(pkt_p.get("port") or 0) == lan_port):
+                            self_replied = True
+                        else:
+                            replies_other[f"{dname} ({addr_p[0]})"] = did
+                            self._handle_discovery_packet(raw_p, addr_p[0], addr_p[1], my_lan_port=lan_port, sync_verify=True)
+            finally:
+                for _l, _d, s in bound_socks:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+            if replies_other:
+                checks.append({
+                    "id": "udp_probe",
+                    "status": "ok",
+                    "title": f"На UDP-зонд ответили устройства: {len(replies_other)}",
+                    "detail": ", ".join(replies_other.keys()),
+                    "hint": "",
+                    "action": None,
+                })
+            else:
+                self_txt = "Свой локальный сервер на зонд ответил." if self_replied else "Даже свой локальный UDP-сервер не ответил на зонд."
+                checks.append({
+                    "id": "udp_probe",
+                    "status": "warn",
+                    "title": "Другие компьютеры с RealtyWatch на UDP-зонд не ответили (0 ответов)",
+                    "detail": self_txt,
+                    "hint": "Убедитесь, что RealtyWatch открыт и LAN включена на ОБОИХ ПК, оба компьютера в одной сети, а на втором ПК также разрешён брандмауэр и не перехватывает VPN.",
+                    "action": None,
+                })
+        else:
+            checks.append({
+                "id": "udp_probe",
+                "status": "fail",
+                "title": "UDP-зонд пропущен, так как LAN выключена",
+                "detail": "",
+                "hint": "Сначала включите локальную сеть.",
+                "action": "enable_lan",
+            })
+
+        # 7. Прямая TCP-проверка до введённого IP второго компьютера (если указан)
+        if clean_peer:
+            if not _is_lan_ip(clean_peer):
+                checks.append({
+                    "id": "peer_tcp",
+                    "status": "fail",
+                    "title": f"Адрес {clean_peer} не является адресом локальной сети",
+                    "detail": "Поддерживаются только частные IPv4-адреса (192.168.x.x, 10.x.x.x, 172.16-31.x.x).",
+                    "hint": "Скопируйте физический адрес Wi-Fi/Ethernet со второго компьютера.",
+                    "action": None,
+                })
+            else:
+                try:
+                    t0 = time.monotonic()
+                    with socket.create_connection((clean_peer, eff_peer_port), timeout=2.5) as tsock:
+                        tsock.settimeout(2.0)
+                        req_b = f"GET /sync/status HTTP/1.1\r\nHost: {clean_peer}\r\nConnection: close\r\n\r\n".encode("ascii", errors="ignore")
+                        tsock.sendall(req_b)
+                        first_line = tsock.recv(256).decode("utf-8", errors="replace").splitlines()[0] if True else ""
+                    rtt = round((time.monotonic() - t0) * 1000)
+                    checks.append({
+                        "id": "peer_tcp",
+                        "status": "ok",
+                        "title": f"Прямое TCP-соединение с {clean_peer}:{eff_peer_port} установлено ({rtt} мс)",
+                        "detail": f"Ответ сервера партнёра: {first_line or 'OK'}",
+                        "hint": "",
+                        "action": None,
+                    })
+                except ConnectionRefusedError:
+                    checks.append({
+                        "id": "peer_tcp",
+                        "status": "fail",
+                        "title": f"Компьютер {clean_peer} отклонил подключение на порт {eff_peer_port}",
+                        "detail": "Узел в сети достижим, но порт закрыт.",
+                        "hint": "На втором компьютере выключена LAN в настройках RealtyWatch, закрыта программа или указан другой порт.",
+                        "action": None,
+                    })
+                except OSError as e:
+                    checks.append({
+                        "id": "peer_tcp",
+                        "status": "fail",
+                        "title": f"Нет TCP-соединения с {clean_peer}:{eff_peer_port}",
+                        "detail": f"Ошибка сети: {e}",
+                        "hint": "На втором ПК брандмауэр Windows блокирует входящие подключения, мешает VPN или введён неверный IP (например, адрес VPN вместо Wi-Fi).",
+                        "action": None,
+                    })
+
+        has_fail = any(c["status"] == "fail" for c in checks)
+        ok_all = not has_fail
+        _lan_log(
+            f"Диагностика сети завершена (peer={clean_peer or '—'}): ok={ok_all}, "
+            + "; ".join(f"{c['id']}={c['status']}" for c in checks)
+        )
+        return {
+            "ok": ok_all,
+            "checked_at": _now_ts(),
+            "peer_ip": clean_peer,
+            "peer_port": eff_peer_port if clean_peer else None,
+            "checks": checks,
+            "local_interfaces": ifaces,
+            "vpn_hijack": vpn_info,
+            "firewall": fw_info,
+        }
+
     def status(self, refresh: bool = False):
         cfg = self._lan_cfg()
         con = db.connect()
@@ -2108,18 +3561,30 @@ class LanService:
                 pass
         peers = self.list_peers()
         inbox = self.list_inbox()
+        raw_adapters = _raw_win32_adapters() if self._bind_host != "127.0.0.1" else []
+        ifaces = local_ipv4s(raw_adapters) if self._bind_host != "127.0.0.1" else []
+        vpn_hijack = (
+            detect_vpn_route_hijack(raw_adapters)
+            if self._bind_host != "127.0.0.1"
+            else {"hijacked": False, "vpn_adapter": "", "intercepted_targets": [], "message": ""}
+        )
+        fw_info = self.get_firewall_status(cfg["port"], sync_if_empty=(refresh and self._bind_host != "127.0.0.1"))
         with self._lock:
             self._outbox_count = ocnt
             newer_peer = dict(self._newer_db_peer) if self._newer_db_peer else None
         return {
             "enabled": cfg["enabled"],
             "listening": self.is_listening(),
+            "udp_listening": self.is_udp_listening(),
             "port": cfg["port"],
             "actual_port": self._running_port,
             "auto_discovery": cfg["auto_discovery"],
             "device_id": ident["device_id"],
             "device_name": ident["device_name"],
-            "local_ips": local_ipv4s(),
+            "local_interfaces": ifaces,
+            "local_ips": [x["ip"] for x in ifaces],
+            "vpn_hijack": vpn_hijack,
+            "firewall": fw_info,
             "pin": self.pin_status(),
             "discovered": self.list_discovered(),
             "peers": peers,
@@ -4556,6 +6021,18 @@ def mark_history_seen(ids=None):
 
 def clear_history():
     return service.clear_history()
+
+
+def diagnose_network(peer_ip: str = "", peer_port: int | None = None):
+    return service.diagnose_network(peer_ip=peer_ip, peer_port=peer_port)
+
+
+def allow_firewall(remove_blocking: bool = False):
+    return service.allow_firewall(remove_blocking=remove_blocking)
+
+
+def open_network_settings():
+    return service.open_network_settings()
 
 
 def reset_runtime_cache():

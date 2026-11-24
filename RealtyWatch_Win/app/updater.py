@@ -40,13 +40,22 @@ log = logging.getLogger("realtywatch")
 
 GITHUB_REPO = "Siesge/RealtyWatch"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-USER_AGENT = "RealtyWatch-Updater/1.7 (+https://github.com/Siesge/RealtyWatch)"
+USER_AGENT = "RealtyWatch-Updater/1.8 (+https://github.com/Siesge/RealtyWatch)"
 
 INTERVAL_SECONDS = {
     "day": 86400,
     "week": 7 * 86400,
     "month": 30 * 86400,
 }
+ERROR_RETRY_SECONDS = 3600  # повторная проверка через 1 час после сетевой ошибки / HTTP != 200/404
+
+
+class InstallerLaunchError(RuntimeError):
+    """Ошибка запуска фонового PowerShell-установщика (процесс завершился сразу после старта)."""
+
+    def __init__(self, returncode: int | None, message: str = ""):
+        self.returncode = returncode
+        super().__init__(message or f"Установщик не запустился (код {returncode})")
 
 # Папки пользователя и среды — НИКОГДА не затираются и не очищаются при обновлении версии
 PROTECTED_ROOTS = frozenset({
@@ -618,28 +627,66 @@ if __name__ == "__main__":
     root = Path(sys.argv[2]).resolve()
     data = Path(sys.argv[3]).resolve()
     ver = sys.argv[4] if len(sys.argv) > 4 else ""
-    log_file = root / "logs" / "update.log"
+    log_file = Path(sys.argv[5]).resolve() if len(sys.argv) > 5 and sys.argv[5] else (root / "logs" / "update.log")
     log_file.parent.mkdir(parents=True, exist_ok=True)
     try:
         apply_tree(unpacked, root, data, ver)
         with open(log_file, "a", encoding="utf-8") as lf:
-            lf.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} успешно обновлено до версии {ver}\\n")
+            lf.write(f"{datetime.now():%Y-%m-%d %H:%M:%S.%f}"[:-3] + f" [py] apply_staged.py: файлы версии v{ver} успешно применены\\n")
     except Exception:
         with open(log_file, "a", encoding="utf-8") as lf:
-            lf.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} сбой обновления:\\n{traceback.format_exc()}\\n")
+            lf.write(f"{datetime.now():%Y-%m-%d %H:%M:%S.%f}"[:-3] + f" [py] сбой apply_staged.py:\\n{traceback.format_exc()}\\n")
         sys.exit(1)
 '''
 
 
-def build_powershell_runner(app_root: Path, data_dir: Path, unpacked_dir: Path, apply_py: Path, pid: int, version: str) -> str:
+def _append_update_log(app_root: Path | None, msg: str):
+    """Дописывает строку в logs/update.log со стороны основного процесса."""
+    try:
+        root = Path(app_root or APP_ROOT)
+        lf = root / "logs" / "update.log"
+        lf.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        with open(lf, "a", encoding="utf-8") as f:
+            f.write(f"{ts} [app] {msg}\n")
+    except OSError:
+        pass
+
+
+def write_ps1_utf8_bom(path: Path, body: str) -> Path:
+    """Записывает PowerShell-скрипт в UTF-8 с BOM и строгими переводами строк CRLF (без двойного \\r\\r\\n)."""
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(("\ufeff" + normalized).encode("utf-8"))
+    return path
+
+
+def build_powershell_runner(
+    app_root: Path,
+    data_dir: Path,
+    unpacked_dir: Path,
+    apply_py: Path,
+    pid: int,
+    version: str,
+    *,
+    logs_dir: Path | None = None,
+    restart_app: bool = True,
+) -> str:
     """Генерирует PowerShell-скрипт ожидания выхода старого процесса, установки релиза, проверки пакетов и перезапуска."""
     py_exe = app_root / "runtime" / "python" / "python.exe"
     if not py_exe.is_file():
-        py_exe = Path(sys.executable)
+        cand = Path(sys.executable)
+        if cand.name.lower() == "pythonw.exe" and cand.with_name("python.exe").is_file():
+            py_exe = cand.with_name("python.exe")
+        else:
+            py_exe = cand
     setup_ps1 = app_root / "setup.ps1"
     launcher_exe = app_root / "RealtyWatch.exe"
     start_bat = app_root / "start.bat"
     staging = _staging_dir(data_dir)
+    eff_logs = Path(logs_dir) if logs_dir is not None else (Path(app_root) / "logs")
+    log_file = eff_logs / "update.log"
     q = lambda p: str(p).replace("'", "''")
     return "\n".join([
         "$ErrorActionPreference = 'Continue'",
@@ -653,38 +700,143 @@ def build_powershell_runner(app_root: Path, data_dir: Path, unpacked_dir: Path, 
         f"$ExePath   = '{q(launcher_exe)}'",
         f"$StartBat  = '{q(start_bat)}'",
         f"$Staging   = '{q(staging)}'",
+        f"$LogDir    = '{q(eff_logs)}'",
+        f"$LogFile   = '{q(log_file)}'",
         f"$NewVer    = '{q(version)}'",
+        f"$DoRestart = {'$true' if restart_app else '$false'}",
+        "",
+        "New-Item -ItemType Directory -Force -Path $LogDir -ErrorAction SilentlyContinue | Out-Null",
+        "function Write-UpdLog([string]$Msg) {",
+        "    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'",
+        "    Add-Content -LiteralPath $LogFile -Value \"$ts [ps1] $Msg\" -Encoding UTF8 -ErrorAction SilentlyContinue",
+        "}",
+        "",
+        "Write-UpdLog \"=== Старт run_update.ps1 (ps_pid=$PID): целевая версия v$NewVer, ожидание завершения PID=$TargetPid ===\"",
         "",
         "# 1. Ждём завершения старого процесса RealtyWatch (до 35 с)",
-        "for ($i = 0; $i -lt 140; $i++) {",
-        "    $proc = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue",
-        "    if (-not $proc) { break }",
-        "    Start-Sleep -Milliseconds 250",
+        "$WaitedSteps = 0",
+        "if ($TargetPid -gt 0) {",
+        "    for ($i = 0; $i -lt 140; $i++) {",
+        "        $proc = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue",
+        "        if (-not $proc) { break }",
+        "        Start-Sleep -Milliseconds 250",
+        "        $WaitedSteps = $i + 1",
+        "    }",
+        "}",
+        "$StillAlive = ($TargetPid -gt 0) -and ($null -ne (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue))",
+        "if ($StillAlive) {",
+        "    Write-UpdLog \"ВНИМАНИЕ: старый процесс PID=$TargetPid не завершился за 35 с — пробую принудительную остановку\"",
+        "    Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue",
+        "    Start-Sleep -Milliseconds 500",
+        "} else {",
+        "    Write-UpdLog (\"Старый процесс PID=$TargetPid завершился (ожидание \" + ($WaitedSteps * 250) + \" мс)\")",
         "}",
         "Start-Sleep -Milliseconds 400",
         "",
         "# 2. Применяем файлы релиза и вычищаем устаревшие файлы / мусор",
-        "& $PyExe -I $ApplyPy $Unpacked $AppRoot $DataDir $NewVer",
+        "Write-UpdLog \"Запуск apply_staged.py через $PyExe\"",
+        "& $PyExe -I $ApplyPy $Unpacked $AppRoot $DataDir $NewVer $LogFile",
         "$ApplyCode = $LASTEXITCODE",
+        "Write-UpdLog \"apply_staged.py завершился с кодом $ApplyCode\"",
         "",
         "# 3. Если requirements.txt обновился — тихо доустанавливаем библиотеки через setup.ps1 -Quick",
-        "if ($ApplyCode -eq 0 -and (Test-Path $SetupPs1)) {",
+        "if ($ApplyCode -eq 0 -and (Test-Path -LiteralPath $SetupPs1)) {",
+        "    Write-UpdLog \"Запуск setup.ps1 -Quick\"",
         "    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $SetupPs1 -Quick | Out-Null",
+        "    Write-UpdLog \"setup.ps1 -Quick завершился с кодом $LASTEXITCODE\"",
         "}",
         "",
-        "# 4. Удаляем временную папку скачивания и распаковки",
-        "if (Test-Path $Staging) {",
+        "# 4. Удаляем временную папку скачивания и распаковки (только при успешном применении)",
+        "if ($ApplyCode -eq 0 -and (Test-Path -LiteralPath $Staging)) {",
+        "    Write-UpdLog \"Очистка временной папки $Staging\"",
+        "    if (Test-Path -LiteralPath $Unpacked) { Remove-Item -LiteralPath $Unpacked -Recurse -Force -ErrorAction SilentlyContinue }",
+        "    if (Test-Path -LiteralPath $ApplyPy) { Remove-Item -LiteralPath $ApplyPy -Force -ErrorAction SilentlyContinue }",
+        "    Get-ChildItem -LiteralPath $Staging -Filter '*.zip*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue",
         "    Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue",
+        "} elseif ($ApplyCode -ne 0) {",
+        "    Write-UpdLog \"ОШИБКА установки (код $ApplyCode): папка $Staging оставлена для диагностики\"",
         "}",
         "",
         "# 5. Запускаем обновлённое приложение",
-        "if (Test-Path $ExePath) {",
-        "    Start-Process -FilePath $ExePath -WorkingDirectory $AppRoot",
-        "} elseif (Test-Path $StartBat) {",
-        "    Start-Process -FilePath $StartBat -WorkingDirectory $AppRoot",
+        "if ($DoRestart) {",
+        "    try {",
+        "        if (Test-Path -LiteralPath $ExePath) {",
+        "            Write-UpdLog \"Перезапуск программы: $ExePath\"",
+        "            $started = Start-Process -FilePath $ExePath -WorkingDirectory $AppRoot -PassThru",
+        "            Write-UpdLog \"Запущен новый процесс RealtyWatch.exe (PID=$($started.Id))\"",
+        "        } elseif (Test-Path -LiteralPath $StartBat) {",
+        "            Write-UpdLog \"Перезапуск через start.bat: $StartBat\"",
+        "            $started = Start-Process -FilePath $StartBat -WorkingDirectory $AppRoot -PassThru",
+        "            Write-UpdLog \"Запущен start.bat (PID=$($started.Id))\"",
+        "        } else {",
+        "            Write-UpdLog \"ПРЕДУПРЕЖДЕНИЕ: не найден ни RealtyWatch.exe, ни start.bat в $AppRoot\"",
+        "        }",
+        "    } catch {",
+        "        Write-UpdLog \"ОШИБКА при перезапуске программы: $($_.Exception.Message)\"",
+        "    }",
+        "} else {",
+        "    Write-UpdLog \"Автоперезапуск отключён (режим проверки)\"",
         "}",
+        "Write-UpdLog \"=== Завершение run_update.ps1 (код apply=$ApplyCode) ===\"",
+        "exit $ApplyCode",
         "",
     ])
+
+
+def spawn_powershell_installer(
+    run_ps1: Path,
+    cwd: Path,
+    *,
+    wait_verify_sec: float = 1.5,
+    powershell_exe: str = "powershell.exe",
+) -> subprocess.Popen:
+    """Запускает фоновый PowerShell-установщик в собственной группе процессов (без DETACHED_PROCESS,
+    из-за которого powershell.exe -File мгновенно завершается при запуске из pythonw.exe)
+    и проверяет в течение wait_verify_sec, что процесс не упал сразу после старта."""
+    cmd = [
+        powershell_exe,
+        "-NoProfile",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(run_ps1),
+    ]
+    base_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    breakaway_flag = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000 if os.name == "nt" else 0)
+
+    proc = None
+    if os.name == "nt" and breakaway_flag:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                creationflags=base_flags | breakaway_flag,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+            )
+        except OSError:
+            proc = None
+    if proc is None:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            creationflags=base_flags if os.name == "nt" else 0,
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+        )
+
+    deadline = time.monotonic() + max(0.0, float(wait_verify_sec))
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    rc = proc.poll()
+    if rc is not None:
+        raise InstallerLaunchError(rc, f"Установщик не запустился (код {rc})")
+    return proc
 
 
 class UpdaterService:
@@ -696,6 +848,7 @@ class UpdaterService:
         self._checking = False
         self._downloading = False
         self._dismissed_version = ""
+        self._startup_checked = False
         self._seq = 0
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
@@ -723,6 +876,7 @@ class UpdaterService:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            self._startup_checked = False
             self._stop_evt.clear()
             self._thread = threading.Thread(target=self._bg_loop, daemon=True, name="updater")
             self._thread.start()
@@ -734,6 +888,8 @@ class UpdaterService:
         sf = _state_file()
         base = {
             "last_checked": "",
+            "last_attempt": "",
+            "last_success": "",
             "available_version": "",
             "title": "",
             "notes": "",
@@ -755,6 +911,12 @@ class UpdaterService:
                     base.update(loaded)
             except (OSError, ValueError):
                 pass
+        # Обратная совместимость с updater.json версий 1.6/1.7, где хранилось только поле last_checked
+        if not base.get("last_attempt") and base.get("last_checked"):
+            base["last_attempt"] = base["last_checked"]
+        if not base.get("last_success") and base.get("last_checked") and not base.get("last_error"):
+            base["last_success"] = base["last_checked"]
+
         # Если ранее скачанный файл был удалён с диска или текущая версия уже догнала скачанную — сбрасываем ready
         local_ver = read_local_version()
         avail = str(base.get("available_version") or "")
@@ -780,9 +942,9 @@ class UpdaterService:
 
     def get_config(self) -> dict:
         cfg = settings.load().get("updates") or {}
-        interval = str(cfg.get("interval") or "week")
+        interval = str(cfg.get("interval") or "day")
         if interval not in INTERVAL_SECONDS:
-            interval = "week"
+            interval = "day"
         return {
             "auto_check": bool(cfg.get("auto_check", True)),
             "interval": interval,
@@ -807,7 +969,9 @@ class UpdaterService:
             "interval": ucfg["interval"],
             "checking": checking,
             "downloading": downloading,
-            "last_checked": st.get("last_checked") or "",
+            "last_checked": st.get("last_checked") or st.get("last_attempt") or "",
+            "last_attempt": st.get("last_attempt") or "",
+            "last_success": st.get("last_success") or "",
             "last_error": st.get("last_error") or "",
             "available_version": avail,
             "has_update": bool(avail and (not local_ver and not dev or (local_ver and is_newer_version(avail, local_ver)) or (dev and bool(avail)))),
@@ -850,16 +1014,29 @@ class UpdaterService:
         self._bump_seq()
         return self.status()
 
-    def is_due(self) -> bool:
+    def is_due(self, startup: bool = False) -> bool:
         ucfg = self.get_config()
         if not ucfg["auto_check"]:
             return False
+        if startup:
+            return True
         st = self._read_state()
-        last = st.get("last_checked") or ""
-        if not last:
+        # После сетевой ошибки или HTTP != 200/404 повторяем попытку через 1 час, не дожидаясь полного интервала
+        if st.get("last_error"):
+            last_att = st.get("last_attempt") or st.get("last_checked") or ""
+            if not last_att:
+                return True
+            try:
+                elapsed_err = (datetime.now() - datetime.fromisoformat(last_att)).total_seconds()
+            except ValueError:
+                return True
+            return elapsed_err >= ERROR_RETRY_SECONDS
+
+        last_ok = st.get("last_success") or ""
+        if not last_ok:
             return True
         try:
-            elapsed = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+            elapsed = (datetime.now() - datetime.fromisoformat(last_ok)).total_seconds()
         except ValueError:
             return True
         return elapsed >= INTERVAL_SECONDS[ucfg["interval"]]
@@ -884,12 +1061,21 @@ class UpdaterService:
                 max_bytes=4 * 1024 * 1024,
             )
             if code == 404:
-                st.update({"last_checked": now_s, "last_error": ""})
+                st.update({
+                    "last_checked": now_s,
+                    "last_attempt": now_s,
+                    "last_success": now_s,
+                    "last_error": "",
+                })
                 self._write_state(st)
                 self._bump_seq()
             elif code != 200:
                 err_msg = f"GitHub ответил HTTP {code}"
-                st.update({"last_checked": now_s, "last_error": err_msg})
+                st.update({
+                    "last_checked": now_s,
+                    "last_attempt": now_s,
+                    "last_error": err_msg,
+                })
                 self._write_state(st)
                 self._bump_seq()
                 if manual:
@@ -903,7 +1089,7 @@ class UpdaterService:
                 info = select_portable_asset(rel_json)
                 remote_ver = info["version"]
                 st["last_checked"] = now_s
-                st["last_error"] = ""
+                st["last_attempt"] = now_s
 
                 # Сравнение версий (в режиме разработки без version.txt сообщаем о релизе, но не перезаписываем репо)
                 newer = is_newer_version(remote_ver, local_ver) if local_ver else (not dev)
@@ -918,9 +1104,17 @@ class UpdaterService:
                             "notes": info["notes"],
                             "html_url": info["html_url"],
                             "published_at": info["published_at"],
+                            "last_success": now_s,
+                            "last_error": "",
                         })
                     else:
-                        st.update({"available_version": "", "ready": False, "zip_path": ""})
+                        st.update({
+                            "available_version": "",
+                            "ready": False,
+                            "zip_path": "",
+                            "last_success": now_s,
+                            "last_error": "",
+                        })
                     self._write_state(st)
                     self._bump_seq()
                     extra_fields["latest_github_version"] = remote_ver
@@ -931,6 +1125,8 @@ class UpdaterService:
                     and existing_zip.is_file()
                 ):
                     # Если этот же релиз уже скачан и проверен на диске — повторно не качаем
+                    st["last_success"] = now_s
+                    st["last_error"] = ""
                     if manual:
                         with self._lock:
                             self._dismissed_version = ""
@@ -951,6 +1147,9 @@ class UpdaterService:
                     self._write_state(st)
 
                     if not download:
+                        st["last_success"] = now_s
+                        st["last_error"] = ""
+                        self._write_state(st)
                         self._bump_seq()
                     else:
                         with self._lock:
@@ -995,6 +1194,7 @@ class UpdaterService:
                         st["zip_path"] = str(final_zip)
                         st["size"] = len(zip_bytes)
                         st["ready"] = True
+                        st["last_success"] = now_s
                         st["last_error"] = ""
                         self._write_state(st)
                         with self._lock:
@@ -1013,8 +1213,10 @@ class UpdaterService:
                             except Exception:
                                 pass
         except Exception as e:
+            now_err = _now_iso()
             st = self._read_state()
-            st["last_checked"] = _now_iso()
+            st["last_checked"] = now_err
+            st["last_attempt"] = now_err
             st["last_error"] = str(e)
             self._write_state(st)
             self._bump_seq()
@@ -1031,7 +1233,7 @@ class UpdaterService:
             res.update(extra_fields)
         return res
 
-    def apply_update(self, allow_dev: bool = False, spawn_installer: bool = True) -> dict:
+    def apply_update(self, allow_dev: bool = False, spawn_installer: bool = True, wait_verify_sec: float = 1.5) -> dict:
         """Готовит страховочный бэкап БД, распаковывает проверенный релиз и запускает обновление с перезапуском."""
         from .runner import manager
 
@@ -1074,34 +1276,47 @@ class UpdaterService:
         run_ps1 = sdir / "run_update.ps1"
         apply_py.write_text(_STANDALONE_APPLY_SCRIPT, encoding="utf-8")
         ps_body = build_powershell_runner(APP_ROOT, DATA_DIR, unpacked, apply_py, os.getpid(), target_ver)
-        run_ps1.write_text("\ufeff" + ps_body.replace("\r\n", "\n").replace("\n", "\r\n"), encoding="utf-8")
+        write_ps1_utf8_bom(run_ps1, ps_body)
 
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-        subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", str(run_ps1)],
-            cwd=str(APP_ROOT.parent),
-            creationflags=creation_flags,
-            close_fds=True,
-        )
+        _append_update_log(APP_ROOT, f"Подготовлен установщик v{target_ver}: {run_ps1} (ожидание PID={os.getpid()}, бэкап={Path(backup_path).name})")
+        try:
+            proc = spawn_powershell_installer(run_ps1, cwd=APP_ROOT.parent, wait_verify_sec=wait_verify_sec)
+        except (InstallerLaunchError, OSError) as e:
+            err_msg = str(e) if isinstance(e, InstallerLaunchError) else f"Установщик не запустился ({e})"
+            _append_update_log(APP_ROOT, f"ОШИБКА запуска установщика: {err_msg}")
+            st["last_error"] = err_msg
+            self._write_state(st)
+            self._bump_seq()
+            manager.log("db", f"⚠ {err_msg} — закрытие программы отменено")
+            raise RuntimeError(err_msg) from e
+
+        _append_update_log(APP_ROOT, f"Установщик powershell.exe успешно запущен (PID={proc.pid}), закрываю текущее окно…")
         manager.log("db", f"установка обновления v{target_ver}: резервная копия создана ({Path(backup_path).name}), перезапуск…")
 
         if self._shutdown_cb:
-            threading.Timer(0.45, self._shutdown_cb).start()
-        return {"ok": True, "version": target_ver, "backup": backup_path, "restarting": True}
+            threading.Timer(0.35, self._shutdown_cb).start()
+        return {"ok": True, "version": target_ver, "backup": backup_path, "restarting": True, "installer_pid": proc.pid}
 
     def _bg_loop(self):
-        # Мягкий отложенный первый опрос через 25 с после старта окна, далее проверка каждые 15 мин
+        # Первый опрос при каждом запуске через 25 с после старта окна, далее проверка каждые 5 мин (по интервалу / 1 ч после сбоя)
         if self._stop_evt.wait(25.0):
             return
         while not self._stop_evt.is_set():
             try:
                 from .runner import manager
 
-                if self.is_due() and not manager.any_running():
-                    self.check_for_updates(manual=False, download=True)
+                with self._lock:
+                    need_startup = not self._startup_checked
+                if not manager.any_running():
+                    if need_startup and self.get_config()["auto_check"]:
+                        with self._lock:
+                            self._startup_checked = True
+                        self.check_for_updates(manual=False, download=True)
+                    elif self.is_due():
+                        self.check_for_updates(manual=False, download=True)
             except Exception:
                 pass
-            if self._stop_evt.wait(900.0):
+            if self._stop_evt.wait(300.0):
                 break
 
 

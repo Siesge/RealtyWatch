@@ -1086,6 +1086,35 @@ def lan_history_clear():
     return lan_sync.clear_history()
 
 
+@app.post("/api/lan/diagnose")
+def lan_diagnose(body: dict = Body(default={})):
+    b = body if isinstance(body, dict) else {}
+    peer_ip = str(b.get("peer_ip") or "").strip()
+    peer_port = b.get("peer_port")
+    try:
+        pport = int(peer_port) if peer_port else None
+    except (TypeError, ValueError):
+        pport = None
+    return lan_sync.diagnose_network(peer_ip=peer_ip, peer_port=pport)
+
+
+@app.post("/api/lan/firewall/allow")
+def lan_firewall_allow(body: dict = Body(default={})):
+    b = body if isinstance(body, dict) else {}
+    try:
+        return lan_sync.allow_firewall(remove_blocking=bool(b.get("remove_blocking", False)))
+    except (ValueError, RuntimeError, TimeoutError, OSError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/lan/open-network-settings")
+def lan_open_network_settings():
+    try:
+        return lan_sync.open_network_settings()
+    except (ValueError, OSError) as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/runs")
 def runs():
     con = db.connect()

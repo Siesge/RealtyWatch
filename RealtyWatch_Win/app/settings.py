@@ -47,7 +47,7 @@ DEFAULTS = {
     "ui": {"tray_on_close": True},
     "server": {"port": 8765},
     "lan": {"enabled": False, "port": 8766, "auto_discovery": True, "device_id": "", "device_name": ""},
-    "updates": {"auto_check": True, "interval": "week"},
+    "updates": {"auto_check": True, "interval": "day"},
 }
 
 _lock = threading.Lock()

@@ -4,6 +4,7 @@
 import hashlib
 import io
 import json
+import os
 import socket
 import sqlite3
 import subprocess
@@ -384,7 +385,8 @@ class UpdaterCoreAndCleanupTests(Case):
 
     def test_intervals_day_week_month_and_busy_or_dev_guards(self):
         svc = updater.UpdaterService()
-        # По умолчанию auto_check=True, interval='week', ещё не проверялось -> is_due() == True
+        # По умолчанию auto_check=True, interval='day', ещё не проверялось -> is_due() == True
+        self.assertEqual(svc.get_config()["interval"], "day")
         self.assertTrue(svc.is_due())
 
         now = datetime.now()
@@ -400,8 +402,31 @@ class UpdaterCoreAndCleanupTests(Case):
             svc._write_state({"last_checked": (now - timedelta(days=ago_days)).isoformat(timespec="seconds")})
             self.assertEqual(svc.is_due(), expected, f"interval={interval}, ago={ago_days}")
 
+        # При старте (startup=True) проверяем даже если недавний last_success уже был 10 минут назад
+        server.set_settings({"updates": {"auto_check": True, "interval": "week"}})
+        svc._write_state({"last_success": (now - timedelta(minutes=10)).isoformat(timespec="seconds")})
+        self.assertFalse(svc.is_due(startup=False))
+        self.assertTrue(svc.is_due(startup=True))
+
+        # После ошибки сети / HTTP != 200/404 повтор через 1 час (не дожидаясь week/month), last_success сохраняется отдельно
+        prev_ok = (now - timedelta(hours=2)).isoformat(timespec="seconds")
+        svc._write_state({"last_success": prev_ok, "last_attempt": prev_ok, "last_checked": prev_ok})
+        with patch.object(updater, "_fetch_bytes", return_value=(502, b"Bad Gateway")):
+            svc.check_for_updates(manual=False, download=True)
+        st_err = svc._read_state()
+        self.assertEqual(st_err["last_success"], prev_ok)
+        self.assertIn("502", st_err["last_error"])
+        # Сразу после ошибки (прошло < 1 ч) — ещё рано
+        self.assertFalse(svc.is_due())
+        # Спустя 65 минут после неудачной попытки — пора повторить, даже при интервале 'month'!
+        server.set_settings({"updates": {"auto_check": True, "interval": "month"}})
+        st_err["last_attempt"] = (now - timedelta(minutes=65)).isoformat(timespec="seconds")
+        svc._write_state(st_err)
+        self.assertTrue(svc.is_due())
+
         server.set_settings({"updates": {"auto_check": False, "interval": "day"}})
         self.assertFalse(svc.is_due())
+        self.assertFalse(svc.is_due(startup=True))
 
         # Блокировка установки во время активного сбора -> HTTP 409
         with patch.object(runner.manager, "any_running", return_value=True):
@@ -415,6 +440,118 @@ class UpdaterCoreAndCleanupTests(Case):
             server.update_apply()
         self.assertEqual(ctx400.exception.status_code, 400)
         self.assertIn("git", ctx400.exception.detail.lower())
+
+    @unittest.skipUnless(os.name == "nt", "Тест реального powershell.exe для Windows")
+    def test_spawn_powershell_installer_from_pythonw_survives_parent_exit_and_early_fail_guard(self):
+        """Реальный интеграционный тест A1:
+        1) Дочерний процесс pythonw.exe (или python.exe) запускает настоящий powershell.exe через
+           spawn_powershell_installer с теми же флагами Popen и сразу завершается;
+           проверяем отсутствие \\r\\r\\n в ps1, выживание powershell.exe после закрытия родителя,
+           появление маркер-файла и полного журнала в logs/update.log.
+        2) Если установщик мгновенно падает (код возврата != None за время проверки), программа
+           НЕ закрывается (_shutdown_cb не вызывается) и выдаёт ошибку «Установщик не запустился (код N)»."""
+        root = updater.APP_ROOT
+        data_dir = updater.DATA_DIR
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (root / "version.txt").write_text("RealtyWatch 1.6\r\n", encoding="utf-8")
+
+        unpacked = data_dir / "update_staging" / "unpacked"
+        (unpacked / "app").mkdir(parents=True, exist_ok=True)
+        (unpacked / "web").mkdir(parents=True, exist_ok=True)
+        (unpacked / "app" / "main.py").write_text("# v1.8 main\n" * 30, encoding="utf-8")
+        (unpacked / "web" / "index.html").write_text("<html>1.8</html>\n" * 20, encoding="utf-8")
+        (unpacked / "version.txt").write_text("RealtyWatch 1.8, сборка 2026-11-24\r\n", encoding="utf-8")
+
+        apply_py = data_dir / "update_staging" / "apply_staged.py"
+        run_ps1 = data_dir / "update_staging" / "run_update.ps1"
+        apply_py.write_text(updater._STANDALONE_APPLY_SCRIPT, encoding="utf-8")
+
+        # 1) Проверяем отсутствие двойного \r\r\n при записи ps1
+        sample_ps1 = updater.write_ps1_utf8_bom(
+            data_dir / "sample_check.ps1",
+            "Write-Host 'one'\r\nWrite-Host 'two'\nWrite-Host 'three'\r\n",
+        )
+        raw_ps1 = sample_ps1.read_bytes()
+        self.assertTrue(raw_ps1.startswith(b"\xef\xbb\xbf"))
+        self.assertNotIn(b"\r\r\n", raw_ps1)
+        self.assertIn(b"\r\n", raw_ps1)
+
+        # 2) Запускаем из настоящего pythonw.exe (как у пользователя в Проводнике!), который стартует powershell и выходит
+        py_dir = Path(sys.executable).parent
+        pyw_exe = py_dir / "pythonw.exe"
+        parent_exe = str(pyw_exe if pyw_exe.is_file() else Path(sys.executable))
+        repo_win = str(Path(__file__).resolve().parent.parent)
+        marker_parent_done = self.dir / "parent_exited.txt"
+
+        child_code = f"""
+import os, sys, time
+from pathlib import Path
+sys.path.insert(0, {repo_win!r})
+from app import updater
+root = Path({str(root)!r})
+data_dir = Path({str(data_dir)!r})
+unpacked = Path({str(unpacked)!r})
+apply_py = Path({str(apply_py)!r})
+run_ps1 = Path({str(run_ps1)!r})
+body = updater.build_powershell_runner(root, data_dir, unpacked, apply_py, os.getpid(), '1.8', restart_app=False)
+updater.write_ps1_utf8_bom(run_ps1, body)
+proc = updater.spawn_powershell_installer(run_ps1, cwd=root.parent, wait_verify_sec=1.5)
+Path({str(marker_parent_done)!r}).write_text(str(proc.pid), encoding='utf-8')
+sys.exit(0)
+"""
+        env = os.environ.copy()
+        env["RW_LOGS_DIR"] = str(self.dir / "logs")
+        env["RW_NO_UPDATER"] = "1"
+        rc = subprocess.run([parent_exe, "-c", child_code], cwd=repo_win, env=env, timeout=20).returncode
+        self.assertEqual(rc, 0)
+        self.assertTrue(marker_parent_done.is_file(), "родительский pythonw должен успешно запустить powershell и выйти")
+        self.assertNotIn(b"\r\r\n", run_ps1.read_bytes() if run_ps1.exists() else b"")
+
+        # Ждём завершения фонового run_update.ps1 УЖЕ ПОСЛЕ выхода родителя pythonw.exe!
+        upd_log = root / "logs" / "update.log"
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if updater.read_local_version(root) == "1.8" and upd_log.is_file() and "Завершение run_update.ps1" in upd_log.read_text(encoding="utf-8", errors="replace"):
+                break
+            time.sleep(0.2)
+
+        self.assertEqual(updater.read_local_version(root), "1.8", "новая версия должна примениться после выхода родителя")
+        self.assertFalse(unpacked.exists(), "папка распаковки должна быть удалена сразу")
+        self.assertFalse(apply_py.exists(), "apply_staged.py должен быть удалён сразу")
+        # После завершения powershell.exe штатная уборка стартующей программы удаляет остаток папки update_staging (если ОС держала сам run_update.ps1)
+        time.sleep(0.25)
+        updater.UpdaterService().cleanup_leftovers()
+        self.assertFalse((data_dir / "update_staging").exists(), "папка update_staging полностью очищена")
+        log_txt = upd_log.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("[ps1] === Старт run_update.ps1", log_txt)
+        self.assertIn("[py] apply_staged.py: файлы версии v1.8 успешно применены", log_txt)
+        self.assertIn("[ps1] === Завершение run_update.ps1 (код apply=0) ===", log_txt)
+
+        # 3) Защита при мгновенном падении установщика: программа НЕ закрывается и сообщает код возврата
+        zip_v19 = _build_release_zip({
+            "version.txt": "RealtyWatch 1.9, сборка 2026-11-25\r\n",
+            "app/main.py": "# v1.9\n" * 30,
+            "web/index.html": "<html>1.9</html>\n" * 20,
+        })
+        zpath = data_dir / "update_staging" / "RealtyWatch-1.9-windows-portable.zip"
+        zpath.parent.mkdir(parents=True, exist_ok=True)
+        zpath.write_bytes(zip_v19)
+        svc = updater.UpdaterService()
+        shutdown_called = []
+        svc.set_hooks(shutdown_cb=lambda: shutdown_called.append(True))
+        svc._write_state({
+            "available_version": "1.9",
+            "ready": True,
+            "zip_path": str(zpath),
+            "sha256": hashlib.sha256(zip_v19).hexdigest(),
+        })
+        # Подменяем build_powershell_runner на скрипт, который мгновенно завершается с кодом 7
+        with patch.object(updater, "build_powershell_runner", return_value="exit 7"):
+            with self.assertRaises(RuntimeError) as ctx_err:
+                svc.apply_update(spawn_installer=True, wait_verify_sec=1.2)
+        self.assertIn("Установщик не запустился (код 7)", str(ctx_err.exception))
+        self.assertEqual(shutdown_called, [], "при падении установщика текущее окно закрываться НЕ должно")
+        self.assertIn("код 7", svc.status()["last_error"])
 
 
 class UpdaterSettingsUITests(Case):
@@ -513,6 +650,16 @@ class UpdaterSettingsUITests(Case):
         page.wait_for_selector("#updModalClose", state="visible", timeout=3000)
         self.assertIn("раз в день, неделю и месяц", page.text_content("#modalBody"))
         page.click("#updModalClose")
+
+        # A4: проверяем заметную плашку dev-режима (когда нет version.txt и есть .git) и в шапке, и в настройках
+        (root / "version.txt").unlink(missing_ok=True)
+        (root / ".git").mkdir(parents=True, exist_ok=True)
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_selector("#updateBar.dev-mode-bar", state="visible", timeout=10000)
+        self.assertIn("рабочая копия разработчика", page.text_content("#updateBar"))
+        page.click('.nav button[data-view="settings"]')
+        page.wait_for_selector("#updStatusBox .upd-dev-banner", state="visible", timeout=5000)
+        self.assertIn("автообновление отключено", page.text_content("#updStatusBox"))
 
         self.assertEqual(js_errors, [], f"ошибки JS в браузере: {js_errors}")
 

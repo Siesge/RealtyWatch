@@ -2007,9 +2007,25 @@ async function applyStagedUpdate(btn = null) {
   }
 }
 
+let DEV_BANNER_DISMISSED = false;
+
 function renderUpdateBar(u) {
   const bar = $("#updateBar");
   if (!bar) return;
+  if (u && u.dev_mode && !DEV_BANNER_DISMISSED) {
+    bar.classList.add("dev-mode-bar");
+    bar.innerHTML = `<span>🛠 <b>Запущена рабочая копия разработчика — автообновление отключено.</b> Для обычной работы используйте установленную копию из релиза.</span>
+      <span class="fresh-db-acts">
+        <button type="button" class="link sm" id="btnDevBarHide">Скрыть ×</button>
+      </span>`;
+    bar.classList.remove("hidden");
+    $("#btnDevBarHide").onclick = () => {
+      DEV_BANNER_DISMISSED = true;
+      bar.classList.add("hidden");
+    };
+    return;
+  }
+  bar.classList.remove("dev-mode-bar");
   if (!u || !u.ready || u.dismissed || u.dev_mode || !u.available_version) {
     bar.classList.add("hidden");
     bar.innerHTML = "";
@@ -2035,6 +2051,9 @@ function paintUpdateSettingsBox(st) {
   if (!box || !st) return;
   const curLbl = st.current_version ? `v${esc(st.current_version)}` : (st.dev_mode ? "режим разработки (git)" : "не указана");
   const checkedLbl = st.last_checked ? `проверено ${dtt(st.last_checked)}` : "ещё не проверялось";
+  const devBanner = st.dev_mode
+    ? `<div class="upd-dev-banner">🛠 <b>Запущена рабочая копия разработчика — автообновление отключено.</b> Для обычной работы используйте установленную копию из релиза.</div>`
+    : "";
   let extra = "";
   if (st.checking || st.downloading) {
     extra = `<div class="upd-state-line">${st.downloading ? "Скачиваю и проверяю архив новой версии…" : "Проверяю релизы на GitHub…"}</div>`;
@@ -2054,7 +2073,7 @@ function paintUpdateSettingsBox(st) {
     const latestTxt = st.latest_github_version && st.dev_mode ? ` (последний релиз на GitHub: v${esc(st.latest_github_version)})` : "";
     extra = `<div class="upd-ok-line">Установлена актуальная версия${latestTxt}</div>`;
   }
-  box.innerHTML = `<div class="upd-cur-line">Текущая версия: <b>${curLbl}</b> · <span class="meta">${checkedLbl}</span></div>${extra}`;
+  box.innerHTML = `${devBanner}<div class="upd-cur-line">Текущая версия: <b>${curLbl}</b> · <span class="meta">${checkedLbl}</span></div>${extra}`;
   const goBtn = $("#btnApplyUpdate");
   if (goBtn) goBtn.onclick = () => applyStagedUpdate(goBtn);
   const notesBtn = $("#btnUpdNotes");
@@ -3680,13 +3699,19 @@ async function openLanModal(prefetched = null) {
   renderLanModalBody(st);
 }
 
-function renderDiscoveredRowsHtml(discovered) {
+let LAN_LAST_SEARCH_EMPTY = false;
+let LAN_LAST_DIAG = null;
+
+function renderDiscoveredRowsHtml(discovered, showDiagHint = false) {
   if (!discovered || !discovered.length) {
-    return `<div class="meta lan-empty">Новых устройств рядом пока не найдено — нажмите «Автопоиск устройств» (программа должна быть открыта на обоих компьютерах).</div>`;
+    return `<div class="meta lan-empty">
+      <div>Новых устройств рядом пока не найдено — нажмите «Автопоиск устройств». <b>LAN должна быть включена на обоих ПК.</b></div>
+      ${showDiagHint ? `<div class="lan-empty-diag">Устройства не видят друг друга? <button type="button" class="link sm lan-run-diag-inline">Проверить сеть (диагностика)</button></div>` : ""}
+    </div>`;
   }
   return `<div class="lan-disc-list">${discovered.map(d => `<div class="lan-disc-item" data-ip="${esc(d.ip)}" data-port="${d.port}" data-dname="${esc(d.device_name)}">
     <div class="lan-disc-row">
-      <div class="lan-disc-title"><span class="lan-pdot on"></span><b>${esc(d.device_name)}</b><span class="meta">найдено в сети</span></div>
+      <div class="lan-disc-title"><span class="lan-pdot on"></span><b>${esc(d.device_name)}</b><span class="meta">${esc(d.ip)}:${d.port} · найдено в сети</span></div>
       <button type="button" class="btn-pri sm lan-quick-pair">Подключить</button>
     </div>
     <div class="lan-quick-box hidden">
@@ -3698,6 +3723,39 @@ function renderDiscoveredRowsHtml(discovered) {
       </div>
     </div>
   </div>`).join("")}</div>`;
+}
+
+function renderLanDiagChecklistHtml(diag) {
+  if (!diag || !Array.isArray(diag.checks)) return "";
+  const iconFor = s => s === "ok" ? "✅" : (s === "warn" ? "⚠️" : "❌");
+  const rows = diag.checks.map(c => {
+    let actBtn = "";
+    if (c.action === "enable_lan") {
+      actBtn = `<button type="button" class="btn-pri sm" data-diag-act="enable_lan">Включить LAN</button>`;
+    } else if (c.action === "allow_firewall") {
+      actBtn = `<button type="button" class="btn-pri sm" data-diag-act="allow_firewall">Разрешить в брандмауэре</button>`;
+    } else if (c.action === "allow_firewall_unblock") {
+      actBtn = `<button type="button" class="btn-pri sm" data-diag-act="allow_firewall_unblock">Удалить блок и разрешить</button>`;
+    } else if (c.action === "open_net_settings") {
+      actBtn = `<button type="button" class="btn-sec sm" data-diag-act="open_net_settings">Открыть параметры сети</button>`;
+    }
+    return `<div class="lan-diag-row ${esc(c.status)}" data-check-id="${esc(c.id)}">
+      <span class="lan-diag-ico">${iconFor(c.status)}</span>
+      <div class="lan-diag-body">
+        <div class="lan-diag-title">${esc(c.title)}</div>
+        ${c.detail ? `<div class="lan-diag-detail">${esc(c.detail)}</div>` : ""}
+        ${c.hint ? `<div class="lan-diag-hint">${esc(c.hint)}</div>` : ""}
+      </div>
+      ${actBtn ? `<div class="lan-diag-acts">${actBtn}</div>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="lan-diag-panel" id="lanDiagPanel">
+    <div class="lan-diag-head">
+      <b>${diag.ok ? "✅ Проблем на этом компьютере не обнаружено" : "❌ Найдены причины, мешающие работе по сети"}</b>
+      <span class="meta">журнал: <code>logs/lan.log</code></span>
+    </div>
+    <div class="lan-diag-list">${rows}</div>
+  </div>`;
 }
 
 function bindDiscoveredEvents(boxEl, onPaired) {
@@ -3750,8 +3808,53 @@ function bindDiscoveredEvents(boxEl, onPaired) {
 function renderLanModalBody(st) {
   stopLanTimers();
   LAN_CACHE = st;
-  const ips = (st.local_ips && st.local_ips.length ? st.local_ips : ["127.0.0.1"]).map(ip => `${ip}:${st.port}`);
+  const ifaces = Array.isArray(st.local_interfaces) && st.local_interfaces.length
+    ? st.local_interfaces
+    : (st.local_ips || []).map(x => typeof x === "object" && x ? x : { ip: String(x), adapter: "LAN", prefix: 24, kind: "lan" });
+  const primaryIp = ifaces.length ? ifaces[0].ip : "127.0.0.1";
+  const ifacePillsHtml = ifaces.length
+    ? ifaces.map(it => `<span class="lan-iface-pill" title="${esc(it.description || it.adapter || '')}"><b>${esc(it.adapter || "Сеть")}</b> · <code class="lan-addr">${esc(it.ip)}:${st.port}</code></span>`).join(" ")
+    : `<code class="lan-addr">127.0.0.1:${st.port}</code>`;
   const pin = st.pin || {};
+  const vpnH = st.vpn_hijack || {};
+  const fw = st.firewall || {};
+  const defaultDiagPeer = (LAN_LAST_DIAG && LAN_LAST_DIAG.peer_ip) || (st.peers.find(p => !p.online)?.ip) || "";
+
+  const vpnAlertHtml = vpnH.hijacked
+    ? `<div class="lan-alert-card bad" id="lanVpnWarn">
+        <div class="lan-alert-body">
+          <b>⛔ VPN «${esc(vpnH.vpn_adapter)}» перехватывает локальную сеть — второй компьютер недоступен</b>
+          <p>Включите в VPN раздельное туннелирование: исключите <code>192.168.0.0/16</code> (и <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>) или временно отключите VPN.</p>
+        </div>
+      </div>`
+    : "";
+
+  const fwAlertHtml = st.enabled && fw.checked && !fw.ok
+    ? `<div class="lan-alert-card warn" id="lanFwCard">
+        <div class="lan-alert-body">
+          <b>🛡 Брандмауэр блокирует подключения</b>
+          <p>${fw.has_block_rules
+            ? `Найдены блокирующие входящие правила брандмауэра для <code>pythonw.exe</code> (${esc((fw.block_rules || []).map(b => b.display_name || b.name).join(", "))}) — они перекрывают доступ.`
+            : `Для <code>pythonw.exe</code> не настроены разрешающие входящие правила на порты TCP ${fw.tcp_port || st.port} и UDP ${fw.udp_port || (st.port + 1)} (профили «Частная» и «Публичная»).`}</p>
+          ${fw.has_block_rules ? `<label class="lan-fw-consent"><input type="checkbox" id="chkRemoveFwBlock"><span>Удалить блокирующие правила брандмауэра для этой программы</span></label>` : ""}
+        </div>
+        <div class="lan-alert-acts">
+          <button type="button" class="btn-pri sm" id="btnLanAllowFw">Разрешить (потребуются права администратора)</button>
+        </div>
+      </div>`
+    : "";
+
+  const pubNetHtml = fw.has_public_profile
+    ? `<div class="lan-alert-card info" id="lanPubNetCard">
+        <div class="lan-alert-body">
+          <b>⚠ Сетевой профиль «Общедоступная» (${esc((fw.public_profiles || []).map(p => `«${p.name}»`).join(", "))})</b>
+          <p>В общедоступной сети Windows строже блокирует входящие подключения между домашними компьютерами. Рекомендуется переключить тип профиля сети на <b>«Частная»</b>.</p>
+        </div>
+        <div class="lan-alert-acts">
+          <button type="button" class="btn-sec sm" id="btnLanOpenNetSettings">Открыть параметры сети</button>
+        </div>
+      </div>`
+    : "";
   const peersHtml = st.peers.length
     ? st.peers.map(p => {
         const lc = p.live_cfg || {};
@@ -3799,12 +3902,28 @@ function renderLanModalBody(st) {
       }).join("")
     : `<div class="meta lan-empty">Сопряжённых устройств пока нет — сгенерируйте PIN на одном компьютере и введите его на другом.</div>`;
 
-  const discHtml = renderDiscoveredRowsHtml(st.discovered);
+  const discHtml = renderDiscoveredRowsHtml(st.discovered, LAN_LAST_SEARCH_EMPTY || !(st.discovered && st.discovered.length));
 
   $("#modalBody").innerHTML = `<div class="lan-win" id="lanModalWin">
     <div class="lan-head">
-      <div><h3>Локальная сеть и устройства</h3><div class="meta">ID: <code>${esc(st.device_id)}</code></div></div>
-      <button type="button" class="btn-sec sm" id="btnLanRefresh">${ICON.refresh}Обновить</button>
+      <div><h3>Локальная сеть и устройства</h3><div class="meta">ID: <code>${esc(st.device_id)}</code> · LAN должна быть включена на обоих ПК</div></div>
+      <div class="lan-head-acts">
+        <button type="button" class="btn-sec sm" id="btnLanDiagnose" title="Проверить адаптеры, брандмауэр, VPN, роутер и связь со вторым ПК">Проверить сеть</button>
+        <button type="button" class="btn-sec sm" id="btnLanRefresh">${ICON.refresh}Обновить</button>
+      </div>
+    </div>
+
+    ${vpnAlertHtml}
+    ${fwAlertHtml}
+    ${pubNetHtml}
+
+    <div class="lan-diag-wrap${LAN_LAST_DIAG ? "" : " hidden"}" id="lanDiagWrap">
+      <div class="lan-diag-bar">
+        <input type="text" id="lanDiagPeerIp" value="${esc(defaultDiagPeer)}" placeholder="IP второго ПК для проверки TCP (необязательно, напр. 192.168.2.148)">
+        <button type="button" class="btn-pri sm" id="btnLanRunDiagNow">Запустить проверку</button>
+        <button type="button" class="link sm" id="btnLanHideDiag">Скрыть</button>
+      </div>
+      <div id="lanDiagBox">${LAN_LAST_DIAG ? renderLanDiagChecklistHtml(LAN_LAST_DIAG) : ""}</div>
     </div>
 
     <div class="lan-sec">
@@ -3817,8 +3936,8 @@ function renderLanModalBody(st) {
         <button type="button" class="btn-sec sm" id="btnLanSaveName">Сохранить имя</button>
       </div>
       <div class="lan-addr-row">
-        <span>Адреса для подключения: ${ips.map(a => `<code class="lan-addr">${esc(a)}</code>`).join(" ")}</span>
-        <button type="button" class="chip" id="btnLanCopyAddr">Копировать ${esc(ips[0])}</button>
+        <span>Физический адрес: ${ifacePillsHtml}</span>
+        <button type="button" class="chip" id="btnLanCopyAddr" title="Скопировать физический IP-адрес этого компьютера (без VPN и виртуальных сетей)">Копировать адрес (${esc(primaryIp)})</button>
         <button type="button" class="btn-pri sm" id="btnLanGenPin" ${st.enabled ? "" : "disabled"}>Показать PIN для подключения</button>
       </div>
       <div class="lan-pin-box${pin.active ? "" : " hidden"}" id="lanPinBox">
@@ -3880,7 +3999,83 @@ function renderLanModalBody(st) {
     syncLanIndicators(fresh);
     if (isLanModalOpen()) renderLanModalBody(fresh);
   };
+
+  const runAllowFirewallFlow = async (forceRemoveBlock = false, triggerBtn = null) => {
+    const remove_blocking = forceRemoveBlock || !!$("#chkRemoveFwBlock")?.checked;
+    if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.textContent = "Ожидаю подтверждения UAC…"; }
+    try {
+      await post("/api/lan/firewall/allow", { remove_blocking });
+      toast("ok", "Брандмауэр настроен", "Входящие правила для RealtyWatch успешно добавлены");
+      if (LAN_LAST_DIAG) {
+        LAN_LAST_DIAG = await post("/api/lan/diagnose", { peer_ip: ($("#lanDiagPeerIp")?.value || "").trim() }).catch(() => null);
+      }
+      await refreshModal();
+    } catch (e) {
+      toast("warn", "Не удалось настроить брандмауэр", e.message || String(e));
+      if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.textContent = "Разрешить (потребуются права администратора)"; }
+    }
+  };
+
+  const openWinNetSettings = async () => {
+    try {
+      await post("/api/lan/open-network-settings", {});
+    } catch (e) {
+      toast("warn", "Не удалось открыть параметры", e.message || String(e));
+    }
+  };
+
+  const runNetworkDiagnoseFlow = async () => {
+    const wrap = $("#lanDiagWrap"), box = $("#lanDiagBox"), runBtn = $("#btnLanRunDiagNow"), topBtn = $("#btnLanDiagnose");
+    if (wrap) wrap.classList.remove("hidden");
+    const peerIp = ($("#lanDiagPeerIp")?.value || $("#lanPairIp")?.value || "").trim();
+    if ($("#lanDiagPeerIp") && peerIp && !$("#lanDiagPeerIp").value) $("#lanDiagPeerIp").value = peerIp;
+    if (runBtn) { runBtn.disabled = true; runBtn.textContent = "Проверяю…"; }
+    if (topBtn) topBtn.disabled = true;
+    if (box) box.innerHTML = `<div class="meta" style="padding:8px 2px">Проверяю адаптеры, профиль сети, брандмауэр, маршруты VPN, шлюз и отправляю UDP-зонд…</div>`;
+    try {
+      const res = await post("/api/lan/diagnose", { peer_ip: peerIp });
+      LAN_LAST_DIAG = res;
+      const fresh = await api("/api/lan/status");
+      syncLanIndicators(fresh);
+      if (isLanModalOpen()) renderLanModalBody(fresh);
+    } catch (e) {
+      toast("warn", "Ошибка диагностики сети", e.message || String(e));
+      if (box) box.innerHTML = `<div class="upd-err-line">⚠ ${esc(e.message || String(e))}</div>`;
+    } finally {
+      if (runBtn) { runBtn.disabled = false; runBtn.textContent = "Запустить проверку"; }
+      if (topBtn) topBtn.disabled = false;
+    }
+  };
+
+  const bindInlineDiagButtons = (rootEl) => {
+    if (!rootEl) return;
+    rootEl.querySelectorAll(".lan-run-diag-inline").forEach(b => b.onclick = () => runNetworkDiagnoseFlow());
+  };
+
   bindDiscoveredEvents($("#lanDiscBox"), refreshModal);
+  bindInlineDiagButtons($("#lanDiscBox"));
+
+  if ($("#btnLanAllowFw")) $("#btnLanAllowFw").onclick = () => runAllowFirewallFlow(false, $("#btnLanAllowFw"));
+  if ($("#btnLanOpenNetSettings")) $("#btnLanOpenNetSettings").onclick = openWinNetSettings;
+  if ($("#btnLanDiagnose")) $("#btnLanDiagnose").onclick = runNetworkDiagnoseFlow;
+  if ($("#btnLanRunDiagNow")) $("#btnLanRunDiagNow").onclick = runNetworkDiagnoseFlow;
+  if ($("#btnLanHideDiag")) $("#btnLanHideDiag").onclick = () => {
+    LAN_LAST_DIAG = null;
+    $("#lanDiagWrap")?.classList.add("hidden");
+  };
+  $$("#lanDiagBox [data-diag-act]").forEach(b => b.onclick = async () => {
+    const act = b.dataset.diagAct;
+    if (act === "enable_lan") {
+      await post("/api/lan/config", { enabled: true });
+      await runNetworkDiagnoseFlow();
+    } else if (act === "allow_firewall") {
+      await runAllowFirewallFlow(false, b);
+    } else if (act === "allow_firewall_unblock") {
+      await runAllowFirewallFlow(true, b);
+    } else if (act === "open_net_settings") {
+      await openWinNetSettings();
+    }
+  });
 
   if (st.enabled) {
     lanDiscTimer = setInterval(async () => {
@@ -3893,8 +4088,9 @@ function renderLanModalBody(st) {
         const quickOpen = !!curBox.querySelector(".lan-quick-box:not(.hidden)");
         const typingHere = curBox.contains(document.activeElement);
         if (!quickOpen && !typingHere) {
-          curBox.innerHTML = renderDiscoveredRowsHtml(cur.discovered);
+          curBox.innerHTML = renderDiscoveredRowsHtml(cur.discovered, LAN_LAST_SEARCH_EMPTY || !(cur.discovered && cur.discovered.length));
           bindDiscoveredEvents(curBox, refreshModal);
+          bindInlineDiagButtons(curBox);
         }
       } catch (e) { /* игнорируем кратковременный сбой опроса */ }
     }, 3500);
@@ -3908,12 +4104,16 @@ function renderLanModalBody(st) {
       try {
         const fresh = await post("/api/lan/discover", { auto_enable: true, wait_sec: 1.5 });
         syncLanIndicators(fresh);
-        if (isLanModalOpen()) renderLanModalBody(fresh);
         const foundN = (fresh.discovered || []).length;
         const onN = fresh.online_peers || 0;
+        LAN_LAST_SEARCH_EMPTY = (foundN === 0 && onN === 0);
+        if (isLanModalOpen()) renderLanModalBody(fresh);
         if (foundN) toast("ok", "Найдены устройства", `Доступно для подключения: ${foundN}`);
         else if (onN) toast("ok", "Поиск завершён", `Сопряжённые устройства уже в сети (${onN})`);
-        else toast("ok", "Поиск завершён", "Новых несопряжённых устройств рядом не обнаружено");
+        else toast("warn", "Устройства не найдены", "Убедитесь, что LAN включена на ОБОИХ ПК, или нажмите «Проверить сеть»", {
+          label: "Проверить сеть",
+          fn: () => runNetworkDiagnoseFlow(),
+        });
       } catch (e) {
         toast("warn", "Не удалось выполнить поиск", e.message || String(e));
         discBtn.disabled = false;
@@ -3947,9 +4147,9 @@ function renderLanModalBody(st) {
   };
   $("#btnLanCopyAddr").onclick = async () => {
     try {
-      await navigator.clipboard.writeText(ips[0]);
-      toast("ok", "Адрес скопирован", ips[0]);
-    } catch { toast("ok", "Адрес этого устройства", ips[0]); }
+      await navigator.clipboard.writeText(primaryIp);
+      toast("ok", "Физический адрес скопирован", primaryIp);
+    } catch { toast("ok", "Физический адрес этого ПК", primaryIp); }
   };
   $("#btnLanGenPin").onclick = async () => {
     try {

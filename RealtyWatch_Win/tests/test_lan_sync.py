@@ -133,6 +133,8 @@ class _PeerProc:
     def start(self):
         env = os.environ.copy()
         env["RW_PEER_DIR"] = str(self.dir)
+        env["RW_LOGS_DIR"] = str(self.dir / "logs")
+        env["RW_NO_UPDATER"] = "1"
         env["RW_PEER_UI_PORT"] = str(self.ui_port)
         env["RW_PEER_LAN_PORT"] = str(self.lan_port)
         env["RW_PEER_NAME"] = self.name
@@ -181,8 +183,10 @@ class _PeerProc:
 
 
 _CHILD_RUNNER = r'''
+import logging
 import os
 from pathlib import Path
+logging.getLogger().addHandler(logging.NullHandler())
 import uvicorn
 from app import db, exchange, images, lan_sync, runlog, server, settings, transfer
 
@@ -194,7 +198,7 @@ images.IMAGES = transfer.IMAGES = d / "images"
 transfer.BACKUPS = d / "backups"
 transfer.DB_DIR = d
 exchange.IMPORT_IMAGES = d / "import_images"
-runlog.LOGS_DIR = d / "logs"
+runlog.redirect_logs_dir(d / "logs")
 
 cfg = settings.load()
 cfg["lan"] = {

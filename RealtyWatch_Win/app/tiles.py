@@ -20,7 +20,7 @@ MIN_TILE_BYTES = 100
 MAX_TILE_BYTES = 2 * 1024 * 1024
 MAX_CONCURRENT_DOWNLOADS = 6
 
-USER_AGENT = "RealtyWatch/1.7 (+https://github.com/Siesge/RealtyWatch)"
+USER_AGENT = "RealtyWatch/1.8 (+https://github.com/Siesge/RealtyWatch)"
 ACCEPT_HEADER = "image/png,*/*"
 _CARTO_SUBS = ("a", "b", "c")
 

@@ -15,14 +15,15 @@ from pathlib import Path
 
 # Журнал тестов не пишется в logs/app.log: обработчик ставится до импорта runner (setup_logging его не трогает)
 logging.getLogger().addHandler(logging.NullHandler())
+TMP_ROOT = Path(tempfile.mkdtemp(prefix="rw-tests-"))
+os.environ.setdefault("RW_LOGS_DIR", str(TMP_ROOT / "logs"))
+os.environ.setdefault("RW_NO_UPDATER", "1")
 
 from app import alerts, db, human, images, net, paths, runlog, settings, tiles, transfer, updater  # noqa: E402
 from app import runner  # noqa: E402
 
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(paths.BROWSERS))
-os.environ.setdefault("RW_NO_UPDATER", "1")
 
-TMP_ROOT = Path(tempfile.mkdtemp(prefix="rw-tests-"))
 _REQUEST = net.Http.request
 _TILE_FETCH = tiles._fetch_url
 _UPDATER_FETCH = updater._fetch_bytes
@@ -106,7 +107,8 @@ def isolate(test):
     db.reset()
     settings.SETTINGS_FILE = d / "settings.json"
     net.PROFILES = d / "profiles"
-    runlog.RUNS_DIR, runlog.SNAP_DIR = d / "runs", d / "snapshots"
+    runlog.redirect_logs_dir(d)
+    runner.manager.journal.clear()
     images.IMAGES = transfer.IMAGES = d / "images"
     tiles.TILES = d / "tiles"
     transfer.BACKUPS, transfer.DB_DIR = d / "backups", d
@@ -114,11 +116,12 @@ def isolate(test):
     updater.DATA_DIR = d / "data"
     updater.APP_ROOT = d / "app_root"
     (updater.APP_ROOT / "app").mkdir(parents=True, exist_ok=True)
-    for p in (db.DB_FILE, settings.SETTINGS_FILE, images.IMAGES, tiles.TILES, transfer.BACKUPS, alerts.FILE, runlog.RUNS_DIR, updater.DATA_DIR, updater.APP_ROOT):
+    for p in (db.DB_FILE, settings.SETTINGS_FILE, images.IMAGES, tiles.TILES, transfer.BACKUPS, alerts.FILE, runlog.LOGS_DIR, runlog.RUNS_DIR, updater.DATA_DIR, updater.APP_ROOT):
         assert TMP_ROOT in Path(p).parents, f"тест работает вне временной папки: {p}"
     images.repair = lambda *a, **k: None
     runner.pause = lambda *a, **k: None
     test.addCleanup(shutil.rmtree, d, ignore_errors=True)
+    test.addCleanup(runlog.close_lan_logging)
     return d
 
 
