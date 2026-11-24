@@ -45,6 +45,11 @@ class UpdaterCoreAndCleanupTests(Case):
     def test_version_parsing_and_portable_asset_selection(self):
         self.assertEqual(updater.parse_version("v1.5"), (1, 5))
         self.assertEqual(updater.parse_version("RealtyWatch 1.5.0, сборка 2026-11-17, коммит abc"), (1, 5))
+        self.assertEqual(updater.parse_version("1.8"), (1, 8))
+        self.assertEqual(updater.parse_version("1.8.1"), (1, 8, 1))
+        self.assertGreater(updater.parse_version("1.8.1"), updater.parse_version("1.8"))
+        self.assertTrue(updater.is_newer_version("v1.8.1", "1.8"))
+        self.assertTrue(updater.is_newer_version("1.8.1", "RealtyWatch 1.8, сборка 2026-11-24, коммит ad78e24"))
         self.assertTrue(updater.is_newer_version("v1.6", "1.5"))
         self.assertTrue(updater.is_newer_version("1.10", "1.9"))
         self.assertFalse(updater.is_newer_version("1.5.0", "1.5"))

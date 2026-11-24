@@ -40,7 +40,8 @@ log = logging.getLogger("realtywatch")
 
 GITHUB_REPO = "Siesge/RealtyWatch"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-USER_AGENT = "RealtyWatch-Updater/1.8 (+https://github.com/Siesge/RealtyWatch)"
+CURRENT_APP_VERSION = "1.8.1"
+USER_AGENT = f"RealtyWatch-Updater/{CURRENT_APP_VERSION} (+https://github.com/Siesge/RealtyWatch)"
 
 INTERVAL_SECONDS = {
     "day": 86400,
@@ -135,6 +136,11 @@ def read_local_version(root: Path | None = None) -> str:
     except (OSError, IndexError):
         return ""
     return clean_version_label(first)
+
+
+def current_app_version(root: Path | None = None) -> str:
+    """Возвращает версию программы из version.txt либо встроенную константу CURRENT_APP_VERSION (в режиме разработки)."""
+    return read_local_version(root) or CURRENT_APP_VERSION
 
 
 def is_dev_worktree(root: Path | None = None) -> bool:

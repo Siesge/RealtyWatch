@@ -311,6 +311,310 @@ class LanDiagnosticsAndRealNetUnitTests(Case):
         else:
             self.assertFalse(real_app_log.exists(), "тесты не должны создавать боевой logs/app.log!")
 
+    def test_v181_partner_17_delayed_ephemeral_reply_and_asymmetric_broadcast_diag(self):
+        """1.8.1 (п. 1, 4, 6): зонд уходит строго с порта lan.port+1, ждёт 2–3 с ответа от эмулятора 1.7
+        со случайного эфемерного порта без собственных broadcast, а диагностика отмечает старый протокол и односторонний broadcast."""
+        my_lan_port = _free_port()
+        while True:
+            peer_lan_port = _free_port()
+            if abs(peer_lan_port - my_lan_port) > 4:
+                break
+        peer_disc_port = peer_lan_port + 1
+
+        cfg = settings.load()
+        cfg["lan"] = {"enabled": True, "port": my_lan_port, "auto_discovery": True, "device_id": "", "device_name": "BB-Portable"}
+        settings.save(cfg)
+        lan_sync.service._bind_host = "127.0.0.1"
+        self.assertTrue(lan_sync.start_if_enabled())
+
+        # Эмулятор партнёра Olga (1.7): НЕ шлёт периодических RW_DISCOVER_V1 сам,
+        # а на входящий RW_PROBE_V1 отвечает с задержкой 2.2 с и с НОВОГО случайного порта (без поля app_version).
+        stop_olga = threading.Event()
+        olga_rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        olga_rx.bind(("127.0.0.1", peer_disc_port))
+        olga_rx.settimeout(0.2)
+        self.addCleanup(olga_rx.close)
+        self.addCleanup(stop_olga.set)
+
+        seen_probe_src_ports: list[int] = []
+        seen_probe_versions: list[str] = []
+
+        def _olga_loop():
+            while not stop_olga.is_set():
+                try:
+                    raw, sender = olga_rx.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    pkt = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    continue
+                if pkt.get("magic") != "RW_PROBE_V1":
+                    continue
+                seen_probe_src_ports.append(sender[1])
+                seen_probe_versions.append(str(pkt.get("app_version") or ""))
+                reply_target_port = int(pkt.get("disc_port") or sender[1])
+
+                def _delayed_reply(dst_port: int):
+                    if stop_olga.wait(2.2):
+                        return
+                    ephem = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                    try:
+                        ephem.bind(("127.0.0.1", 0))
+                        # Пакет 1.7 без app_version
+                        rep = json.dumps({
+                            "magic": "RW_DISCOVER_V1",
+                            "device_id": "olga-v17-id",
+                            "device_name": "Olga",
+                            "port": peer_lan_port,
+                            "platform": "windows",
+                        }).encode("utf-8")
+                        ephem.sendto(rep, ("127.0.0.1", dst_port))
+                    finally:
+                        ephem.close()
+
+                threading.Thread(target=_delayed_reply, args=(reply_target_port,), daemon=True).start()
+
+        t_olga = threading.Thread(target=_olga_loop, daemon=True)
+        t_olga.start()
+
+        # Вызываем discover_now с дефолтным ожиданием (4.5 с) — должен дождаться ответа через 2.2 с!
+        res = lan_sync.discover_now(target_ports=[peer_disc_port])
+        disc_by_id = {d["device_id"]: d for d in res["discovered"]}
+        self.assertIn("olga-v17-id", disc_by_id, "партнёр 1.7 с задержкой 2.2 с и случайным портом должен находиться!")
+        olga_d = disc_by_id["olga-v17-id"]
+        self.assertEqual(olga_d["device_name"], "Olga")
+        self.assertTrue(olga_d["legacy_protocol"])
+        self.assertFalse(olga_d["seen_broadcast"])
+        self.assertTrue(olga_d["via_probe_only"])
+        # Проверяем п. 1: зонд ушёл строго с основного порта my_lan_port + 1 и содержит app_version!
+        self.assertTrue(seen_probe_src_ports)
+        self.assertTrue(all(p == my_lan_port + 1 for p in seen_probe_src_ports), f"зонды должны идти с порта {my_lan_port + 1}, было: {seen_probe_src_ports}")
+        self.assertIn("1.8.1", seen_probe_versions)
+
+        # Проверяем п. 4: diagnose_network видит ответ на my_lan_port+1 и выдаёт оба предупреждения (старый протокол + только по запросу)
+        lan_sync.service._udp_started_mono = time.monotonic() - 10.0
+        diag = lan_sync.diagnose_network(peer_ip=f"127.0.0.1:{peer_lan_port}", probe_wait_sec=3.0)
+        by_id = {c["id"]: c for c in diag["checks"]}
+        self.assertEqual(by_id["udp_probe"]["status"], "ok")
+        self.assertIn("Olga", by_id["udp_probe"]["detail"])
+        self.assertIn("peer_legacy_protocol", by_id)
+        self.assertEqual(by_id["peer_legacy_protocol"]["status"], "warn")
+        self.assertIn("отвечает по старому протоколу", by_id["peer_legacy_protocol"]["title"])
+        self.assertIn("1.7", by_id["peer_legacy_protocol"]["title"])
+        self.assertIn("peer_asymmetric_bcast", by_id)
+        self.assertEqual(by_id["peer_asymmetric_bcast"]["status"], "warn")
+        self.assertIn("найдено только по запросу", by_id["peer_asymmetric_bcast"]["title"])
+
+    def test_v181_incoming_probe_sender_added_to_discovered_and_unicast_subnet_sweep(self):
+        """1.8.1 (п. 2, 3, 4): входящий RW_PROBE_V1 от несопряжённого ПК добавляет его в discovered (с разбором app_version),
+        служебный diag-* игнорируется, а unicast-обход подсети покрывает до /22 и ограничивает крупные сети своей /24."""
+        # 1. Проверка расчёта адресов подсети (compute_subnet_unicast_hosts)
+        h24 = lan_sync.compute_subnet_unicast_hosts("192.168.2.119", 24)
+        self.assertEqual(len(h24), 253)
+        self.assertNotIn("192.168.2.0", h24)
+        self.assertNotIn("192.168.2.255", h24)
+        self.assertNotIn("192.168.2.119", h24)
+        self.assertIn("192.168.2.148", h24)
+
+        h22 = lan_sync.compute_subnet_unicast_hosts("192.168.0.10", 22)
+        self.assertEqual(len(h22), 1021)
+        self.assertIn("192.168.3.254", h22)
+        self.assertNotIn("192.168.0.10", h22)
+
+        # Для /20 (крупнее /22) обходится только собственная /24!
+        h20 = lan_sync.compute_subnet_unicast_hosts("172.20.5.14", 20)
+        self.assertEqual(len(h20), 253)
+        self.assertTrue(all(ip.startswith("172.20.5.") for ip in h20))
+
+        self.assertEqual(lan_sync.compute_subnet_unicast_hosts("10.8.1.5", 32), [])
+
+        # 2. Проверка п. 3 и разбора app_version при входящем RW_PROBE_V1
+        my_port = _free_port()
+        cfg = settings.load()
+        cfg["lan"] = {"enabled": True, "port": my_port, "auto_discovery": False, "device_id": "", "device_name": "Main-PC"}
+        settings.save(cfg)
+
+        rx_dummy = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx_dummy.bind(("127.0.0.1", 0))
+        sender_dummy = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sender_dummy.bind(("127.0.0.1", 0))
+        self.addCleanup(rx_dummy.close)
+        self.addCleanup(sender_dummy.close)
+
+        # Несопряжённое устройство само прислало RW_PROBE_V1 -> должно появиться в discovered!
+        lan_sync.service._handle_discovery_packet(
+            json.dumps({
+                "magic": "RW_PROBE_V1",
+                "device_id": "probe-sender-olga",
+                "device_name": "Ноутбук Ольги",
+                "port": 18766,
+                "disc_port": sender_dummy.getsockname()[1],
+                "platform": "windows",
+                "app_version": "1.8.1",
+            }).encode("utf-8"),
+            "192.168.2.148",
+            51154,
+            my_lan_port=my_port,
+            reply_sock=rx_dummy,
+        )
+        # Диагностический зонд diag-* в discovered попадать НЕ должен
+        lan_sync.service._handle_discovery_packet(
+            json.dumps({
+                "magic": "RW_PROBE_V1",
+                "device_id": "diag-deadbeef",
+                "device_name": "diag@Other",
+                "port": 18766,
+                "disc_port": sender_dummy.getsockname()[1],
+                "platform": "diag",
+            }).encode("utf-8"),
+            "192.168.2.149",
+            51155,
+            my_lan_port=my_port,
+            reply_sock=rx_dummy,
+        )
+
+        disc = {d["device_id"]: d for d in lan_sync.service.list_discovered()}
+        self.assertIn("probe-sender-olga", disc)
+        self.assertNotIn("diag-deadbeef", disc)
+        self.assertEqual(disc["probe-sender-olga"]["ip"], "192.168.2.148")
+        self.assertEqual(disc["probe-sender-olga"]["port"], 18766)
+        self.assertEqual(disc["probe-sender-olga"]["app_version"], "1.8.1")
+        self.assertFalse(disc["probe-sender-olga"]["legacy_protocol"])
+
+        # 3. Проверка unicast-обхода с моком сокета (и автоматического фолбэка в discover_now)
+        sent_packets: list[tuple[dict, tuple[str, int]]] = []
+
+        class _MockSock:
+            def getsockname(self):
+                return ("0.0.0.0", my_port + 1)
+
+            def sendto(self, data: bytes, addr: tuple[str, int]):
+                sent_packets.append((json.loads(data.decode("utf-8")), addr))
+                return len(data)
+
+        cnt = lan_sync.service._unicast_subnet_sweep(
+            my_port,
+            tx_sock=_MockSock(),
+            interfaces=[{"ip": "192.168.2.119", "prefix": 24, "adapter": "Wi-Fi"}],
+            batch_pause_sec=0.0,
+        )
+        # По 253 хостам на порты {my_port+1, 8767}
+        expected_ports = {my_port + 1, 8767}
+        self.assertEqual(cnt, 253 * len(expected_ports))
+        target_ips = {addr[0] for _p, addr in sent_packets}
+        self.assertEqual(len(target_ips), 253)
+        self.assertIn("192.168.2.148", target_ips)
+        self.assertNotIn("192.168.2.119", target_ips)
+        self.assertTrue(all(pkt["disc_port"] == my_port + 1 and pkt["app_version"] == "1.8.1" for pkt, _a in sent_packets))
+
+    @unittest.skipUnless(
+        (paths.ROOT.parent / "dist" / "RealtyWatch-1.7-windows-portable.zip").is_file(),
+        "архив dist/RealtyWatch-1.7-windows-portable.zip не найден (запуск вне репозитория)",
+    )
+    def test_v181_real_17_archive_subprocess_discovery_and_pin_pairing(self):
+        """Интеграционный тест 1.8.1 с настоящим кодом 1.7 из dist/RealtyWatch-1.7-windows-portable.zip на изолированных портах."""
+        import subprocess
+        import sys
+        import zipfile
+
+        zip17 = paths.ROOT.parent / "dist" / "RealtyWatch-1.7-windows-portable.zip"
+        peer17_dir = self.dir / "peer17"
+        with zipfile.ZipFile(zip17, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir() or not info.filename.startswith("RealtyWatch/"):
+                    continue
+                rel = info.filename[len("RealtyWatch/"):]
+                if not rel:
+                    continue
+                dst = peer17_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(zf.read(info.filename))
+
+        p17 = _free_port()
+        while True:
+            p18 = _free_port()
+            if abs(p18 - p17) > 6:
+                break
+
+        pin_file = self.dir / "peer17_pin.txt"
+        worker_py = self.dir / "run_peer17.py"
+        worker_py.write_text(
+            "\n".join([
+                "import logging, sys, time",
+                "from pathlib import Path",
+                "logging.getLogger().addHandler(logging.NullHandler())",
+                f"p17_root = Path({str(peer17_dir)!r})",
+                "(p17_root / 'database').mkdir(parents=True, exist_ok=True)",
+                "(p17_root / 'data').mkdir(parents=True, exist_ok=True)",
+                "(p17_root / 'logs').mkdir(parents=True, exist_ok=True)",
+                f"sys.path = [str(p17_root)] + [p for p in sys.path if 'RealtyWatch_Win' not in p or 'runtime' in p]",
+                "from app import db, lan_sync, runlog, settings",
+                "assert str(Path(lan_sync.__file__).resolve()).startswith(str(p17_root.resolve())), lan_sync.__file__",
+                "runlog.LOG_FILE = p17_root / 'logs' / 'app.log'",
+                "db.connect().close()",
+                "cfg = settings.load()",
+                f"cfg['lan'] = {{'enabled': True, 'port': {p17}, 'auto_discovery': True, 'device_id': '', 'device_name': 'Olga-Real-1.7'}}",
+                "settings.save(cfg)",
+                "lan_sync.service._bind_host = '127.0.0.1'",
+                "assert lan_sync.start_if_enabled()",
+                "pin_info = lan_sync.create_pin()",
+                f"Path({str(pin_file)!r}).write_text(pin_info['pin'], encoding='utf-8')",
+                "while True: time.sleep(0.5)",
+            ]),
+            encoding="utf-8",
+        )
+
+        proc17 = subprocess.Popen(
+            [sys.executable, str(worker_py)],
+            cwd=str(peer17_dir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        def _stop_p17():
+            if proc17.poll() is None:
+                proc17.terminate()
+                try:
+                    proc17.wait(timeout=4.0)
+                except Exception:
+                    proc17.kill()
+            for s in (proc17.stdout, proc17.stderr):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+        self.addCleanup(_stop_p17)
+        deadline = time.monotonic() + 10.0
+        while not pin_file.is_file() and time.monotonic() < deadline:
+            if proc17.poll() is not None:
+                out, err = proc17.communicate()
+                self.fail(f"1.7 завершился досрочно: {out.decode(errors='replace')} / {err.decode(errors='replace')}")
+            time.sleep(0.1)
+        self.assertTrue(pin_file.is_file(), "1.7 не успел стартовать за 10 с")
+        pin_code = pin_file.read_text(encoding="utf-8").strip()
+
+        cfg = settings.load()
+        cfg["lan"] = {"enabled": True, "port": p18, "auto_discovery": True, "device_id": "", "device_name": "BB-1.8.1"}
+        settings.save(cfg)
+        lan_sync.service._bind_host = "127.0.0.1"
+        self.assertTrue(lan_sync.start_if_enabled())
+
+        disc_res = lan_sync.discover_now(target_ports=[p17 + 1])
+        found17 = [d for d in disc_res["discovered"] if d["device_name"] == "Olga-Real-1.7"]
+        self.assertEqual(len(found17), 1, f"реальный 1.7 должен находиться через зонд с порта {p18 + 1}: {disc_res['discovered']}")
+        self.assertTrue(found17[0]["legacy_protocol"])
+
+        pair_res = lan_sync.pair_with("127.0.0.1", p17, pin_code)
+        self.assertTrue(pair_res["ok"])
+        self.assertEqual(pair_res["name"], "Olga-Real-1.7")
+
 
 class LanDiagnosticsBrowserUITests(Case):
     @unittest.skipUnless(has_browser(), "Chromium не установлен (setup.bat)")
@@ -422,6 +726,34 @@ class LanDiagnosticsBrowserUITests(Case):
         page.click("#btnLanDiagnose")
         page.wait_for_selector("#lanDiagPanel .lan-diag-row", state="visible", timeout=8000)
         self.assertGreaterEqual(page.locator("#lanDiagPanel .lan-diag-row").count(), 5)
+
+        # 1.8.1 (п. 5): открываем второй локальный TCP-порт (имитируя доступный по TCP второй ПК при пустом discovered)
+        peer_tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        peer_tcp_sock.bind(("127.0.0.1", 0))
+        peer_tcp_sock.listen(2)
+        peer_tcp_port = peer_tcp_sock.getsockname()[1]
+        self.addCleanup(peer_tcp_sock.close)
+
+        def _accept_once():
+            try:
+                conn, _ = peer_tcp_sock.accept()
+                conn.recv(512)
+                conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=_accept_once, daemon=True).start()
+
+        page.fill("#lanDiagPeerIp", f"127.0.0.1:{peer_tcp_port}")
+        page.click("#btnLanRunDiagNow")
+        page.wait_for_selector('[data-diag-act="pair_by_ip"]', state="visible", timeout=8000)
+        # И в пустом блоке #lanDiscBox тоже появилась кнопка «Подключиться по IP и PIN»!
+        page.wait_for_selector("#lanDiscBox .lan-open-manual-pair", state="visible", timeout=5000)
+        page.click("#lanDiscBox .lan-open-manual-pair")
+        self.assertEqual(page.input_value("#lanPairIp"), "127.0.0.1")
+        self.assertEqual(page.input_value("#lanPairPort"), str(peer_tcp_port))
+        self.assertTrue(page.evaluate("() => document.querySelector('details.lan-manual-pair')?.open === true"))
 
         self.assertEqual(js_errors, [], f"ошибки JS в браузере: {js_errors}")
 

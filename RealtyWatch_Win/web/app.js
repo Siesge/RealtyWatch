@@ -3702,16 +3702,38 @@ async function openLanModal(prefetched = null) {
 let LAN_LAST_SEARCH_EMPTY = false;
 let LAN_LAST_DIAG = null;
 
-function renderDiscoveredRowsHtml(discovered, showDiagHint = false) {
+function getDiagTcpReachablePeer(peersList = []) {
+  if (!LAN_LAST_DIAG) return null;
+  const pairedIps = new Set((peersList || []).map(p => p.ip));
+  if (LAN_LAST_DIAG.tcp_reachable_peer && LAN_LAST_DIAG.tcp_reachable_peer.ip) {
+    const tp = LAN_LAST_DIAG.tcp_reachable_peer;
+    if (!pairedIps.has(tp.ip)) return { ip: tp.ip, port: tp.port || 8766 };
+  }
+  const tcpChk = (LAN_LAST_DIAG.checks || []).find(c => c.id === "peer_tcp" && c.status === "ok");
+  if (tcpChk && LAN_LAST_DIAG.peer_ip && !pairedIps.has(LAN_LAST_DIAG.peer_ip)) {
+    return { ip: LAN_LAST_DIAG.peer_ip, port: LAN_LAST_DIAG.peer_port || 8766 };
+  }
+  return null;
+}
+
+function renderDiscoveredRowsHtml(discovered, showDiagHint = false, opts = {}) {
+  const scanningSubnet = !!opts.scanningSubnet;
+  const tcpPeer = opts.tcpPeer !== undefined ? opts.tcpPeer : getDiagTcpReachablePeer(LAN_CACHE?.peers || []);
   if (!discovered || !discovered.length) {
     return `<div class="meta lan-empty">
+      ${scanningSubnet ? `<div class="lan-sweep-prog">Ищу по всей подсети…</div>` : ""}
       <div>Новых устройств рядом пока не найдено — нажмите «Автопоиск устройств». <b>LAN должна быть включена на обоих ПК.</b></div>
+      ${tcpPeer ? `<div class="lan-tcp-ready"><span>Прямое TCP-соединение с <b>${esc(tcpPeer.ip)}:${tcpPeer.port}</b> подтверждено:</span> <button type="button" class="btn-pri sm lan-open-manual-pair" data-peer-ip="${esc(tcpPeer.ip)}" data-peer-port="${tcpPeer.port}">Подключиться по IP и PIN</button></div>` : ""}
       ${showDiagHint ? `<div class="lan-empty-diag">Устройства не видят друг друга? <button type="button" class="link sm lan-run-diag-inline">Проверить сеть (диагностика)</button></div>` : ""}
     </div>`;
   }
-  return `<div class="lan-disc-list">${discovered.map(d => `<div class="lan-disc-item" data-ip="${esc(d.ip)}" data-port="${d.port}" data-dname="${esc(d.device_name)}">
+  return `<div class="lan-disc-list">${discovered.map(d => {
+    const verTxt = d.app_version
+      ? ` · v${esc(d.app_version)}`
+      : (d.legacy_protocol ? ` · <span class="lan-old-ver" title="Рекомендуется обновить программу на этом компьютере до версии 1.8.1+">версия 1.7 или старше</span>` : "");
+    return `<div class="lan-disc-item" data-ip="${esc(d.ip)}" data-port="${d.port}" data-dname="${esc(d.device_name)}">
     <div class="lan-disc-row">
-      <div class="lan-disc-title"><span class="lan-pdot on"></span><b>${esc(d.device_name)}</b><span class="meta">${esc(d.ip)}:${d.port} · найдено в сети</span></div>
+      <div class="lan-disc-title"><span class="lan-pdot on"></span><b>${esc(d.device_name)}</b><span class="meta">${esc(d.ip)}:${d.port}${verTxt} · найдено в сети</span></div>
       <button type="button" class="btn-pri sm lan-quick-pair">Подключить</button>
     </div>
     <div class="lan-quick-box hidden">
@@ -3722,7 +3744,8 @@ function renderDiscoveredRowsHtml(discovered, showDiagHint = false) {
         <button type="button" class="btn-sec sm lan-q-cancel">Отмена</button>
       </div>
     </div>
-  </div>`).join("")}</div>`;
+  </div>`;
+  }).join("")}</div>`;
 }
 
 function renderLanDiagChecklistHtml(diag) {
@@ -3738,6 +3761,8 @@ function renderLanDiagChecklistHtml(diag) {
       actBtn = `<button type="button" class="btn-pri sm" data-diag-act="allow_firewall_unblock">Удалить блок и разрешить</button>`;
     } else if (c.action === "open_net_settings") {
       actBtn = `<button type="button" class="btn-sec sm" data-diag-act="open_net_settings">Открыть параметры сети</button>`;
+    } else if (c.action === "pair_by_ip" && diag.peer_ip) {
+      actBtn = `<button type="button" class="btn-pri sm" data-diag-act="pair_by_ip" data-peer-ip="${esc(diag.peer_ip)}" data-peer-port="${diag.peer_port || 8766}">Подключиться по IP и PIN</button>`;
     }
     return `<div class="lan-diag-row ${esc(c.status)}" data-check-id="${esc(c.id)}">
       <span class="lan-diag-ico">${iconFor(c.status)}</span>
@@ -3902,7 +3927,11 @@ function renderLanModalBody(st) {
       }).join("")
     : `<div class="meta lan-empty">Сопряжённых устройств пока нет — сгенерируйте PIN на одном компьютере и введите его на другом.</div>`;
 
-  const discHtml = renderDiscoveredRowsHtml(st.discovered, LAN_LAST_SEARCH_EMPTY || !(st.discovered && st.discovered.length));
+  const discHtml = renderDiscoveredRowsHtml(
+    st.discovered,
+    LAN_LAST_SEARCH_EMPTY || !(st.discovered && st.discovered.length),
+    { scanningSubnet: !!st.scanning_subnet, tcpPeer: getDiagTcpReachablePeer(st.peers) }
+  );
 
   $("#modalBody").innerHTML = `<div class="lan-win" id="lanModalWin">
     <div class="lan-head">
@@ -4047,9 +4076,24 @@ function renderLanModalBody(st) {
     }
   };
 
+  const openManualPairWithIp = (ipVal, portVal = 8766) => {
+    const det = $("#lanModalWin details.lan-manual-pair");
+    if (det) det.open = true;
+    const ipInp = $("#lanPairIp"), portInp = $("#lanPairPort"), pinInp = $("#lanPairPin");
+    if (ipInp && ipVal) ipInp.value = ipVal;
+    if (portInp && portVal) portInp.value = String(portVal);
+    if (pinInp) {
+      pinInp.scrollIntoView({ behavior: "smooth", block: "center" });
+      pinInp.focus();
+    }
+  };
+
   const bindInlineDiagButtons = (rootEl) => {
     if (!rootEl) return;
     rootEl.querySelectorAll(".lan-run-diag-inline").forEach(b => b.onclick = () => runNetworkDiagnoseFlow());
+    rootEl.querySelectorAll(".lan-open-manual-pair").forEach(b => b.onclick = () => {
+      openManualPairWithIp(b.dataset.peerIp || "", +(b.dataset.peerPort || 8766));
+    });
   };
 
   bindDiscoveredEvents($("#lanDiscBox"), refreshModal);
@@ -4074,10 +4118,14 @@ function renderLanModalBody(st) {
       await runAllowFirewallFlow(true, b);
     } else if (act === "open_net_settings") {
       await openWinNetSettings();
+    } else if (act === "pair_by_ip") {
+      openManualPairWithIp(b.dataset.peerIp || "", +(b.dataset.peerPort || 8766));
     }
   });
 
   if (st.enabled) {
+    let bgSweepTicks = 0;
+    let bgSweepBusy = false;
     lanDiscTimer = setInterval(async () => {
       if (!isLanModalOpen() || !$("#lanDiscBox")) { stopLanTimers(); return; }
       try {
@@ -4087,10 +4135,35 @@ function renderLanModalBody(st) {
         if (!curBox || !isLanModalOpen()) return;
         const quickOpen = !!curBox.querySelector(".lan-quick-box:not(.hidden)");
         const typingHere = curBox.contains(document.activeElement);
+        const discEmpty = !(cur.discovered && cur.discovered.length);
         if (!quickOpen && !typingHere) {
-          curBox.innerHTML = renderDiscoveredRowsHtml(cur.discovered, LAN_LAST_SEARCH_EMPTY || !(cur.discovered && cur.discovered.length));
+          curBox.innerHTML = renderDiscoveredRowsHtml(
+            cur.discovered,
+            LAN_LAST_SEARCH_EMPTY || discEmpty,
+            { scanningSubnet: !!cur.scanning_subnet || bgSweepBusy, tcpPeer: getDiagTcpReachablePeer(cur.peers) }
+          );
           bindDiscoveredEvents(curBox, refreshModal);
           bindInlineDiagButtons(curBox);
+        }
+        // Мягкий фоновый обход подсети раз в ~60 с, пока окно LAN открыто и рядом никого не найдено
+        bgSweepTicks += 1;
+        if (bgSweepTicks >= 17) {
+          bgSweepTicks = 0;
+          if (discEmpty && !(cur.online_peers > 0) && !bgSweepBusy && !$("#btnLanDiscover")?.disabled) {
+            bgSweepBusy = true;
+            if (!quickOpen && !typingHere && curBox) {
+              curBox.innerHTML = renderDiscoveredRowsHtml([], true, { scanningSubnet: true, tcpPeer: getDiagTcpReachablePeer(cur.peers) });
+              bindInlineDiagButtons(curBox);
+            }
+            post("/api/lan/discover", { auto_enable: false, wait_sec: 4.0, mode: "subnet_only" })
+              .then(afterSweep => {
+                if (isLanModalOpen() && (afterSweep.discovered || []).length) {
+                  renderLanModalBody(afterSweep);
+                }
+              })
+              .catch(() => {})
+              .finally(() => { bgSweepBusy = false; });
+          }
         }
       } catch (e) { /* игнорируем кратковременный сбой опроса */ }
     }, 3500);
@@ -4102,10 +4175,21 @@ function renderLanModalBody(st) {
       discBtn.disabled = true;
       discBtn.textContent = "Ищу устройства в сети…";
       try {
-        const fresh = await post("/api/lan/discover", { auto_enable: true, wait_sec: 1.5 });
+        let fresh = await post("/api/lan/discover", { auto_enable: true, wait_sec: 4.0, mode: "broadcast_only" });
+        let foundN = (fresh.discovered || []).length;
+        let onN = fresh.online_peers || 0;
+        if (foundN === 0 && onN === 0 && isLanModalOpen()) {
+          discBtn.textContent = "Ищу по всей подсети…";
+          const curBox = $("#lanDiscBox");
+          if (curBox) {
+            curBox.innerHTML = renderDiscoveredRowsHtml([], true, { scanningSubnet: true, tcpPeer: getDiagTcpReachablePeer(fresh.peers) });
+            bindInlineDiagButtons(curBox);
+          }
+          fresh = await post("/api/lan/discover", { auto_enable: false, wait_sec: 4.5, mode: "subnet_only" });
+          foundN = (fresh.discovered || []).length;
+          onN = fresh.online_peers || 0;
+        }
         syncLanIndicators(fresh);
-        const foundN = (fresh.discovered || []).length;
-        const onN = fresh.online_peers || 0;
         LAN_LAST_SEARCH_EMPTY = (foundN === 0 && onN === 0);
         if (isLanModalOpen()) renderLanModalBody(fresh);
         if (foundN) toast("ok", "Найдены устройства", `Доступно для подключения: ${foundN}`);
@@ -4158,6 +4242,11 @@ function renderLanModalBody(st) {
       renderLanModalBody(st);
     } catch (e) { toast("warn", "Не удалось создать PIN", e.message || String(e)); }
   };
+  if ($("#lanPairPin")) {
+    $("#lanPairPin").onkeydown = e => {
+      if (e.key === "Enter") { e.preventDefault(); $("#btnLanPair")?.click(); }
+    };
+  }
   $("#btnLanPair").onclick = async () => {
     const btn = $("#btnLanPair");
     const ip = ($("#lanPairIp").value || "").trim();

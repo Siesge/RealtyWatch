@@ -76,8 +76,11 @@ def _normalize_live_cfg(raw) -> dict:
 
 PIN_TTL_SEC = 120
 PIN_MAX_TRIES = 5
-DISCOVERY_TTL_SEC = 18.0
+DISCOVERY_TTL_SEC = 45.0
 DISCOVERY_INTERVAL_SEC = 4.0
+QUIET_PEER_REPROBE_SEC = 16.0
+SUBNET_SWEEP_BATCH = 32
+SUBNET_SWEEP_PAUSE_SEC = 0.025
 HEARTBEAT_INTERVAL_SEC = 8.0
 HEARTBEAT_TIMEOUT_SEC = 2.0
 DB_SESSION_TTL_SEC = 600.0
@@ -206,6 +209,75 @@ def compute_subnet_broadcast(ip_str: str, prefix: int) -> str | None:
         return None
     bcast = str(iface.network.broadcast_address)
     return bcast if bcast and bcast != ip_str else None
+
+
+def compute_subnet_unicast_hosts(ip_str: str, prefix: int, exclude_ips: set[str] | None = None) -> list[str]:
+    """Возвращает список соседей в подсети адаптера для поадресного unicast-обхода:
+    до /22 включительно — вся подсеть, для более крупных сетей (/21..8) — только своя /24;
+    исключаются адрес сети, broadcast, собственный IP и exclude_ips."""
+    clean = _clean_ip_str(ip_str)
+    if not _is_lan_ip(clean):
+        return []
+    try:
+        ip_obj = ipaddress.IPv4Address(clean)
+    except ValueError:
+        return []
+    if ip_obj.is_loopback or ip_obj.is_link_local:
+        return []
+    try:
+        plen = int(prefix)
+    except (TypeError, ValueError):
+        plen = 24
+    if plen >= 31 or plen <= 0:
+        return []
+    eff_prefix = plen if plen >= 22 else 24
+    try:
+        net = ipaddress.IPv4Network(f"{clean}/{eff_prefix}", strict=False)
+    except ValueError:
+        return []
+    skip = {clean}
+    if exclude_ips:
+        skip.update(_clean_ip_str(x) for x in exclude_ips if x)
+    out: list[str] = []
+    for host in net.hosts():
+        hs = str(host)
+        if hs not in skip:
+            out.append(hs)
+    return out
+
+
+def _disable_udp_connreset(sock: socket.socket) -> None:
+    """Отключает на Windows генерацию ConnectionResetError (WinError 10054) на UDP-сокете
+    после прихода ICMP Port Unreachable при поадресном опросе закрытых портов подсети."""
+    if os.name != "nt":
+        return
+    try:
+        ws2 = ctypes.windll.ws2_32
+        in_buf = ctypes.c_ulong(0)
+        bytes_ret = ctypes.c_ulong(0)
+        ws2.WSAIoctl(
+            ctypes.c_size_t(sock.fileno()),
+            ctypes.c_ulong(0x9800000C),  # SIO_UDP_CONNRESET
+            ctypes.byref(in_buf),
+            ctypes.c_ulong(ctypes.sizeof(in_buf)),
+            None,
+            ctypes.c_ulong(0),
+            ctypes.byref(bytes_ret),
+            None,
+            None,
+        )
+    except Exception:
+        pass
+
+
+def current_lan_app_version() -> str:
+    """Возвращает строку текущей версии приложения для пакетов обнаружения и статуса LAN."""
+    try:
+        from . import updater
+
+        return updater.current_app_version()
+    except Exception:
+        return "1.8.1"
 
 
 def _raw_win32_adapters() -> list[dict]:
@@ -1383,6 +1455,11 @@ class LanService:
         self._history_db_key: str | None = None
         self._rx_sock = None
         self._udp_listening: bool = False
+        self._udp_started_mono: float = 0.0
+        self._last_bcast_probe_mono: float = 0.0
+        self._last_unicast_probe_by_ip: dict[str, float] = {}
+        self._diag_listeners: list = []
+        self._scanning_subnet: bool = False
         self._fw_cache: dict | None = None
         self._fw_cache_ts: float = 0.0
         self._fw_refreshing: bool = False
@@ -1456,6 +1533,10 @@ class LanService:
             self._fw_cache = None
             self._fw_cache_ts = 0.0
             self._fw_refreshing = False
+            self._last_bcast_probe_mono = 0.0
+            self._last_unicast_probe_by_ip.clear()
+            self._diag_listeners.clear()
+            self._scanning_subnet = False
 
     def _ensure_history_unread(self) -> int:
         cur_key = str(db.DB_FILE)
@@ -1940,6 +2021,8 @@ class LanService:
             self._running_disc = False
             self._udp_listening = False
             self._rx_sock = None
+            self._udp_started_mono = 0.0
+            self._scanning_subnet = False
             self._newer_db_peer = None
             self._bootstrapped_peers.clear()
             for rt in self._peer_runtime.values():
@@ -1983,14 +2066,21 @@ class LanService:
                 targets.add(bcast)
         return targets
 
-    def _open_bound_bcast_sockets(self) -> list[tuple[str, list[str], socket.socket]]:
-        """Открывает по одному UDP-сокету с SO_BROADCAST, привязанному к IP каждого физического адаптера (bind((ip, 0))).
-        Это гарантирует уход широковещательных пакетов в реальную Wi-Fi/Ethernet сеть, а не только в интерфейс с меньшей метрикой."""
+    def _open_bound_bcast_sockets(self, bind_port: int = 0) -> list[tuple[str, list[str], socket.socket]]:
+        """Открывает по одному UDP-сокету с SO_BROADCAST, привязанному к IP каждого физического адаптера.
+        Если задан bind_port (например, 8767), привязывается к (ip, bind_port) с SO_REUSEADDR."""
         out: list[tuple[str, list[str], socket.socket]] = []
+        eff_port = int(bind_port or 0)
         if self._bind_host == "127.0.0.1":
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-                s.bind(("127.0.0.1", 0))
+                if eff_port:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                _disable_udp_connreset(s)
+                try:
+                    s.bind(("127.0.0.1", eff_port))
+                except OSError:
+                    s.bind(("127.0.0.1", 0))
                 s.settimeout(0.25)
                 out.append(("127.0.0.1", ["127.0.0.1"], s))
             except OSError as e:
@@ -2011,7 +2101,13 @@ class LanService:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                s.bind((ip_s, 0))
+                if eff_port:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                _disable_udp_connreset(s)
+                try:
+                    s.bind((ip_s, eff_port))
+                except OSError:
+                    s.bind((ip_s, 0))
                 s.settimeout(0.25)
                 out.append((f"{iface.get('adapter') or 'LAN'}({ip_s})", dsts, s))
             except OSError as e:
@@ -2026,12 +2122,111 @@ class LanService:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                s.bind(("", 0))
+                if eff_port:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                _disable_udp_connreset(s)
+                try:
+                    s.bind(("", eff_port))
+                except OSError:
+                    s.bind(("", 0))
                 s.settimeout(0.25)
                 out.append(("fallback(0.0.0.0)", ["255.255.255.255", "127.0.0.1"], s))
             except OSError as e:
                 _lan_log(f"Ошибка открытия резервного UDP-сокета: {e}", logging.WARNING, rate_key="bcast_fb", min_interval=30.0)
         return out
+
+    def _wait_udp_ready(self, max_wait: float = 0.5):
+        """Ждёт привязки основного сокета self._rx_sock сразу после запуска потока _discovery_loop."""
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline and not self._stop_evt.is_set():
+            with self._lock:
+                if self._rx_sock is not None and self._udp_listening:
+                    return self._rx_sock
+            time.sleep(0.02)
+        with self._lock:
+            return self._rx_sock
+
+    def _send_limited_bcast_per_adapter(self, lan_port: int, disc_port: int, payload: bytes, ports: set[int]):
+        """Дополнительно отправляет 255.255.255.255 с IP:disc_port каждого вторичного физического адаптера,
+        мгновенно закрывая сокет после вычитки буфера, чтобы все входящие ответы шли в основной self._rx_sock."""
+        if self._bind_host == "127.0.0.1":
+            return
+        ifaces = local_ipv4s()
+        for iface in ifaces:
+            ip_s = str(iface.get("ip") or "").strip()
+            if not ip_s:
+                continue
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                _disable_udp_connreset(s)
+                s.bind((ip_s, int(disc_port)))
+                s.setblocking(False)
+                for p in ports:
+                    try:
+                        s.sendto(payload, ("255.255.255.255", int(p)))
+                    except OSError:
+                        pass
+                for _ in range(4):
+                    try:
+                        raw_d, addr_d = s.recvfrom(4096)
+                        self._handle_discovery_packet(raw_d, addr_d[0], addr_d[1], my_lan_port=lan_port)
+                    except (BlockingIOError, OSError):
+                        break
+            except OSError:
+                pass
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+    def _reprobe_quiet_discovered(self, lan_port: int, disc_port: int, rx_sock):
+        """Поддерживает актуальность записей устройств с односторонним broadcast (например, 1.7 с VPN на стороне партнёра),
+        пока окно сопряжения открыто и пользователь вводит PIN."""
+        if rx_sock is None:
+            return
+        cutoff = time.time() - DISCOVERY_TTL_SEC
+        with self._lock:
+            quiet_targets = [
+                (str(v.get("ip") or ""), int(v.get("port") or 8766))
+                for v in self._discovered.values()
+                if v.get("seen_ts", 0) >= cutoff and not v.get("seen_broadcast") and v.get("ip")
+            ]
+        if not quiet_targets:
+            return
+        try:
+            ident = self._identity()
+        except Exception:
+            return
+        probe_b = json.dumps({
+            "magic": _PROBE_MAGIC,
+            "device_id": ident["device_id"],
+            "device_name": ident["device_name"],
+            "port": int(lan_port),
+            "disc_port": int(disc_port),
+            "platform": "windows",
+            "app_version": current_lan_app_version(),
+            "probe_kind": "unicast",
+        }, ensure_ascii=False).encode("utf-8")
+        now_m = time.monotonic()
+        for ip_s, pport in quiet_targets:
+            if not _is_lan_ip(ip_s):
+                continue
+            with self._lock:
+                self._last_unicast_probe_by_ip[ip_s] = now_m
+            dst_ports = {pport + 1}
+            if self._bind_host != "127.0.0.1":
+                dst_ports.add(8767)
+            for dp in dst_ports:
+                if 1 <= dp <= 65535:
+                    try:
+                        rx_sock.sendto(probe_b, (ip_s, dp))
+                    except OSError:
+                        pass
 
     def _discovery_loop(self, lan_port: int):
         disc_port = lan_port + 1
@@ -2040,11 +2235,17 @@ class LanService:
         try:
             rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                rx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            except OSError:
+                pass
+            _disable_udp_connreset(rx)
             rx.bind((bind_ip, disc_port))
             rx.settimeout(0.8)
             with self._lock:
                 self._rx_sock = rx
                 self._udp_listening = True
+                self._udp_started_mono = time.monotonic()
             _lan_log(f"UDP discovery слушает {bind_ip or '0.0.0.0'}:{disc_port}")
         except OSError as e:
             _lan_log(f"ОШИБКА bind UDP discovery на {bind_ip or '0.0.0.0'}:{disc_port}: {e}", logging.ERROR)
@@ -2057,24 +2258,34 @@ class LanService:
             with self._lock:
                 self._rx_sock = None
                 self._udp_listening = False
+                self._udp_started_mono = 0.0
 
-        # Активный зонд сразу при запуске LAN + публикация собственного присутствия
-        self._send_udp_probe(lan_port, reply_disc_port=disc_port)
-        self._broadcast_presence(lan_port, disc_port)
+        # Активный зонд сразу при запуске LAN (с порта disc_port=8767) + публикация собственного присутствия
+        self._send_udp_probe(lan_port, reply_disc_port=disc_port, tx_sock=rx)
+        self._broadcast_presence(lan_port, disc_port, tx_sock=rx)
         last_bcast = time.monotonic()
+        last_quiet_reprobe = last_bcast
 
         while not self._stop_evt.is_set():
             now_m = time.monotonic()
             if now_m - last_bcast >= DISCOVERY_INTERVAL_SEC:
                 last_bcast = now_m
-                self._broadcast_presence(lan_port, disc_port)
+                self._broadcast_presence(lan_port, disc_port, tx_sock=rx)
+            if rx is not None and (now_m - last_quiet_reprobe) >= QUIET_PEER_REPROBE_SEC:
+                last_quiet_reprobe = now_m
+                self._reprobe_quiet_discovered(lan_port, disc_port, rx)
             if rx is not None:
                 try:
-                    raw, addr = rx.recvfrom(2048)
+                    raw, addr = rx.recvfrom(4096)
                     self._handle_discovery_packet(raw, addr[0], addr[1], my_lan_port=lan_port, reply_sock=rx)
                 except socket.timeout:
                     pass
+                except ConnectionResetError:
+                    # На Windows ICMP Port Unreachable от закрытых портов при unicast-обходе не должен рвать цикл приёма
+                    continue
                 except OSError as e:
+                    if getattr(e, "winerror", None) in (10054, 10052, 10065):
+                        continue
                     if not self._stop_evt.is_set():
                         _lan_log(f"Ошибка чтения UDP discovery сокета: {e}", logging.WARNING, rate_key="rx_recv", min_interval=30.0)
                     break
@@ -2091,24 +2302,32 @@ class LanService:
         with self._lock:
             self._udp_listening = False
             self._rx_sock = None
+            self._udp_started_mono = 0.0
         if rx is not None:
             try:
                 rx.close()
             except OSError:
                 pass
 
-    def _presence_payload(self, lan_port: int) -> bytes | None:
+    def _presence_payload(self, lan_port: int, *, is_bcast: bool = False, is_reply: bool = False) -> bytes | None:
         try:
             ident = self._identity()
         except Exception:
             return None
-        return json.dumps({
+        obj = {
             "magic": _DISCOVERY_MAGIC,
             "device_id": ident["device_id"],
             "device_name": ident["device_name"],
             "port": int(lan_port),
+            "disc_port": int(lan_port) + 1,
             "platform": "windows",
-        }, ensure_ascii=False).encode("utf-8")
+            "app_version": current_lan_app_version(),
+        }
+        if is_bcast:
+            obj["is_bcast"] = True
+        if is_reply:
+            obj["is_reply"] = True
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
     def _send_probe_reply(
         self,
@@ -2119,8 +2338,8 @@ class LanService:
         extra_dst: tuple[str, int] | None = None,
     ):
         """Отвечает на RW_PROBE_V1 с того же сокета rx (порт 8767), на который пришёл зонд,
-        чтобы ответ проходил stateful-фильтр брандмауэра на ищущем компьютере."""
-        payload = self._presence_payload(lan_port)
+        чтобы ответ проходил брандмауэр и доходил на открытый порт ищущего компьютера."""
+        payload = self._presence_payload(lan_port, is_reply=True)
         if not payload:
             return
         sock = reply_sock
@@ -2131,6 +2350,7 @@ class LanService:
         if sock is None:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                _disable_udp_connreset(sock)
                 sock.settimeout(0.5)
                 own_sock = True
             except OSError as e:
@@ -2154,8 +2374,9 @@ class LanService:
                 except OSError:
                     pass
 
-    def _broadcast_presence(self, lan_port: int, disc_port: int, unicast_to: tuple[str, int] | None = None, reply_sock=None):
-        payload = self._presence_payload(lan_port)
+    def _broadcast_presence(self, lan_port: int, disc_port: int, unicast_to: tuple[str, int] | None = None,
+                            reply_sock=None, tx_sock=None):
+        payload = self._presence_payload(lan_port, is_bcast=True)
         if not payload:
             return
         if unicast_to is not None:
@@ -2165,7 +2386,27 @@ class LanService:
         if self._bind_host != "127.0.0.1":
             ports.add(8767)
 
-        bound_list = self._open_bound_bcast_sockets()
+        sock = tx_sock
+        if sock is None:
+            with self._lock:
+                sock = self._rx_sock
+
+        if sock is not None:
+            for dst in self._broadcast_targets():
+                for p in ports:
+                    try:
+                        sock.sendto(payload, (dst, p))
+                    except OSError as e:
+                        _lan_log(
+                            f"Ошибка broadcast присутствия с порта {disc_port} -> {dst}:{p}: {e}",
+                            logging.WARNING,
+                            rate_key=f"bcast_rx_{dst}",
+                            min_interval=60.0,
+                        )
+            self._send_limited_bcast_per_adapter(lan_port, disc_port, payload, ports)
+            return
+
+        bound_list = self._open_bound_bcast_sockets(bind_port=disc_port)
         try:
             for label, dst_ips, tx in bound_list:
                 for dst in dst_ips:
@@ -2188,7 +2429,8 @@ class LanService:
 
     def _send_udp_probe(self, lan_port: int, reply_disc_port: int | None = None,
                         extra_ports=(), tx_sock=None, log_probe: bool = False):
-        """Отправляет активный UDP-запрос RW_PROBE_V1 с каждого физического адаптера и известным сопряжённым пирам."""
+        """Отправляет активный UDP-запрос RW_PROBE_V1 с основного порта disc_port (8767),
+        чтобы ответы от версий 1.6/1.7 (со случайного порта и с задержкой 1–4 с) приходили на открытый в брандмауэре localport 8767."""
         con = db.connect()
         try:
             ident = self._identity(con)
@@ -2198,7 +2440,9 @@ class LanService:
         finally:
             con.close()
 
-        ports = {int(lan_port) + 1}
+        disc_port = int(lan_port) + 1
+        rport = int(reply_disc_port or disc_port)
+        ports = {disc_port}
         if self._bind_host != "127.0.0.1":
             ports.add(8767)
         for ep in (extra_ports or ()):
@@ -2210,6 +2454,7 @@ class LanService:
                 pass
 
         peer_unicast: set[tuple[str, int]] = set()
+        now_m = time.monotonic()
         for pr in peer_rows:
             pip = _clean_ip_str(pr.get("ip") or "")
             if not _is_lan_ip(pip):
@@ -2223,25 +2468,31 @@ class LanService:
             except (TypeError, ValueError):
                 pass
 
-        def _make_probe(rport_val: int) -> bytes:
-            return json.dumps({
-                "magic": _PROBE_MAGIC,
-                "device_id": ident["device_id"],
-                "device_name": ident["device_name"],
-                "port": int(lan_port),
-                "disc_port": int(rport_val),
-                "platform": "windows",
-            }, ensure_ascii=False).encode("utf-8")
+        payload = json.dumps({
+            "magic": _PROBE_MAGIC,
+            "device_id": ident["device_id"],
+            "device_name": ident["device_name"],
+            "port": int(lan_port),
+            "disc_port": int(rport),
+            "platform": "windows",
+            "app_version": current_lan_app_version(),
+            "probe_kind": "broadcast",
+        }, ensure_ascii=False).encode("utf-8")
 
-        if tx_sock is not None:
-            rport = int(reply_disc_port or (int(lan_port) + 1))
-            payload = _make_probe(rport)
+        with self._lock:
+            self._last_bcast_probe_mono = now_m
+            for pip, _pp in peer_unicast:
+                self._last_unicast_probe_by_ip[pip] = now_m
+            sock = tx_sock if tx_sock is not None else self._rx_sock
+
+        if sock is not None:
             dests = {(dst, p) for dst in self._broadcast_targets() for p in ports} | peer_unicast
-            for addr_pair in dests:
+            src_p = sock.getsockname()[1] if hasattr(sock, "getsockname") else rport
+            for addr_pair in sorted(dests):
                 try:
-                    tx_sock.sendto(payload, addr_pair)
+                    sock.sendto(payload, addr_pair)
                     if log_probe:
-                        _lan_log(f"UDP зонд отправлен -> {addr_pair[0]}:{addr_pair[1]} (reply_port={rport})")
+                        _lan_log(f"UDP зонд с порта {src_p} -> {addr_pair[0]}:{addr_pair[1]} (disc_port={rport})")
                 except OSError as e:
                     _lan_log(
                         f"Ошибка отправки UDP зонда -> {addr_pair[0]}:{addr_pair[1]}: {e}",
@@ -2249,21 +2500,22 @@ class LanService:
                         rate_key=f"probe_err_{addr_pair[0]}",
                         min_interval=30.0,
                     )
+            if tx_sock is None or sock is self._rx_sock:
+                self._send_limited_bcast_per_adapter(lan_port, rport, payload, ports)
             return
 
-        bound_list = self._open_bound_bcast_sockets()
-        rport_def = int(reply_disc_port or (int(lan_port) + 1))
-        payload_def = _make_probe(rport_def)
+        bound_list = self._open_bound_bcast_sockets(bind_port=rport)
         try:
-            for idx_s, (label, dst_ips, sock) in enumerate(bound_list):
+            for idx_s, (label, dst_ips, bsock) in enumerate(bound_list):
                 targets = {(dst, p) for dst in dst_ips for p in ports}
                 if idx_s == 0:
                     targets |= peer_unicast
-                for addr_pair in targets:
+                src_p = bsock.getsockname()[1] if hasattr(bsock, "getsockname") else rport
+                for addr_pair in sorted(targets):
                     try:
-                        sock.sendto(payload_def, addr_pair)
+                        bsock.sendto(payload, addr_pair)
                         if log_probe:
-                            _lan_log(f"UDP зонд с {label} -> {addr_pair[0]}:{addr_pair[1]}")
+                            _lan_log(f"UDP зонд с {label}:{src_p} -> {addr_pair[0]}:{addr_pair[1]} (disc_port={rport})")
                     except OSError as e:
                         _lan_log(
                             f"Ошибка отправки UDP зонда с {label} -> {addr_pair[0]}:{addr_pair[1]}: {e}",
@@ -2272,11 +2524,135 @@ class LanService:
                             min_interval=30.0,
                         )
         finally:
-            for _lbl, _dsts, sock in bound_list:
+            for _lbl, _dsts, bsock in bound_list:
+                try:
+                    bsock.close()
+                except OSError:
+                    pass
+
+    def _unicast_subnet_sweep(
+        self,
+        lan_port: int,
+        *,
+        target_ports=(),
+        tx_sock=None,
+        interfaces: list[dict] | None = None,
+        batch_size: int = SUBNET_SWEEP_BATCH,
+        batch_pause_sec: float = SUBNET_SWEEP_PAUSE_SEC,
+        probe_device_id: str | None = None,
+        probe_device_name: str | None = None,
+        probe_platform: str = "windows",
+    ) -> int:
+        """Поадресный unicast-обход подсети каждого физического адаптера с порта disc_port (8767).
+        Используется как надёжный фолбэк, когда широковещательные пакеты режутся Wi-Fi роутером или виртуальным коммутатором."""
+        disc_port = int(lan_port) + 1
+        ports = {disc_port}
+        if self._bind_host != "127.0.0.1" or interfaces is not None:
+            ports.add(8767)
+        for ep in (target_ports or ()):
+            try:
+                ep_i = int(ep)
+                if 1 <= ep_i <= 65535:
+                    ports.add(ep_i)
+            except (TypeError, ValueError):
+                pass
+
+        if interfaces is not None:
+            ifaces = list(interfaces)
+        elif self._bind_host == "127.0.0.1":
+            ifaces = []
+        else:
+            ifaces = local_ipv4s()
+        if not ifaces:
+            return 0
+
+        my_ips = {_clean_ip_str(str(x.get("ip") or "")) for x in ifaces if x.get("ip")}
+        all_hosts: list[str] = []
+        seen_h: set[str] = set()
+        for iface in ifaces:
+            ip_s = str(iface.get("ip") or "").strip()
+            pref = int(iface.get("prefix") or 24)
+            for h in compute_subnet_unicast_hosts(ip_s, pref, exclude_ips=my_ips):
+                if h not in seen_h:
+                    seen_h.add(h)
+                    all_hosts.append(h)
+        if not all_hosts:
+            return 0
+
+        if not probe_device_id or not probe_device_name:
+            con = db.connect()
+            try:
+                ident = self._identity(con)
+            finally:
+                con.close()
+            eff_id = probe_device_id or ident["device_id"]
+            eff_name = probe_device_name or ident["device_name"]
+        else:
+            eff_id = probe_device_id
+            eff_name = probe_device_name
+
+        probe_b = json.dumps({
+            "magic": _PROBE_MAGIC,
+            "device_id": eff_id,
+            "device_name": eff_name,
+            "port": int(lan_port),
+            "disc_port": disc_port,
+            "platform": probe_platform,
+            "app_version": current_lan_app_version(),
+            "probe_kind": "unicast",
+        }, ensure_ascii=False).encode("utf-8")
+
+        own_sock = False
+        sock = tx_sock
+        if sock is None:
+            with self._lock:
+                sock = self._rx_sock
+        if sock is None:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                _disable_udp_connreset(sock)
+                try:
+                    sock.bind(("", disc_port))
+                except OSError:
+                    sock.bind(("", 0))
+                own_sock = True
+            except OSError as e:
+                _lan_log(f"Не удалось открыть сокет для unicast-обхода подсети: {e}", logging.WARNING)
+                return 0
+
+        sent = 0
+        sorted_ports = sorted(ports)
+        bsize = max(1, int(batch_size or SUBNET_SWEEP_BATCH))
+        bpause = max(0.0, float(batch_pause_sec if batch_pause_sec is not None else SUBNET_SWEEP_PAUSE_SEC))
+        was_running = self.is_listening()
+        try:
+            src_p = sock.getsockname()[1] if hasattr(sock, "getsockname") else disc_port
+            _lan_log(f"Старт unicast-обхода подсети с порта {src_p}: хостов={len(all_hosts)}, порты={sorted_ports}")
+            for idx, host_ip in enumerate(all_hosts):
+                if was_running and self._stop_evt.is_set():
+                    break
+                now_m = time.monotonic()
+                with self._lock:
+                    self._last_unicast_probe_by_ip[host_ip] = now_m
+                for dp in sorted_ports:
+                    try:
+                        sock.sendto(probe_b, (host_ip, dp))
+                        sent += 1
+                    except OSError:
+                        pass
+                if bpause > 0 and (idx + 1) % bsize == 0 and (idx + 1) < len(all_hosts):
+                    if was_running and self._stop_evt.is_set():
+                        break
+                    time.sleep(bpause)
+        finally:
+            if own_sock and sock is not None:
                 try:
                     sock.close()
                 except OSError:
                     pass
+        _lan_log(f"Unicast-обход подсети отправлен: пакетов={sent} по {len(all_hosts)} адресам")
+        return sent
 
     def _verify_and_update_peer_endpoint(self, dev_id: str, cand_ip: str, cand_port: int, hint_name: str = "") -> bool:
         """Проверяет новый IP/порт уже сопряжённого устройства по токену и /sync/status перед обновлением БД."""
@@ -2348,6 +2724,17 @@ class LanService:
         dev_id = str(pkt.get("device_id") or "").strip()
         if not dev_id:
             return
+        clean_ip = _clean_ip_str(sender_ip)
+        src_udp = int(sender_udp_port or 0)
+
+        with self._lock:
+            listeners = list(self._diag_listeners)
+        for cb in listeners:
+            try:
+                cb(pkt, clean_ip, src_udp)
+            except Exception:
+                pass
+
         con = db.connect()
         try:
             ident = self._identity(con)
@@ -2362,16 +2749,15 @@ class LanService:
 
         if dev_id == ident["device_id"]:
             return
-        clean_ip = _clean_ip_str(sender_ip)
         eff_my_port = int(my_lan_port or self._running_port or self._lan_cfg()["port"])
 
         if magic == _PROBE_MAGIC:
             # Отвечаем с того же сокета rx (порт 8767), на который поступил зонд
             if self._lan_cfg()["enabled"]:
                 try:
-                    reply_port = int(pkt.get("disc_port") or sender_udp_port or (eff_my_port + 1))
+                    reply_port = int(pkt.get("disc_port") or src_udp or (eff_my_port + 1))
                 except (TypeError, ValueError):
-                    reply_port = int(sender_udp_port or (eff_my_port + 1))
+                    reply_port = int(src_udp or (eff_my_port + 1))
                 tkey = f"{clean_ip}:{dev_id}:{reply_port}"
                 now_m = time.monotonic()
                 with self._lock:
@@ -2381,8 +2767,8 @@ class LanService:
                         self._probe_reply_ts[tkey] = now_m
                 if should_reply and (1 <= reply_port <= 65535):
                     extra_dst = (
-                        (clean_ip, int(sender_udp_port))
-                        if sender_udp_port and 1 <= int(sender_udp_port) <= 65535 and int(sender_udp_port) != reply_port
+                        (clean_ip, src_udp)
+                        if src_udp and 1 <= src_udp <= 65535 and src_udp != reply_port
                         else None
                     )
                     self._send_probe_reply(
@@ -2391,7 +2777,9 @@ class LanService:
                         reply_sock=reply_sock,
                         extra_dst=extra_dst,
                     )
-            if paired_row is None:
+            # Служебные диагностические зонды diag-* не добавляем в список реальных устройств,
+            # а настоящие несопряжённые компьютеры, сами приславшие RW_PROBE_V1, добавляем в discovered!
+            if dev_id.startswith("diag-") or str(pkt.get("platform") or "") == "diag":
                 return
 
         try:
@@ -2420,22 +2808,66 @@ class LanService:
                 self._hb_evt.set()
             return
 
+        raw_ver = str(pkt.get("app_version") or "").strip()
+        expected_disc = port + 1
+        from_fixed_port = (src_udp == expected_disc)
+        now_m = time.monotonic()
+        if magic == _DISCOVERY_MAGIC:
+            if pkt.get("is_bcast") is True:
+                spontaneous_bcast = True
+            elif pkt.get("is_reply") is True:
+                spontaneous_bcast = False
+            else:
+                with self._lock:
+                    last_p = max(self._last_bcast_probe_mono, self._last_unicast_probe_by_ip.get(clean_ip, 0.0))
+                spontaneous_bcast = (now_m - last_p) > 5.0
+        else:
+            spontaneous_bcast = False
+
         with self._lock:
+            prev = self._discovered.get(dev_id) or {}
             is_new = dev_id not in self._discovered
+            app_ver = raw_ver or str(prev.get("app_version") or "")
+            seen_bcast = bool(prev.get("seen_broadcast")) or spontaneous_bcast
+            seen_fixed = bool(prev.get("seen_fixed_port")) or (magic == _DISCOVERY_MAGIC and from_fixed_port)
+            if app_ver or seen_fixed:
+                legacy_proto = False
+            elif magic == _DISCOVERY_MAGIC and src_udp not in (0, expected_disc):
+                legacy_proto = True
+            else:
+                legacy_proto = bool(prev.get("legacy_protocol", False))
             self._discovered[dev_id] = {
                 "device_id": dev_id,
                 "device_name": name,
                 "ip": clean_ip,
                 "port": port,
-                "platform": str(pkt.get("platform") or "desktop"),
+                "platform": str(pkt.get("platform") or prev.get("platform") or "desktop"),
+                "app_version": app_ver,
+                "legacy_protocol": legacy_proto,
+                "seen_broadcast": seen_bcast,
+                "seen_fixed_port": seen_fixed,
+                "via_probe_only": not seen_bcast,
+                "last_udp_port": src_udp or int(prev.get("last_udp_port") or 0),
                 "seen_ts": time.time(),
             }
         if is_new:
-            _lan_log(f"Обнаружено устройство в сети: «{name}» ({clean_ip}:{port}, id={dev_id})")
+            ver_tag = f", v{app_ver}" if app_ver else (", legacy<=1.7" if legacy_proto else "")
+            _lan_log(f"Обнаружено устройство в сети: «{name}» ({clean_ip}:{port}, id={dev_id}, src_udp={src_udp}{ver_tag})")
 
-    def discover_now(self, wait_sec: float = 1.5, auto_enable: bool = True, target_ports=()):
-        """Активный поиск устройств в локальной сети с отправкой зондов с каждого физического адаптера."""
-        wait_f = max(0.2, min(float(wait_sec or 1.5), 5.0))
+    def discover_now(
+        self,
+        wait_sec: float = 4.5,
+        auto_enable: bool = True,
+        target_ports=(),
+        mode: str = "auto",
+        interfaces: list[dict] | None = None,
+    ):
+        """Активный поиск устройств с порта disc_port (8767) и автоматическим поадресным обходом подсети при отсутствии ответов на broadcast."""
+        wait_f = max(0.2, min(float(wait_sec if wait_sec is not None else 4.5), 10.0))
+        eff_mode = str(mode or "auto").strip().lower()
+        if eff_mode not in ("auto", "broadcast_only", "subnet_only"):
+            eff_mode = "auto"
+
         cfg = self._lan_cfg()
         if not cfg["enabled"] and auto_enable:
             full_cfg = settings.load()
@@ -2449,96 +2881,110 @@ class LanService:
 
         if cfg["enabled"]:
             lan_port = int(self._running_port or cfg["port"])
-            ports = {lan_port + 1}
-            if self._bind_host != "127.0.0.1":
-                ports.add(8767)
-            for ep in (target_ports or ()):
-                try:
-                    ep_i = int(ep)
-                    if 1 <= ep_i <= 65535:
-                        ports.add(ep_i)
-                except (TypeError, ValueError):
-                    pass
+            disc_port = lan_port + 1
+            rx_sock = self._wait_udp_ready(0.5) if cfg.get("auto_discovery") else None
 
             con = db.connect()
             try:
-                ident = self._identity(con)
-                peer_rows = [dict(r) for r in con.execute("SELECT ip, port FROM sync_peers")]
+                my_id = self._identity(con)["device_id"]
             finally:
                 con.close()
 
-            peer_unicast: set[tuple[str, int]] = set()
-            for pr in peer_rows:
-                pip = _clean_ip_str(pr.get("ip") or "")
-                if _is_lan_ip(pip):
-                    try:
-                        pp = int(pr.get("port") or 8766)
-                        if 1 <= pp + 1 <= 65535:
-                            peer_unicast.add((pip, pp + 1))
-                        if self._bind_host != "127.0.0.1":
-                            peer_unicast.add((pip, 8767))
-                    except (TypeError, ValueError):
-                        pass
+            with self._lock:
+                before_ids = set(self._discovered.keys())
+                before_online = sum(1 for v in self._peer_runtime.values() if v.get("online"))
 
-            bound_list = self._open_bound_bcast_sockets()
-            _lan_log(f"Старт активного поиска устройств (ожидание {wait_f:.1f} с, сокетов={len(bound_list)}, порты={sorted(ports)})")
+            wake_evt = threading.Event()
+            seen_remote: set[str] = set()
 
-            def _send_all_probes(log_it: bool):
-                for idx_s, (label, dst_ips, sock) in enumerate(bound_list):
-                    try:
-                        ephem = int(sock.getsockname()[1])
-                    except OSError:
-                        continue
-                    probe_bytes = json.dumps({
-                        "magic": _PROBE_MAGIC,
-                        "device_id": ident["device_id"],
-                        "device_name": ident["device_name"],
-                        "port": lan_port,
-                        "disc_port": ephem,
-                        "platform": "windows",
-                    }, ensure_ascii=False).encode("utf-8")
-                    targets = {(dst, p) for dst in dst_ips for p in ports}
-                    if idx_s == 0:
-                        targets |= peer_unicast
-                    for addr_pair in targets:
-                        try:
-                            sock.sendto(probe_bytes, addr_pair)
-                            if log_it:
-                                _lan_log(f"Активный зонд с {label}:{ephem} -> {addr_pair[0]}:{addr_pair[1]}")
-                        except OSError as e:
-                            _lan_log(
-                                f"Ошибка отправки активного зонда с {label} -> {addr_pair[0]}:{addr_pair[1]}: {e}",
-                                logging.WARNING,
-                                rate_key=f"disc_send_{label}_{addr_pair[0]}",
-                                min_interval=15.0,
-                            )
+            def _on_pkt(pkt: dict, _ip: str, _sp: int):
+                did = str(pkt.get("device_id") or "")
+                if did and did != my_id and not did.startswith("diag-") and pkt.get("platform") != "diag":
+                    seen_remote.add(did)
+                    wake_evt.set()
 
+            with self._lock:
+                self._diag_listeners.append(_on_pkt)
+
+            temp_socks: list[tuple[str, list[str], socket.socket]] = []
+            was_running_disc = self.is_listening()
             try:
-                _send_all_probes(log_it=True)
-                self._broadcast_presence(lan_port, lan_port + 1)
+                def _wait_for_replies(phase_timeout: float, resend_cb=None):
+                    deadline = time.monotonic() + phase_timeout
+                    mid = time.monotonic() + min(1.6, phase_timeout * 0.45)
+                    resent = False
+                    settle_until: float | None = None
+                    while time.monotonic() < deadline and not (was_running_disc and self._stop_evt.is_set()):
+                        now_t = time.monotonic()
+                        if settle_until is not None and now_t >= settle_until:
+                            break
+                        if resend_cb is not None and not resent and now_t >= mid and not seen_remote:
+                            resent = True
+                            resend_cb()
+                        if temp_socks:
+                            s_list = [s for _l, _d, s in temp_socks]
+                            try:
+                                rdy, _, _ = select.select(s_list, [], [], 0.12)
+                            except (OSError, ValueError):
+                                break
+                            for rs in rdy:
+                                try:
+                                    raw, addr = rs.recvfrom(4096)
+                                    self._handle_discovery_packet(raw, addr[0], addr[1], my_lan_port=lan_port, sync_verify=True, reply_sock=rs)
+                                except OSError:
+                                    pass
+                        else:
+                            rem = min(0.15, max(0.01, deadline - now_t))
+                            wake_evt.wait(rem)
+                            wake_evt.clear()
+                        with self._lock:
+                            cur_new = set(self._discovered.keys()) - before_ids
+                        if (cur_new or seen_remote) and settle_until is None:
+                            settle_until = min(deadline, time.monotonic() + 0.30)
 
-                socks = [s for _lbl, _dsts, s in bound_list]
-                deadline = time.monotonic() + wait_f
-                mid = time.monotonic() + wait_f * 0.45
-                resent = False
-                while time.monotonic() < deadline and not self._stop_evt.is_set() and socks:
-                    if not resent and time.monotonic() >= mid:
-                        resent = True
-                        _send_all_probes(log_it=False)
+                if rx_sock is None:
+                    temp_socks = self._open_bound_bcast_sockets(bind_port=disc_port)
+
+                primary_tx = rx_sock if rx_sock is not None else (temp_socks[0][2] if temp_socks else None)
+
+                if eff_mode in ("auto", "broadcast_only"):
+                    _lan_log(f"Старт активного поиска (mode={eff_mode}, ожидание до {wait_f:.1f} с, порт={disc_port})")
+                    self._send_udp_probe(lan_port, reply_disc_port=disc_port, extra_ports=target_ports, tx_sock=rx_sock, log_probe=True)
+                    self._broadcast_presence(lan_port, disc_port, tx_sock=rx_sock)
+                    _wait_for_replies(
+                        wait_f,
+                        resend_cb=lambda: self._send_udp_probe(lan_port, reply_disc_port=disc_port, extra_ports=target_ports, tx_sock=rx_sock),
+                    )
+
+                with self._lock:
+                    found_after_bcast = len(self._discovered) > len(before_ids) or bool(seen_remote)
+                    cur_online = sum(1 for v in self._peer_runtime.values() if v.get("online"))
+
+                need_sweep = (
+                    eff_mode == "subnet_only"
+                    or (eff_mode == "auto" and not found_after_bcast and cur_online <= before_online and (self._bind_host != "127.0.0.1" or interfaces is not None))
+                )
+                if need_sweep:
+                    with self._lock:
+                        self._scanning_subnet = True
                     try:
-                        ready_socks, _, _ = select.select(socks, [], [], 0.15)
-                    except (OSError, ValueError):
-                        break
-                    for rs in ready_socks:
-                        try:
-                            raw, addr = rs.recvfrom(2048)
-                            self._handle_discovery_packet(
-                                raw, addr[0], addr[1], my_lan_port=lan_port, sync_verify=True,
-                            )
-                        except OSError:
-                            pass
+                        sent_cnt = self._unicast_subnet_sweep(
+                            lan_port,
+                            target_ports=target_ports,
+                            tx_sock=primary_tx,
+                            interfaces=interfaces,
+                        )
+                        if sent_cnt > 0:
+                            wake_evt.clear()
+                            _wait_for_replies(min(wait_f, 4.5))
+                    finally:
+                        with self._lock:
+                            self._scanning_subnet = False
             finally:
-                for _lbl, _dsts, s in bound_list:
+                with self._lock:
+                    if _on_pkt in self._diag_listeners:
+                        self._diag_listeners.remove(_on_pkt)
+                for _lbl, _dsts, s in temp_socks:
                     try:
                         s.close()
                     except OSError:
@@ -2549,7 +2995,7 @@ class LanService:
                 pass
 
         res = self.status(refresh=False)
-        _lan_log(f"Активный поиск завершён: новых={len(res.get('discovered') or [])}, онлайн сопряжённых={res.get('online_peers', 0)}")
+        _lan_log(f"Активный поиск завершён (mode={eff_mode}): новых={len(res.get('discovered') or [])}, онлайн сопряжённых={res.get('online_peers', 0)}")
         return res
 
     def _heartbeat_loop(self):
@@ -3201,8 +3647,13 @@ class LanService:
         os.startfile("ms-settings:network-status")
         return {"ok": True}
 
-    def diagnose_network(self, peer_ip: str = "", peer_port: int | None = None) -> dict:
-        """Выполняет полную пошаговую диагностику LAN (адаптер, порты, профиль, брандмауэр, VPN, шлюз, UDP-зонд, TCP пира)."""
+    def diagnose_network(
+        self,
+        peer_ip: str = "",
+        peer_port: int | None = None,
+        probe_wait_sec: float | None = None,
+    ) -> dict:
+        """Выполняет полную пошаговую диагностику LAN (адаптер, порты, профиль, брандмауэр, VPN, шлюз, UDP-зонд с порта 8767, TCP пира)."""
         cfg = self._lan_cfg()
         lan_port = int(self._running_port or cfg["port"])
         disc_port = lan_port + 1
@@ -3389,7 +3840,7 @@ class LanService:
                     "action": None,
                 })
 
-        # 6. Активный UDP-зонд RW_PROBE_V1
+        # 6. Активный UDP-зонд RW_PROBE_V1 с основного порта disc_port (8767)
         if cfg["enabled"]:
             con = db.connect()
             try:
@@ -3397,69 +3848,207 @@ class LanService:
             finally:
                 con.close()
             my_ips = {x["ip"] for x in ifaces} | {"127.0.0.1"}
-            bound_socks = self._open_bound_bcast_sockets()
-            replies_other: dict[str, str] = {}
+            rx_sock = self._wait_udp_ready(0.5) if cfg.get("auto_discovery") else None
+            diag_id = f"diag-{uuid.uuid4().hex[:8]}"
+            diag_name = f"diag@{my_ident['device_name']}"
+            probe_b = json.dumps({
+                "magic": _PROBE_MAGIC,
+                "device_id": diag_id,
+                "device_name": diag_name,
+                "port": lan_port,
+                "disc_port": disc_port,
+                "platform": "diag",
+                "app_version": current_lan_app_version(),
+                "probe_kind": "diag",
+            }, ensure_ascii=False).encode("utf-8")
+
+            peer_replies: dict[str, dict] = {}
             self_replied = False
+            in_unicast_sweep = False
+            wake_evt = threading.Event()
+
+            def _on_diag_pkt(pkt_p: dict, addr_ip: str, addr_port: int):
+                nonlocal self_replied
+                if pkt_p.get("magic") != _DISCOVERY_MAGIC:
+                    return
+                did = str(pkt_p.get("device_id") or "").strip()
+                if not did:
+                    return
+                if did == my_ident["device_id"] or (addr_ip in my_ips and int(pkt_p.get("port") or 0) == lan_port):
+                    self_replied = True
+                    return
+                if did.startswith("diag-") or pkt_p.get("platform") == "diag":
+                    return
+                dname = str(pkt_p.get("device_name") or addr_ip)
+                dport = int(pkt_p.get("port") or 8766)
+                dver = str(pkt_p.get("app_version") or "").strip()
+                rec = peer_replies.get(did)
+                if rec is None:
+                    rec = {
+                        "device_id": did,
+                        "name": dname,
+                        "ip": addr_ip,
+                        "port": dport,
+                        "app_version": dver,
+                        "src_ports": set(),
+                        "unicast_only": bool(in_unicast_sweep),
+                    }
+                    peer_replies[did] = rec
+                else:
+                    if dver and not rec["app_version"]:
+                        rec["app_version"] = dver
+                if addr_port:
+                    rec["src_ports"].add(int(addr_port))
+                wake_evt.set()
+
+            with self._lock:
+                self._diag_listeners.append(_on_diag_pkt)
+
+            temp_socks: list[tuple[str, list[str], socket.socket]] = []
             try:
-                for idx_s, (_lbl, dst_ips, s) in enumerate(bound_socks):
-                    ep = int(s.getsockname()[1])
-                    probe_b = json.dumps({
-                        "magic": _PROBE_MAGIC,
-                        "device_id": f"diag-{uuid.uuid4().hex[:8]}",
-                        "device_name": f"diag@{my_ident['device_name']}",
-                        "port": lan_port,
-                        "disc_port": ep,
-                        "platform": "diag",
-                    }, ensure_ascii=False).encode("utf-8")
-                    targets = {(d, disc_port) for d in dst_ips}
-                    if idx_s == 0 and clean_peer and _is_lan_ip(clean_peer):
-                        targets.add((clean_peer, int(eff_peer_port) + 1))
-                        targets.add((clean_peer, disc_port))
-                    for dst_pair in targets:
+                now_p = time.monotonic()
+                with self._lock:
+                    self._last_bcast_probe_mono = now_p
+                    if clean_peer:
+                        self._last_unicast_probe_by_ip[clean_peer] = now_p
+
+                dst_ports = {disc_port}
+                if self._bind_host != "127.0.0.1":
+                    dst_ports.add(8767)
+                targets = {(d, p) for d in self._broadcast_targets() for p in dst_ports}
+                if clean_peer and _is_lan_ip(clean_peer):
+                    targets.add((clean_peer, int(eff_peer_port) + 1))
+                    targets.add((clean_peer, disc_port))
+
+                if rx_sock is not None:
+                    for dst_pair in sorted(targets):
                         try:
-                            s.sendto(probe_b, dst_pair)
+                            rx_sock.sendto(probe_b, dst_pair)
                         except OSError:
                             pass
-                socks_list = [s for _l, _d, s in bound_socks]
-                end_t = time.monotonic() + (0.45 if self._bind_host == "127.0.0.1" else 1.4)
-                while time.monotonic() < end_t and socks_list:
-                    try:
-                        rdy, _, _ = select.select(socks_list, [], [], 0.15)
-                    except (OSError, ValueError):
-                        break
-                    for rs in rdy:
-                        try:
-                            raw_p, addr_p = rs.recvfrom(4096)
-                            pkt_p = json.loads(raw_p.decode("utf-8"))
-                        except Exception:
-                            continue
-                        if not isinstance(pkt_p, dict) or pkt_p.get("magic") != _DISCOVERY_MAGIC:
-                            continue
-                        did = str(pkt_p.get("device_id") or "")
-                        dname = str(pkt_p.get("device_name") or addr_p[0])
-                        if did == my_ident["device_id"] or (addr_p[0] in my_ips and int(pkt_p.get("port") or 0) == lan_port):
-                            self_replied = True
+                    self._send_limited_bcast_per_adapter(lan_port, disc_port, probe_b, dst_ports)
+                else:
+                    temp_socks = self._open_bound_bcast_sockets(bind_port=disc_port)
+                    for idx_s, (_lbl, dst_ips, s) in enumerate(temp_socks):
+                        t_set = {(d, p) for d in dst_ips for p in dst_ports}
+                        if idx_s == 0 and clean_peer and _is_lan_ip(clean_peer):
+                            t_set.add((clean_peer, int(eff_peer_port) + 1))
+                            t_set.add((clean_peer, disc_port))
+                        for dst_pair in sorted(t_set):
+                            try:
+                                s.sendto(probe_b, dst_pair)
+                            except OSError:
+                                pass
+
+                if probe_wait_sec is not None:
+                    eff_wait = max(0.15, min(float(probe_wait_sec), 10.0))
+                else:
+                    eff_wait = 0.45 if self._bind_host == "127.0.0.1" else 4.2
+
+                was_running_diag = self.is_listening()
+
+                def _pump_wait(duration: float):
+                    end_t = time.monotonic() + duration
+                    settle_t: float | None = None
+                    while time.monotonic() < end_t and not (was_running_diag and self._stop_evt.is_set()):
+                        now_w = time.monotonic()
+                        if settle_t is not None and now_w >= settle_t:
+                            break
+                        if temp_socks:
+                            socks_list = [s for _l, _d, s in temp_socks]
+                            try:
+                                rdy, _, _ = select.select(socks_list, [], [], 0.12)
+                            except (OSError, ValueError):
+                                break
+                            for rs in rdy:
+                                try:
+                                    raw_p, addr_p = rs.recvfrom(4096)
+                                    self._handle_discovery_packet(raw_p, addr_p[0], addr_p[1], my_lan_port=lan_port, sync_verify=True, reply_sock=rs)
+                                except OSError:
+                                    pass
                         else:
-                            replies_other[f"{dname} ({addr_p[0]})"] = did
-                            self._handle_discovery_packet(raw_p, addr_p[0], addr_p[1], my_lan_port=lan_port, sync_verify=True)
+                            wake_evt.wait(min(0.15, max(0.01, end_t - now_w)))
+                            wake_evt.clear()
+                        if clean_peer and any(r["ip"] == clean_peer for r in peer_replies.values()) and settle_t is None:
+                            settle_t = min(end_t, time.monotonic() + 0.35)
+                        elif in_unicast_sweep and peer_replies and settle_t is None:
+                            settle_t = min(end_t, time.monotonic() + 0.35)
+
+                _pump_wait(eff_wait)
+
+                # Если на broadcast никто не ответил и конкретный IP не задан — делаем поадресный unicast-обход подсети
+                if not peer_replies and not clean_peer and self._bind_host != "127.0.0.1" and ifaces:
+                    in_unicast_sweep = True
+                    tx_for_sweep = rx_sock if rx_sock is not None else (temp_socks[0][2] if temp_socks else None)
+                    sent_u = self._unicast_subnet_sweep(
+                        lan_port,
+                        tx_sock=tx_for_sweep,
+                        interfaces=ifaces,
+                        probe_device_id=diag_id,
+                        probe_device_name=diag_name,
+                        probe_platform="diag",
+                    )
+                    if sent_u > 0:
+                        _pump_wait(min(eff_wait, 3.5))
             finally:
-                for _l, _d, s in bound_socks:
+                with self._lock:
+                    if _on_diag_pkt in self._diag_listeners:
+                        self._diag_listeners.remove(_on_diag_pkt)
+                for _l, _d, s in temp_socks:
                     try:
                         s.close()
                     except OSError:
                         pass
 
-            if replies_other:
+            if peer_replies:
+                desc_parts = []
+                for pr in peer_replies.values():
+                    vtag = f"v{pr['app_version']}" if pr["app_version"] else "версия <= 1.8"
+                    desc_parts.append(f"{pr['name']} ({pr['ip']}, {vtag})")
                 checks.append({
                     "id": "udp_probe",
                     "status": "ok",
-                    "title": f"На UDP-зонд ответили устройства: {len(replies_other)}",
-                    "detail": ", ".join(replies_other.keys()),
+                    "title": f"На UDP-зонд (порт {disc_port}) ответили устройства: {len(peer_replies)}",
+                    "detail": ", ".join(desc_parts),
                     "hint": "",
                     "action": None,
                 })
+
+                now_diag = time.monotonic()
+                with self._lock:
+                    disc_snap = {k: dict(v) for k, v in self._discovered.items()}
+                    udp_uptime = (now_diag - self._udp_started_mono) if self._udp_started_mono > 0 else 0.0
+
+                for pr in peer_replies.values():
+                    did = pr["device_id"]
+                    exp_disc = int(pr["port"]) + 1
+                    disc_entry = disc_snap.get(did) or {}
+                    eff_ver = pr["app_version"] or str(disc_entry.get("app_version") or "")
+                    seen_fixed = bool(disc_entry.get("seen_fixed_port")) or (exp_disc in pr["src_ports"])
+                    is_legacy = bool(not eff_ver and not seen_fixed and pr["src_ports"])
+                    if is_legacy:
+                        sample_sp = sorted(pr["src_ports"])[0]
+                        checks.append({
+                            "id": "peer_legacy_protocol",
+                            "status": "warn",
+                            "title": f"Устройство «{pr['name']}» ({pr['ip']}) отвечает по старому протоколу (версия 1.7 или старше) — обновите его до 1.8.1",
+                            "detail": f"Ответ на порт {disc_port} пришёл со случайного порта UDP {sample_sp} вместо {exp_disc}.",
+                            "hint": "Обновите RealtyWatch на втором компьютере до версии 1.8.1+, чтобы обнаружение работало мгновенно без задержек.",
+                            "action": None,
+                        })
+
+                    seen_bcast = bool(disc_entry.get("seen_broadcast"))
+                    if not seen_bcast and (pr["unicast_only"] or udp_uptime >= (DISCOVERY_INTERVAL_SEC + 1.5)):
+                        checks.append({
+                            "id": "peer_asymmetric_bcast",
+                            "status": "warn",
+                            "title": f"Устройство «{pr['name']}» ({pr['ip']}) найдено только по запросу — проверьте на нём «Проверить сеть» (VPN/брандмауэр)",
+                            "detail": "Наши зонды доходят до второго компьютера, но его собственные широковещательные анонсы сюда не поступают.",
+                            "hint": "Откройте окно «Локальная сеть → Проверить сеть» на втором компьютере: вероятно, там включён VPN без раздельного туннелирования или активен виртуальный адаптер.",
+                            "action": None,
+                        })
             else:
-                self_txt = "Свой локальный сервер на зонд ответил." if self_replied else "Даже свой локальный UDP-сервер не ответил на зонд."
+                self_txt = f"Свой локальный сервер (UDP {disc_port}) на зонд ответил." if self_replied else f"Даже свой локальный UDP-сервер ({disc_port}) не ответил на зонд."
                 checks.append({
                     "id": "udp_probe",
                     "status": "warn",
@@ -3479,6 +4068,8 @@ class LanService:
             })
 
         # 7. Прямая TCP-проверка до введённого IP второго компьютера (если указан)
+        tcp_reachable_peer = None
+        paired_ips = {p["ip"] for p in self.list_peers()}
         if clean_peer:
             if not _is_lan_ip(clean_peer):
                 checks.append({
@@ -3498,13 +4089,17 @@ class LanService:
                         tsock.sendall(req_b)
                         first_line = tsock.recv(256).decode("utf-8", errors="replace").splitlines()[0] if True else ""
                     rtt = round((time.monotonic() - t0) * 1000)
+                    is_self_ip = (clean_peer in ({x["ip"] for x in ifaces} | {"127.0.0.1"}) and eff_peer_port == lan_port)
+                    can_pair_by_ip = (not is_self_ip) and (clean_peer not in paired_ips)
+                    if can_pair_by_ip:
+                        tcp_reachable_peer = {"ip": clean_peer, "port": eff_peer_port}
                     checks.append({
                         "id": "peer_tcp",
                         "status": "ok",
                         "title": f"Прямое TCP-соединение с {clean_peer}:{eff_peer_port} установлено ({rtt} мс)",
                         "detail": f"Ответ сервера партнёра: {first_line or 'OK'}",
-                        "hint": "",
-                        "action": None,
+                        "hint": "Сопряжение по TCP полностью доступно — введите 6-значный PIN со второго компьютера." if can_pair_by_ip else "",
+                        "action": "pair_by_ip" if can_pair_by_ip else None,
                     })
                 except ConnectionRefusedError:
                     checks.append({
@@ -3536,6 +4131,7 @@ class LanService:
             "checked_at": _now_ts(),
             "peer_ip": clean_peer,
             "peer_port": eff_peer_port if clean_peer else None,
+            "tcp_reachable_peer": tcp_reachable_peer,
             "checks": checks,
             "local_interfaces": ifaces,
             "vpn_hijack": vpn_info,
@@ -3572,10 +4168,13 @@ class LanService:
         with self._lock:
             self._outbox_count = ocnt
             newer_peer = dict(self._newer_db_peer) if self._newer_db_peer else None
+            scanning_sub = bool(self._scanning_subnet)
         return {
             "enabled": cfg["enabled"],
             "listening": self.is_listening(),
             "udp_listening": self.is_udp_listening(),
+            "scanning_subnet": scanning_sub,
+            "app_version": current_lan_app_version(),
             "port": cfg["port"],
             "actual_port": self._running_port,
             "auto_discovery": cfg["auto_discovery"],
@@ -5248,6 +5847,7 @@ class LanService:
                 "device_name": ident["device_name"],
                 "port": svc._running_port or cfg["port"],
                 "platform": "windows",
+                "app_version": current_lan_app_version(),
                 "freshness": freshness,
                 "latest_db_ts": _max_freshness_ts(freshness),
                 "listings_count": listings_cnt,
@@ -5923,8 +6523,20 @@ def status(refresh: bool = False):
     return service.status(refresh=refresh)
 
 
-def discover_now(wait_sec: float = 1.5, auto_enable: bool = True, target_ports=()):
-    return service.discover_now(wait_sec=wait_sec, auto_enable=auto_enable, target_ports=target_ports)
+def discover_now(
+    wait_sec: float = 4.5,
+    auto_enable: bool = True,
+    target_ports=(),
+    mode: str = "auto",
+    interfaces: list[dict] | None = None,
+):
+    return service.discover_now(
+        wait_sec=wait_sec,
+        auto_enable=auto_enable,
+        target_ports=target_ports,
+        mode=mode,
+        interfaces=interfaces,
+    )
 
 
 def summary(lan_after: int = 0):
@@ -6023,8 +6635,8 @@ def clear_history():
     return service.clear_history()
 
 
-def diagnose_network(peer_ip: str = "", peer_port: int | None = None):
-    return service.diagnose_network(peer_ip=peer_ip, peer_port=peer_port)
+def diagnose_network(peer_ip: str = "", peer_port: int | None = None, probe_wait_sec: float | None = None):
+    return service.diagnose_network(peer_ip=peer_ip, peer_port=peer_port, probe_wait_sec=probe_wait_sec)
 
 
 def allow_firewall(remove_blocking: bool = False):

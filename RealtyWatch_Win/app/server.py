@@ -858,10 +858,11 @@ def lan_config(body: dict = Body(...)):
 def lan_discover(body: dict | None = Body(default=None)):
     b = body if isinstance(body, dict) else {}
     auto_enable = bool(b.get("auto_enable", True))
-    wait_sec = b.get("wait_sec", 1.5)
+    wait_sec = b.get("wait_sec", 4.5)
     target_ports = b.get("target_ports") or ()
+    mode = str(b.get("mode") or "auto")
     try:
-        return lan_sync.discover_now(wait_sec=wait_sec, auto_enable=auto_enable, target_ports=target_ports)
+        return lan_sync.discover_now(wait_sec=wait_sec, auto_enable=auto_enable, target_ports=target_ports, mode=mode)
     except (ValueError, ConnectionError) as e:
         raise HTTPException(400, str(e))
 
@@ -1091,11 +1092,16 @@ def lan_diagnose(body: dict = Body(default={})):
     b = body if isinstance(body, dict) else {}
     peer_ip = str(b.get("peer_ip") or "").strip()
     peer_port = b.get("peer_port")
+    probe_wait = b.get("probe_wait_sec")
     try:
         pport = int(peer_port) if peer_port else None
     except (TypeError, ValueError):
         pport = None
-    return lan_sync.diagnose_network(peer_ip=peer_ip, peer_port=pport)
+    try:
+        pwait = float(probe_wait) if probe_wait is not None else None
+    except (TypeError, ValueError):
+        pwait = None
+    return lan_sync.diagnose_network(peer_ip=peer_ip, peer_port=pport, probe_wait_sec=pwait)
 
 
 @app.post("/api/lan/firewall/allow")
