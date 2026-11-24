@@ -593,13 +593,16 @@ class RetryAndResumeBrowserUITests(Case):
         page.wait_for_selector('#view-runs .rp-cont[data-src="yandex"]', timeout=5000)
 
         # Клик по «Продолжить» в боковой панели НЕ должен снимать галочку чекбокса .src-run[value="yandex"]
-        was_checked = page.is_checked('.src-run[value="yandex"]')
+        was_checked = page.evaluate("""() => document.querySelector('.src-run[value="yandex"]')?.checked === true""")
         self.assertTrue(was_checked)
 
-        # Чиним сайт и жмём «Продолжить» прямо в боковой панели
+        # Наводим курсор на #sources (чтобы фоновый poll() не перерисовал панель во время клика),
+        # чиним сайт и жмём «Продолжить» прямо в боковой панели
+        page.hover("#sources")
         ctl["fail_p2"] = False
         page.click('.src-cont[data-continue="yandex"]')
-        self.assertTrue(page.is_checked('.src-run[value="yandex"]'), "клик по «Продолжить» не переключает чекбокс сайта")
+        still_checked = page.evaluate("""() => document.querySelector('.src-run[value="yandex"]')?.checked === true""")
+        self.assertTrue(still_checked, "клик по «Продолжить» не переключает чекбокс сайта")
 
         _wait_idle(mgr)
         # Уводим мышь с #sources, чтобы очередной тик poll() обновил и боковую панель, и вкладку «Прогоны»

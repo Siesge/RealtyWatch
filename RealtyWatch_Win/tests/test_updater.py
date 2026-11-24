@@ -61,6 +61,11 @@ class UpdaterCoreAndCleanupTests(Case):
             "prerelease": False,
             "assets": [
                 {
+                    "name": "Обновить вручную.bat",
+                    "browser_download_url": "https://example.test/%D0%9E%D0%B1%D0%BD%D0%BE%D0%B2%D0%B8%D1%82%D1%8C%20%D0%B2%D1%80%D1%83%D1%87%D0%BD%D1%83%D1%8E.bat",
+                    "size": 1850,
+                },
+                {
                     "name": "RealtyWatch-1.6-macos.dmg",
                     "browser_download_url": "https://example.test/mac.dmg",
                     "size": 5000,
@@ -85,6 +90,47 @@ class UpdaterCoreAndCleanupTests(Case):
 
         with self.assertRaises(ValueError):
             updater.select_portable_asset({**rel, "draft": True})
+
+    def test_manual_update_bat_ascii_and_lock_wait(self):
+        """Файл Обновить вручную.bat содержит только 7-битный ASCII и не запускает старый run_update.ps1, пока занят data\\app.lock."""
+        bat_src = paths.ROOT / "Обновить вручную.bat"
+        raw = bat_src.read_bytes()
+        self.assertTrue(all(b < 128 for b in raw), "Обновить вручную.bat должен содержать строго 7-битный ASCII")
+
+        fake_app = self.dir / "fake_stand"
+        staging = fake_app / "data" / "update_staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        bat_copy = fake_app / "Обновить вручную.bat"
+        bat_copy.write_bytes(raw)
+        marker = fake_app / "ran_after_unlock.txt"
+        updater.write_ps1_utf8_bom(
+            staging / "run_update.ps1",
+            f"Set-Content -LiteralPath '{str(marker).replace(chr(39), chr(39)*2)}' -Value 'done' -Encoding UTF8",
+        )
+
+        # Имитируем открытую программу, удерживающую дескриптор data\app.lock (как app.main._single_instance)
+        lock_file = fake_app / "data" / "app.lock"
+        lock_fh = open(lock_file, "a+")
+        try:
+            proc = subprocess.Popen(
+                ["cmd.exe", "/c", str(bat_copy)],
+                cwd=str(fake_app),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+            time.sleep(1.5)
+            # Пока app.lock удерживается — run_update.ps1 ещё НЕ должен отработать
+            self.assertFalse(marker.exists(), "run_update.ps1 не должен стартовать под живой программой")
+            self.assertIsNone(proc.poll())
+        finally:
+            lock_fh.close()
+
+        out, _ = proc.communicate(timeout=10.0)
+        self.assertEqual(proc.returncode, 0, out.decode("utf-8", errors="replace"))
+        self.assertTrue(marker.exists(), "после освобождения app.lock скрипт должен запустить run_update.ps1")
 
     def test_zip_validation_rejects_bad_sha256_traversal_and_embedded_database(self):
         good_bytes = _build_release_zip({

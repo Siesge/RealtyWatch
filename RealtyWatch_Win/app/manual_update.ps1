@@ -11,7 +11,40 @@ Write-Host ""
 
 if (Test-Path -LiteralPath $StagedPs1) {
     Write-Host "Найден подготовленный пакет обновления: $StagedPs1" -ForegroundColor Green
-    Write-Host "Если окно RealtyWatch сейчас открыто — закройте его (в трее: правая кнопка -> Выход)." -ForegroundColor Yellow
+    $RootPrefix = [System.IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $LockFile = Join-Path $RootPrefix 'data\app.lock'
+    $warned = $false
+    while ($true) {
+        $procs = @(Get-Process -Name pythonw, python, RealtyWatch -ErrorAction SilentlyContinue | Where-Object {
+            $_.Id -ne $PID -and $_.Path -and $_.Path.StartsWith($RootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+        $locked = $false
+        if (Test-Path -LiteralPath $LockFile) {
+            try {
+                $fs = [System.IO.File]::Open($LockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+                $fs.Close()
+            } catch [System.IO.FileNotFoundException] {
+                $locked = $false
+            } catch [System.IO.DirectoryNotFoundException] {
+                $locked = $false
+            } catch {
+                $locked = $true
+            }
+        }
+        if ($procs.Count -eq 0 -and -not $locked) {
+            break
+        }
+        if (-not $warned) {
+            Write-Host ""
+            Write-Host "RealtyWatch сейчас запущен в этой папке." -ForegroundColor Yellow
+            Write-Host "Закройте программу (значок в трее -> правая кнопка -> Выход) — ожидаю закрытия..." -ForegroundColor Yellow
+            $warned = $true
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($warned) {
+        Start-Sleep -Milliseconds 400
+    }
     Write-Host "Запускаю установку обновления..." -ForegroundColor Cyan
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $StagedPs1
     $code = $LASTEXITCODE
