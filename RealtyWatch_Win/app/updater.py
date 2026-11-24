@@ -860,14 +860,22 @@ class UpdaterService:
         self._notify_cb = notify_cb
 
     def cleanup_leftovers(self):
-        """Удаляет остатки временных папок обновления после перезапуска (если нет ожидающего установки архива)."""
+        """Удаляет остатки временных папок обновления после перезапуска (если нет активной загрузки или ожидающего архива)."""
+        if not self._op_lock.acquire(blocking=False):
+            return
         try:
+            with self._lock:
+                if self._checking or self._downloading:
+                    return
             st = self._read_state()
-            if not st.get("ready"):
-                shutil.rmtree(_staging_dir(), ignore_errors=True)
+            sdir = _staging_dir()
+            if not st.get("ready") and not (sdir / "run_update.ps1").is_file():
+                shutil.rmtree(sdir, ignore_errors=True)
             shutil.rmtree(_rollback_dir(), ignore_errors=True)
         except Exception:
             pass
+        finally:
+            self._op_lock.release()
 
     def start_background(self):
         self.cleanup_leftovers()
@@ -1182,6 +1190,7 @@ class UpdaterService:
                                 f"размер скачанного архива ({len(zip_bytes)}) не совпадает с заявленным ({info['size']})"
                             )
 
+                        part_file.parent.mkdir(parents=True, exist_ok=True)
                         part_file.write_bytes(zip_bytes)
                         try:
                             verify_dir = sdir / "verify_tmp"
