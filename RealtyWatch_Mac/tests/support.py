@@ -15,14 +15,16 @@ from pathlib import Path
 
 # Журнал тестов не пишется в logs/app.log: обработчик ставится до импорта runner (setup_logging его не трогает)
 logging.getLogger().addHandler(logging.NullHandler())
+TMP_ROOT = Path(tempfile.mkdtemp(prefix="rw-tests-"))
+os.environ.setdefault("RW_LOGS_DIR", str(TMP_ROOT / "logs"))
 
-from app import alerts, db, human, images, net, paths, runlog, settings, transfer  # noqa: E402
+from app import alerts, db, human, images, net, paths, runlog, settings, tiles, transfer  # noqa: E402
 from app import runner  # noqa: E402
 
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(paths.BROWSERS))
 
-TMP_ROOT = Path(tempfile.mkdtemp(prefix="rw-tests-"))
 _REQUEST = net.Http.request
+_TILE_FETCH = tiles._fetch_url
 
 
 def _local_only(self, method, url, **kw):
@@ -31,11 +33,18 @@ def _local_only(self, method, url, **kw):
     return _REQUEST(self, method, url, **kw)
 
 
+def _local_tile_only(url, timeout=tiles.FETCH_TIMEOUT_SEC):
+    if not url.startswith("http://127.0.0.1"):
+        raise OSError(f"тест обратился к внешнему серверу тайлов: {url}")
+    return _TILE_FETCH(url, timeout=timeout)
+
+
 def _no_real_browser(self):
     raise AssertionError("тест запустил браузер с настоящим профилем — подмените загрузку страницы")
 
 
 net.Http.request = _local_only
+tiles._fetch_url = _local_tile_only
 net.Browser.start = _no_real_browser
 
 
@@ -106,15 +115,18 @@ def isolate(test):
     db.reset()
     settings.SETTINGS_FILE = d / "settings.json"
     net.PROFILES = d / "profiles"
-    runlog.RUNS_DIR, runlog.SNAP_DIR = d / "runs", d / "snapshots"
+    runlog.redirect_logs_dir(d)
+    runner.manager.journal.clear()
     images.IMAGES = transfer.IMAGES = d / "images"
+    tiles.TILES = d / "tiles"
     transfer.BACKUPS, transfer.DB_DIR = d / "backups", d
     alerts.FILE = d / "sound.json"
-    for p in (db.DB_FILE, settings.SETTINGS_FILE, images.IMAGES, transfer.BACKUPS, alerts.FILE, runlog.RUNS_DIR):
+    for p in (db.DB_FILE, settings.SETTINGS_FILE, images.IMAGES, tiles.TILES, transfer.BACKUPS, alerts.FILE, runlog.LOGS_DIR, runlog.RUNS_DIR):
         assert TMP_ROOT in Path(p).parents, f"тест работает вне временной папки: {p}"
     images.repair = lambda *a, **k: None
     runner.pause = lambda *a, **k: None
     test.addCleanup(shutil.rmtree, d, ignore_errors=True)
+    test.addCleanup(runlog.close_lan_logging)
     return d
 
 

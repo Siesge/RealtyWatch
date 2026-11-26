@@ -225,6 +225,41 @@ class DesktopApi:
         path = self._dialog("OPEN", directory=str(Path.home() / "Desktop"))
         return {"path": path} if path else {"cancelled": True}
 
+    def export_cards(self, object_ids=None, liked_only=False, kind="cards"):
+        from . import exchange
+        from .runner import manager
+
+        kind = str(kind or ("favorites" if liked_only else "cards"))
+        path = self._dialog(
+            "SAVE",
+            file_types=("Карточки RealtyWatch (*.rwcards.zip)", "ZIP-архив (*.zip)"),
+            directory=str(Path.home() / "Desktop"),
+            save_filename=exchange.default_name(kind),
+        )
+        if not path:
+            return {"cancelled": True}
+        if not path.lower().endswith(".zip"):
+            path += exchange.EXT
+        try:
+            res = exchange.export_cards_zip(
+                path,
+                object_ids=object_ids,
+                liked_only=bool(liked_only),
+                kind=kind,
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+        manager.log("db", f"карточки выгружены (.rwcards.zip): {res['path']} ({res['cards']} карточек, фото {res['images']})")
+        return res
+
+    def pick_cards_import(self):
+        path = self._dialog(
+            "OPEN",
+            file_types=("Карточки RealtyWatch (*.rwcards.zip;*.zip)",),
+            directory=str(Path.home() / "Desktop"),
+        )
+        return {"path": path} if path else {"cancelled": True}
+
 
 def _clean_caches():
     """При закрытии убираем кэши браузера и окна: папку программы можно сразу заархивировать и переслать."""
@@ -264,9 +299,11 @@ def main():
     url = f"http://127.0.0.1:{port}/"
     RUNTIME_FILE.write_text(json.dumps({"pid": os.getpid(), "url": url}), encoding="utf-8")
     threading.Thread(target=_startup_maintenance, daemon=True, name="maintenance").start()
+    from . import lan_sync
     from .runner import manager
     from .server import scheduler
 
+    lan_sync.start_if_enabled()
     sched = scheduler()  # автообновление по таймеру работает и при свёрнутом окне
     try:
         if server_only:
@@ -292,6 +329,7 @@ def main():
         pass
     finally:
         _shutdown_runs()
+        lan_sync.stop()
         server.should_exit = True
         _clean_caches()
         try:

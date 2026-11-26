@@ -76,6 +76,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <string>Чтобы сохранить в «Документы» выгрузку базы или страницу с избранным.</string>
   <key>NSDownloadsFolderUsageDescription</key>
   <string>Чтобы сохранить в «Загрузки» выгрузку базы или страницу с избранным.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Чтобы находить другие компьютеры с RealtyWatch в домашней сети и обмениваться карточками и заметками.</string>
 </dict>
 </plist>
 PLIST

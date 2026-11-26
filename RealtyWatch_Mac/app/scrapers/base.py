@@ -63,6 +63,22 @@ class Scraper:
         self.declared = None  # сколько объявлений заявил сайт
         self.bans = 0         # ограничений IP за прогон
         self.skip_missing_ids = set()  # source_id из узких выдач, не ожидаемые в сокращённом сборе
+        self.checkpoint = {}  # JSON-совместимое состояние для автоповтора и кнопки «Продолжить»
+        self.on_step = None   # вызывается после каждого успешно пройденного шага (сбрасывает счётчик автоповторов)
+
+    def set_checkpoint(self, data):
+        self.checkpoint = dict(data or {})
+        if self.mode == "auto" and self.checkpoint.get("use_browser"):
+            self.use_browser = True
+
+    def save_checkpoint(self, advance=True, **updates):
+        self.checkpoint.update(updates)
+        if self.use_browser:
+            self.checkpoint["use_browser"] = True
+        if advance:
+            self.checkpoint["_steps"] = int(self.checkpoint.get("_steps") or 0) + 1
+            if self.on_step:
+                self.on_step()
 
     # --- переопределяется в наследниках ---
     def is_blocked(self, html, url):

@@ -145,3 +145,173 @@ class RulesVersion(Case):
         pb = geo._polygon_with_bbox("yalta_city.json")
         for lat, lon in pts:
             self.assertEqual(geo._in_polygon(lat, lon, poly), geo._in_polygon(lat, lon, *pb))
+
+
+class ManualMerge(Case):
+    """Ручное объединение несовместимых карточек, мульти-слияние и устойчивость при assign/rebuild."""
+
+    def test_manual_merge_same_and_cross_site_survives_rebuild_and_assign(self):
+        a = add("cian", 42.0, 9_000_000, floors=5, floor=2, rooms=1, desc="Первая")
+        b = add("cian", 68.0, 14_000_000, floors=12, floor=7, rooms=3, desc="Вторая")
+        c = add("avito", 68.2, 14_100_000, floors=12, floor=7, rooms=3, desc="Автодубль второй")
+        self.assertFalse(together(a, b))
+
+        con = db.connect()
+        dedupe.rebuild(con)
+        res = dedupe.merge_objects(con, a, b)
+        self.assertEqual(res["manual_merges"], 1)
+        self.assertEqual(res["items"], 3)
+
+        by_group, primaries = dedupe.active_manual_merges(con)
+        self.assertEqual(len(by_group), 1)
+        self.assertEqual(primaries, {tuple(a.split(":"))})
+
+        # Пересборка по правилам НЕ разрушает ручное объединение
+        self.assertEqual(dedupe.rebuild(con), 1)
+        rows = {(r["source"], r["source_id"]): r["object_id"]
+                for r in con.execute("SELECT source, source_id, object_id FROM listings")}
+        self.assertEqual(len(set(rows.values())), 1)
+
+        # Новое авто-совпадение со второй веткой (b/c) при assign() присоединяется к той же группе и совпадает с rebuild()
+        d = add("yandex", 68.1, 14_050_000, floors=12, floor=7, rooms=3, desc="Новый автодубль b")
+        con.execute("UPDATE listings SET object_id=NULL WHERE source=? AND source_id=?", tuple(d.split(":")))
+        dedupe.assign(con, *d.split(":"))
+        con.commit()
+        oid_after_assign = {r["object_id"] for r in con.execute("SELECT object_id FROM listings")}
+        self.assertEqual(len(oid_after_assign), 1)
+
+        # Последовательный assign() с нуля даёт ровно те же object_id, что rebuild()
+        con.execute("UPDATE listings SET object_id=NULL")
+        for r in con.execute("SELECT source, source_id FROM listings ORDER BY first_seen, source, source_id").fetchall():
+            dedupe.assign(con, r["source"], r["source_id"])
+        con.commit()
+        seq = {(r["source"], r["source_id"]): r["object_id"]
+               for r in con.execute("SELECT source, source_id, object_id FROM listings")}
+        dedupe.rebuild(con)
+        fast = {(r["source"], r["source_id"]): r["object_id"]
+                for r in con.execute("SELECT source, source_id, object_id FROM listings")}
+        self.assertEqual(seq, fast)
+        con.close()
+
+    def test_multi_merge_primary_order_and_unmerge_all(self):
+        a = add("cian", 40.0, 8_000_000, floors=5, floor=1, rooms=1, desc="A")
+        b = add("avito", 55.0, 11_000_000, floors=9, floor=4, rooms=2, desc="B")
+        c = add("yandex", 75.0, 15_000_000, floors=12, floor=8, rooms=3, desc="C")
+        d = add("cian", 90.0, 19_000_000, floors=16, floor=10, rooms=4, desc="D")
+
+        con = db.connect()
+        dedupe.rebuild(con)
+        # (A + B) + C -> первенство остаётся за A
+        r1 = dedupe.merge_objects(con, a, b)
+        r2 = dedupe.merge_objects(con, r1["object_id"], c)
+        self.assertEqual(r2["manual_merges"], 1)
+        self.assertEqual(dedupe.active_manual_merges(con)[1], {tuple(a.split(":"))})
+
+        # D + (A + B + C) -> D становится первой и главной
+        r3 = dedupe.merge_objects(con, d, r2["object_id"])
+        self.assertEqual(r3["manual_merges"], 1)
+        self.assertEqual(r3["items"], 4)
+        self.assertEqual(dedupe.active_manual_merges(con)[1], {tuple(d.split(":"))})
+        self.assertEqual(con.execute("SELECT COUNT(DISTINCT object_id) FROM listings").fetchone()[0], 1)
+
+        # Полный сброс возвращает все 4 несовместимые квартиры в отдельные карточки
+        un = dedupe.unmerge_all(con)
+        self.assertEqual(un["unmerged"], 1)
+        self.assertEqual(un["objects"], 4)
+        self.assertEqual(con.execute("SELECT COUNT(DISTINCT object_id) FROM listings").fetchone()[0], 4)
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM manual_merges").fetchone()[0], 0)
+        con.close()
+
+    def test_unmerge_single_object_keeps_other_merges(self):
+        a = add("cian", 40.0, 8_000_000, floors=5, floor=1, rooms=1, desc="A")
+        b = add("avito", 55.0, 11_000_000, floors=9, floor=4, rooms=2, desc="B")
+        c = add("yandex", 75.0, 15_000_000, floors=12, floor=8, rooms=3, desc="C")
+        d = add("cian", 90.0, 19_000_000, floors=16, floor=10, rooms=4, desc="D")
+
+        con = db.connect()
+        dedupe.rebuild(con)
+        r_ab = dedupe.merge_objects(con, a, b)
+        r_cd = dedupe.merge_objects(con, c, d)
+        self.assertEqual((r_cd["objects"], r_cd["manual_merges"]), (2, 2))
+
+        res = dedupe.unmerge_object(con, r_ab["object_id"])
+        self.assertEqual((res["parts"], res["objects"], res["manual_merges"]), (2, 3, 1))
+        self.assertFalse(together(a, b), "первая связка разошлась на исходные карточки")
+        self.assertTrue(together(c, d), "вторая ручная связка осталась нетронутой")
+        con.close()
+
+    def test_exclude_auto_group_keeps_remaining_merged_and_reassigns_primary(self):
+        # Группа A — две авто-склеенные ссылки (a1 + a2), где a1 является главной (is_primary=1)
+        a1 = add("cian", 42.0, 9_000_000, floors=5, floor=2, rooms=1, desc="A1")
+        a2 = add("avito", 42.1, 9_050_000, floors=5, floor=2, rooms=1, desc="A2")
+        b = add("yandex", 64.0, 13_000_000, floors=9, floor=5, rooms=2, desc="B")
+        c = add("cian", 85.0, 17_000_000, floors=12, floor=8, rooms=3, desc="C")
+
+        con = db.connect()
+        dedupe.rebuild(con)
+        self.assertTrue(together(a1, a2))
+
+        r1 = dedupe.merge_objects(con, a1, b)
+        r2 = dedupe.merge_objects(con, r1["object_id"], c)
+        self.assertEqual((r2["objects"], r2["manual_merges"]), (1, 1))
+        self.assertEqual(dedupe.active_manual_merges(con)[1], {tuple(a1.split(":"))})
+
+        # Исключаем a2: отделяется ВСЯ авто-группа A (a1 + a2 вместе), B + C остаются объединены вручную
+        ex1 = dedupe.exclude_from_merge(con, r2["object_id"], *a2.split(":"))
+        self.assertTrue(ex1["still_merged"])
+        self.assertEqual(ex1["excluded_count"], 2)
+        self.assertEqual(set(ex1["excluded_keys"]), {a1, a2})
+        self.assertEqual((ex1["objects"], ex1["manual_merges"]), (2, 1))
+        self.assertTrue(together(a1, a2) and together(b, c) and not together(a1, b))
+
+        _, primaries = dedupe.active_manual_merges(con)
+        self.assertTrue(primaries <= {tuple(b.split(":")), tuple(c.split(":"))})
+        self.assertEqual(len(primaries), 1, "оставшейся связке B+C автоматически назначена новая главная ссылка")
+
+        # Исключаем C из оставшейся пары B+C: остаётся 1 исходная группа B -> ручное объединение снимается полностью
+        ex2 = dedupe.exclude_from_merge(con, ex1["remaining_object_id"], *c.split(":"))
+        self.assertFalse(ex2["still_merged"])
+        self.assertEqual((ex2["objects"], ex2["manual_merges"]), (3, 0))
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM manual_merges").fetchone()[0], 0)
+        con.close()
+
+    def test_targeted_ops_match_full_rebuild_and_scoped_auto_group_map(self):
+        """Точечные merge/exclude/unmerge и scoped auto_group_map полностью совпадают с полным rebuild(con)."""
+        a1 = add("cian", 42.0, 9_000_000, floors=5, floor=2, rooms=1, desc="A1")
+        a2 = add("avito", 42.2, 9_050_000, floors=5, floor=2, rooms=1, desc="A2")
+        # Несвязанный сосед на том же (rooms=1, floor=2) с другой площадью — не должен затрагиваться или меняться
+        nbr = add("yandex", 58.0, 12_000_000, floors=5, floor=2, rooms=1, desc="Сосед")
+        b1 = add("yandex", 64.0, 13_000_000, floors=9, floor=5, rooms=2, desc="B1")
+        c1 = add("cian", 64.1, 13_100_000, floors=9, floor=5, rooms=2, lat=44.499, lon=34.180, desc="C1 другой адрес")
+        d1 = add("cian", 85.0, 17_000_000, floors=12, floor=8, rooms=3, desc="D1")
+
+        con = db.connect()
+        dedupe.rebuild(con)
+
+        def snapshot_oids():
+            return {(r["source"], r["source_id"]): r["object_id"]
+                    for r in con.execute("SELECT source, source_id, object_id FROM listings")}
+
+        r1 = dedupe.merge_objects(con, a1, b1)
+        r2 = dedupe.merge_objects(con, r1["object_id"], c1)
+        r3 = dedupe.merge_objects(con, r2["object_id"], d1)
+        after_merge = snapshot_oids()
+        dedupe.rebuild(con)
+        self.assertEqual(after_merge, snapshot_oids())
+
+        full_ag = dedupe.auto_group_map(con)
+        subset = {tuple(a1.split(":")), tuple(a2.split(":")), tuple(c1.split(":")), tuple(d1.split(":"))}
+        scoped_ag = dedupe.auto_group_map(con, target_keys=subset)
+        self.assertEqual(scoped_ag, {k: full_ag[k] for k in subset})
+
+        ex = dedupe.exclude_from_merge(con, r3["object_id"], *a2.split(":"))
+        after_excl = snapshot_oids()
+        dedupe.rebuild(con)
+        self.assertEqual(after_excl, snapshot_oids())
+        self.assertEqual(after_excl[tuple(nbr.split(":"))], nbr)
+
+        dedupe.unmerge_object(con, ex["remaining_object_id"])
+        after_unm = snapshot_oids()
+        dedupe.rebuild(con)
+        self.assertEqual(after_unm, snapshot_oids())
+        con.close()

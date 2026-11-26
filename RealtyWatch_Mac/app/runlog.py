@@ -8,17 +8,21 @@ logs/snapshots/          — HTML/JSON страницы, на которой ч�
 """
 import logging
 import logging.handlers
+import os
 import re
 import threading
 from datetime import datetime
+from pathlib import Path
 
 from .paths import LOGS
 
-RUNS_DIR = LOGS / "runs"
-SNAP_DIR = LOGS / "snapshots"
+LOGS_DIR = Path(os.environ["RW_LOGS_DIR"]) if os.environ.get("RW_LOGS_DIR") else LOGS
+RUNS_DIR = LOGS_DIR / "runs"
+SNAP_DIR = LOGS_DIR / "snapshots"
 KEEP_RUN_LOGS = 300
 KEEP_SNAPSHOTS = 60
 SNAPSHOT_MAX_BYTES = 3_000_000
+_lan_log_lock = threading.Lock()
 
 
 def setup_logging():
@@ -26,11 +30,66 @@ def setup_logging():
     root = logging.getLogger()
     if root.handlers:
         return
-    LOGS.mkdir(parents=True, exist_ok=True)
-    h = logging.handlers.RotatingFileHandler(LOGS / "app.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    h = logging.handlers.RotatingFileHandler(LOGS_DIR / "app.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     root.addHandler(h)
     root.setLevel(logging.INFO)
+
+
+def close_lan_logging():
+    """Закрывает файловые обработчики журнала LAN (нужно перед удалением временной папки в тестах)."""
+    with _lan_log_lock:
+        lg = logging.getLogger("realtywatch.lan")
+        for h in list(lg.handlers):
+            lg.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+
+
+def setup_lan_logging() -> logging.Logger:
+    """Отдельный журнал локальной сети logs/lan.log с ротацией (1,5 МБ × 3 файла)."""
+    with _lan_log_lock:
+        lg = logging.getLogger("realtywatch.lan")
+        lg.propagate = False
+        lg.setLevel(logging.INFO)
+        target = (LOGS_DIR / "lan.log").resolve()
+        for h in list(lg.handlers):
+            base = getattr(h, "baseFilename", None)
+            if base and Path(base).resolve() == target:
+                return lg
+            lg.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(target, maxBytes=1_500_000, backupCount=3, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        lg.addHandler(fh)
+        return lg
+
+
+def redirect_logs_dir(new_dir: Path):
+    """Перенаправляет все журналы (включая подпроцессы и lan.log) во временную папку."""
+    global LOGS_DIR, RUNS_DIR, SNAP_DIR
+    nd = Path(new_dir)
+    LOGS_DIR = nd
+    RUNS_DIR = nd / "runs"
+    SNAP_DIR = nd / "snapshots"
+    close_lan_logging()
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if isinstance(h, logging.FileHandler):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+    if not root.handlers:
+        root.addHandler(logging.NullHandler())
 
 
 def _prune(folder, pattern, keep):
@@ -42,8 +101,28 @@ def _prune(folder, pattern, keep):
             pass
 
 
+_LOG_ID_RE = re.compile(r"^(\d{6,})_.*\.log$")
+
+
 def run_log_path(run_id):
     return next(iter(sorted(RUNS_DIR.glob(f"{int(run_id):06d}_*.log"))), None)
+
+
+def existing_ids():
+    """Множество номеров прогонов, для которых на диске есть подробный журнал (один обход папки)."""
+    if not RUNS_DIR.exists():
+        return set()
+    out = set()
+    try:
+        with os.scandir(RUNS_DIR) as it:
+            for e in it:
+                if e.is_file():
+                    m = _LOG_ID_RE.match(e.name)
+                    if m:
+                        out.add(int(m.group(1)))
+    except OSError:
+        pass
+    return out
 
 
 def drop(run_ids):
@@ -71,6 +150,7 @@ class RunLog:
         self._f = open(self.path, "a", encoding="utf-8")
         self._lock = threading.Lock()
         self.requests = 0
+        self.suppress_snapshots = False
         _prune(RUNS_DIR, "*.log", KEEP_RUN_LOGS)
 
     def line(self, msg):
@@ -86,7 +166,7 @@ class RunLog:
 
     def snapshot(self, body, reason, ext="html"):
         """Сохраняет страницу, на которой произошёл сбой (или картинку задания капчи). Возвращает имя файла."""
-        if not body:
+        if not body or self.suppress_snapshots:
             return None
         SNAP_DIR.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^\w\-]+", "_", reason.lower())[:40].strip("_")
@@ -113,6 +193,7 @@ class RunLog:
 class NullRunLog:
     """Заглушка, когда прогон не ведёт подробный журнал (проверка снятых из настроек и т.п.)."""
     requests = 0
+    suppress_snapshots = False
 
     def line(self, msg):
         pass

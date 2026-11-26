@@ -3,7 +3,7 @@
 import json
 from datetime import datetime
 
-from . import db, dedupe, history, images, rules, runlog, settings, transfer
+from . import db, dedupe, history, images, lan_sync, rules, runlog, settings, transfer
 
 
 def _bounds(date_from, date_to):
@@ -22,13 +22,15 @@ def _q(ids):
 def _window_counts(con, lo, hi, source=None):
     """Сколько объявлений и записей цен затронет очистка окна (по одному сайту, если задан)."""
     s, a = (" AND source=?", (source,)) if source else ("", ())
+    non_imp = (" AND NOT EXISTS (SELECT 1 FROM listings l WHERE l.source=price_history.source "
+               "AND l.source_id=price_history.source_id AND COALESCE(l.imported_only, 0)=1)")
     one = lambda q, *p: con.execute(q, p).fetchone()[0]  # noqa: E731
     return {
-        "prices": one(f"SELECT COUNT(*) FROM price_history WHERE ts BETWEEN ? AND ?{s}", lo, hi, *a),
-        # объявления, которые видели только в это окно, — удаляются целиком
-        "listings": one(f"SELECT COUNT(*) FROM listings WHERE first_seen >= ? AND last_seen <= ?{s}", lo, hi, *a),
+        "prices": one(f"SELECT COUNT(*) FROM price_history WHERE ts BETWEEN ? AND ?{s}{non_imp}", lo, hi, *a),
+        # объявления, которые видели только в это окно, — удаляются целиком (кроме выборочного импорта)
+        "listings": one(f"SELECT COUNT(*) FROM listings WHERE first_seen >= ? AND last_seen <= ? AND COALESCE(imported_only, 0)=0{s}", lo, hi, *a),
         # снятые в это окно — возвращаются в продажу и проверятся заново в следующем сборе
-        "unremoved": one(f"SELECT COUNT(*) FROM listings WHERE active=0 AND removed_at BETWEEN ? AND ?{s}", lo, hi, *a),
+        "unremoved": one(f"SELECT COUNT(*) FROM listings WHERE active=0 AND removed_at BETWEEN ? AND ? AND COALESCE(imported_only, 0)=0{s}", lo, hi, *a),
     }
 
 
@@ -63,8 +65,10 @@ def _delete_window(con, lo, hi, source=None):
     и избранным), записи цен окна; снятые в окне возвращает в продажу. Прогоны, события и снимки рынка
     удаляются отдельно: по периоду — в purge(), по номерам прогонов — в purge_runs()."""
     s, a = (" AND source=?", (source,)) if source else ("", ())
+    non_imp = (" AND NOT EXISTS (SELECT 1 FROM listings l WHERE l.source=price_history.source "
+               "AND l.source_id=price_history.source_id AND COALESCE(l.imported_only, 0)=1)")
     gone = [(r["source"], r["source_id"]) for r in con.execute(
-        f"SELECT source, source_id FROM listings WHERE first_seen >= ? AND last_seen <= ?{s}", (lo, hi, *a))]
+        f"SELECT source, source_id FROM listings WHERE first_seen >= ? AND last_seen <= ? AND COALESCE(imported_only, 0)=0{s}", (lo, hi, *a))]
     for key in gone:
         for table in ("listings", "price_history", "events", "likes", "dislikes", "notes"):
             con.execute(f"DELETE FROM {table} WHERE source=? AND source_id=?", key)
@@ -72,10 +76,10 @@ def _delete_window(con, lo, hi, source=None):
         if p:
             p.unlink(missing_ok=True)
     con.execute(f"UPDATE listings SET active=1, removed_at=NULL, removed_reason=NULL, missed=0 "
-                f"WHERE active=0 AND removed_at BETWEEN ? AND ?{s}", (lo, hi, *a))
+                f"WHERE active=0 AND removed_at BETWEEN ? AND ? AND COALESCE(imported_only, 0)=0{s}", (lo, hi, *a))
     touched = {(r["source"], r["source_id"]) for r in con.execute(
-        f"SELECT DISTINCT source, source_id FROM price_history WHERE ts BETWEEN ? AND ?{s}", (lo, hi, *a))}
-    con.execute(f"DELETE FROM price_history WHERE ts BETWEEN ? AND ?{s}", (lo, hi, *a))
+        f"SELECT DISTINCT source, source_id FROM price_history WHERE ts BETWEEN ? AND ?{s}{non_imp}", (lo, hi, *a))}
+    con.execute(f"DELETE FROM price_history WHERE ts BETWEEN ? AND ?{s}{non_imp}", (lo, hi, *a))
     # цена объявления после удаления истории за период: видели позже периода — нынешняя цена верна,
     # её запись в истории ставится сразу после периода; не видели — возвращается последняя цена до периода
     filters = settings.load()["filters"]
@@ -108,6 +112,8 @@ def purge(date_from=None, date_to=None):
     con.execute("DELETE FROM snapshots WHERE ts BETWEEN ? AND ?", (lo, hi))
     con.execute("DELETE FROM runs WHERE started BETWEEN ? AND ?", (lo, hi))
     con.commit()
+    dedupe.clean_manual_merges(con)
+    con.commit()
     res["objects"] = dedupe.rebuild(con)
     res["snapshots_left"] = history.rebuild_snapshots(con)
     con.close()
@@ -117,14 +123,25 @@ def purge(date_from=None, date_to=None):
 # ---------- отдельные прогоны ----------
 
 def _launch_of(con):
-    """Номер запуска для каждого прогона: сайты одного запуска стартуют вместе (в пределах LAUNCH_GAP),
-    медленный сайт лишь заканчивает позже. Так же запуски узнаёт история графиков."""
-    out, start, idx = {}, None, 0
-    for r in con.execute("SELECT id, started FROM runs WHERE started IS NOT NULL ORDER BY started, id"):
+    """Номер запуска для каждого прогона: по явному launch_key (включая продолженные прогоны),
+    а для записей без launch_key — по времени старта в пределах LAUNCH_GAP без повтора сайта."""
+    out, by_lkey, start, seen, idx = {}, {}, None, set(), 0
+    for r in con.execute("SELECT id, source, started, launch_key FROM runs WHERE started IS NOT NULL ORDER BY started, id"):
+        lk = r["launch_key"]
+        if lk:
+            if lk not in by_lkey:
+                idx += 1
+                by_lkey[lk] = idx
+                start = None
+                seen = set()
+            out[r["id"]] = by_lkey[lk]
+            continue
         cur = datetime.fromisoformat(r["started"])
-        if start is None or (cur - start).total_seconds() > history.LAUNCH_GAP:
+        if start is None or (cur - start).total_seconds() > history.LAUNCH_GAP or r["source"] in seen:
             idx += 1
             start = cur
+            seen = set()
+        seen.add(r["source"])
         out[r["id"]] = idx
     return out
 
@@ -134,14 +151,24 @@ def launches(con, date_from=None, date_to=None, limit=400):
     Один запуск — одна точка на графиках дашборда, поэтому выбирают для удаления именно запуски."""
     lo, hi = _bounds(date_from, date_to)
     rows = [dict(r) for r in con.execute(
-        "SELECT id, source, mode, started, finished, status, pages, found, new, changed, removed, message, declared, collected "
+        "SELECT id, source, mode, started, finished, status, pages, found, new, changed, removed, message, "
+        "declared, collected, resume_state "
         "FROM runs WHERE started BETWEEN ? AND ? ORDER BY started, id", (lo, hi))]
+    have_log = runlog.existing_ids()
     idx, out = _launch_of(con), []
+    by_key = {}
     for r in rows:
-        if out and out[-1]["key"] == idx.get(r["id"]):
-            out[-1]["runs"].append(r)
+        raw_res = r.pop("resume_state", None)
+        r["can_continue"] = bool(raw_res) and r["status"] in ("error", "blocked", "partial", "stopped")
+        r["has_log"] = r["id"] in have_log
+        k = idx.get(r["id"])
+        if k is not None and k in by_key:
+            by_key[k]["runs"].append(r)
         else:
-            out.append({"key": idx.get(r["id"]), "started": r["started"], "runs": [r]})
+            grp = {"key": k, "started": r["started"], "runs": [r]}
+            out.append(grp)
+            if k is not None:
+                by_key[k] = grp
     for g in out:
         g["finished"] = max((x["finished"] or "" for x in g["runs"]), default="")
         g["collected"] = sum(((x["collected"] if x["collected"] is not None else x["found"]) or 0) for x in g["runs"])
@@ -222,6 +249,8 @@ def purge_runs(ids):
     con.execute(f"DELETE FROM snapshots WHERE run_id IN ({_q(ids)})", ids)
     con.execute(f"DELETE FROM runs WHERE id IN ({_q(ids)})", ids)
     con.commit()
+    dedupe.clean_manual_merges(con)
+    con.commit()
     res["objects"] = dedupe.rebuild(con)
     res["snapshots_left"] = history.rebuild_snapshots(con)
     con.close()
@@ -230,17 +259,24 @@ def purge_runs(ids):
 
 
 def clear_all():
-    """Полная очистка: объявления, история цен, события, проверки рынка, прогоны, избранное и фото.
-    Настройки поиска и круг остаются."""
+    """Полная очистка: объявления, история цен, события, проверки рынка, прогоны, импорты, избранное и фото.
+    Настройки поиска, круг и доверенные устройства (sync_peers) остаются."""
     res = {"backup": transfer.backup("перед_полной_очисткой", with_images=True)}
     con = db.connect()
     res["listings"] = con.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-    for table in ("listings", "price_history", "events", "snapshots", "runs", "likes", "dislikes", "notes"):
+    for table in (
+        "listings", "price_history", "events", "snapshots", "runs",
+        "likes", "dislikes", "notes", "manual_merges",
+        "import_batches", "import_items", "imported_notes", "sync_outbox", "sync_history",
+    ):
         con.execute(f"DELETE FROM {table}")
     con.commit()
     con.execute("VACUUM")
     con.close()
-    for p in images.IMAGES.rglob("*"):
-        if p.is_file():
-            p.unlink(missing_ok=True)
+    for folder in (images.IMAGES, db.DB_FILE.parent / "import_images", db.DB_FILE.parent / "import_staging"):
+        if folder.exists():
+            for p in folder.rglob("*"):
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+    lan_sync.reset_runtime_cache()
     return res

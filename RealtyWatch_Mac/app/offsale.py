@@ -38,13 +38,13 @@ def reconcile(con, run_id=None, log=lambda m: None):
     from .runner import SOURCE_LABEL  # импорт здесь: runner сам пользуется этим модулем
 
     objs = defaultdict(list)
-    for r in con.execute("SELECT source, source_id, object_id, active, missed FROM listings"):
+    for r in con.execute("SELECT source, source_id, object_id, active, missed, COALESCE(imported_only, 0) AS imported_only FROM listings"):
         objs[r["object_id"] or f"{r['source']}:{r['source_id']}"].append(dict(r))
     off = 0
     for items in objs.values():
         alive = [r for r in items if r["active"]]
-        if not alive or any(not off_search(r) for r in alive):
-            continue  # хоть одно объявление ещё в поиске — квартира в продаже
+        if not alive or any((not off_search(r)) or r["imported_only"] for r in alive):
+            continue  # хоть одно объявление ещё в поиске или пришло выборочным импортом — не снимаем автоматически
         for r in alive:
             n = r["missed"] or 0
             reason = f"нет в поиске {SOURCE_LABEL.get(r['source'], r['source'])} {n} {_runs(n)} подряд, страницу проверить не удалось"
